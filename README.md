@@ -532,7 +532,7 @@ provider block. Manage with `./share-kimik3.sh status` / `stop`.
 
 ## License
 
-The scripts in this repo are provided under the MIT License (see `LICENSE` —
-fill in your name before publishing). The container image
+The scripts in this repo are provided under the MIT License (see `LICENSE`).
+The container image
 (`lmsysorg/sglang-rocm`), the SGLang engine, and the model weights
 (`moonshotai/Kimi-K3`) are covered by their own separate licences.
