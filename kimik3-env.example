@@ -1,0 +1,199 @@
+# Configuration for serve-kimik3.sh on Bunya's MI355X — copy to kimik3.env and edit.
+#
+#   cp kimik3-env.example kimik3.env
+#
+# Every value uses the ${VAR:-default} form, so anything you export in your
+# shell (or in an sbatch --export) takes precedence over this file.
+# kimik3.env contains your HF token — keep it out of git (see .gitignore).
+
+# ── Required ────────────────────────────────────────────────────────────────
+
+# Scratch path for the HuggingFace cache, the .sif, the API key, and the server
+# log/PID. Point this at /scratch (NOT /home — tight quota) and make sure it is
+# visible from the compute node.
+#
+#   Kimi-K2.6-MXFP4 (the stand-in)  559 GB (measured)  -> ~650 GB free
+#   Kimi-K3         (when released) ~1.6 TB (estimate) -> ~1.7 TB free
+#
+# Note only the experts are FP4 in these builds — attention and embeddings stay
+# at higher precision — so the on-disk size is roughly double a naive
+# params x 4.25 bits calculation. ./check-k3-readiness.sh prints K3's real size
+# from its safetensors index the moment the weights are published.
+#
+export MODEL_CACHE_DIR="${MODEL_CACHE_DIR:-}"
+# e.g. export MODEL_CACHE_DIR="${MODEL_CACHE_DIR:-/scratch/user/$USER/kimik3/hf-cache}"
+
+# HuggingFace token, needed for the first weights download.
+# Either set the token directly ...
+export HF_TOKEN="${HF_TOKEN:-}"
+# ... or point at a file containing only the token (safer for shared configs):
+export HF_TOKEN_FILE="${HF_TOKEN_FILE:-}"
+
+# ── Engine ──────────────────────────────────────────────────────────────────
+
+# vllm | sglang.
+#
+# vLLM is the default because that is where Kimi K3 support is landing: the
+# 22 Jul 2026 vLLM blog previews FlashKDA/Triton KDA prefill, a fused decode
+# kernel, MXFP4 paths, and AMD contributing initial ROCm support through
+# FlyDSL's MLIR kernel stack (A16W4/A8W4 fused operators). SGLang had no K3
+# work at all as of 27 Jul 2026 — but its MI355X images are well proven, so the
+# path is kept ready. Run ./check-k3-readiness.sh to see the current state.
+export ENGINE="${ENGINE:-vllm}"
+
+# ── Model ───────────────────────────────────────────────────────────────────
+
+# TODAY: the stand-in. amd/Kimi-K2.6-MXFP4 is 550B, MXFP4 experts +
+# shared_experts, built for MI350/MI355 + ROCm 7.2, and ungated. It exercises
+# the same gfx950 FP4 MoE kernel path K3 will, so it proves this whole stack.
+export MODEL_ID="${MODEL_ID:-amd/Kimi-K2.6-MXFP4}"
+#
+# WHEN K3 LANDS: flip to one of these (see README "Switching to K3").
+# export MODEL_ID="${MODEL_ID:-moonshotai/Kimi-K3}"
+# export MODEL_ID="${MODEL_ID:-amd/Kimi-K3-MXFP4}"
+
+# The name clients put in the OpenAI "model" field. Kept as kimi-k3 so opencode
+# configs don't need rewriting when the stand-in is swapped out.
+export SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-kimi-k3}"
+
+# ── Container images ────────────────────────────────────────────────────────
+
+# These are known-good STARTING POINTS, not final answers. K3 will need an image
+# whose engine actually registers the K3 architecture — almost certainly a
+# nightly. ./check-k3-readiness.sh prints the current candidate tags rather than
+# this file pinning something stale, and ./serve-kimik3.sh check tells you
+# whether the image you have can load the model you asked for.
+#
+# rocm/vllm      = periodic release images (stable, may lag)
+# rocm/vllm-dev  = daily CI/base tags (ci_base-<sha>, base_custom_aiter_*)
+export VLLM_IMAGE="${VLLM_IMAGE:-docker://rocm/vllm:rocm7.14.0_cdna_ubuntu24.04_py3.14_pytorch_2.11.0_vllm_0.23.0}"
+export SGLANG_IMAGE="${SGLANG_IMAGE:-docker://lmsysorg/sglang-rocm:v0.5.16-rocm720-mi35x-20260726}"
+
+# Path to the Apptainer image FILE (built with './serve-kimik3.sh pull').
+# Must be a .sif file, not a directory. Defaults to
+# $MODEL_CACHE_DIR/kimik3-<engine>-mi355x.sif — engine-specific, so the vLLM and
+# SGLang images can coexist and you can switch ENGINE without re-pulling.
+export SIF_PATH="${SIF_PATH:-}"
+
+# Apptainer cache/scratch. Keep these OFF /home (quota) — on scratch. Default is
+# alongside MODEL_CACHE_DIR if left empty.
+export APPTAINER_CACHEDIR="${APPTAINER_CACHEDIR:-}"
+export APPTAINER_TMPDIR="${APPTAINER_TMPDIR:-}"
+
+# The MXFP4 MoE JIT-compiles FlyDSL kernels into a path INSIDE the image, which
+# is read-only in a .sif. serve-kimik3.sh resolves aiter's location in the image
+# at runtime and binds this scratch dir over its flydsl_cache, so the writes
+# succeed and compiled kernels persist across runs. Defaults to
+# $MODEL_CACHE_DIR/flydsl-cache. Set FLYDSL_CACHE_TARGET to override the
+# in-image path if the auto-detection ever picks the wrong one.
+export FLYDSL_CACHE_DIR="${FLYDSL_CACHE_DIR:-}"
+export FLYDSL_CACHE_TARGET="${FLYDSL_CACHE_TARGET:-}"
+
+# ── Endpoint auth ───────────────────────────────────────────────────────────
+
+# API key for the endpoint (clients send "Authorization: Bearer ..."). Leave
+# empty to have serve-kimik3.sh generate one and persist it to
+# ${MODEL_CACHE_DIR}/kimik3-api-key so it stays stable across jobs.
+export KIMIK3_API_KEY="${KIMIK3_API_KEY:-}"
+
+# ── Serving parameters ──────────────────────────────────────────────────────
+
+export PORT="${PORT:-30000}"
+
+# An MI355X node has 8 GPUs. TP_SIZE is the TOTAL GPU count on both engines.
+#
+# On SGLang, --dp only applies with dp-attention and SUBDIVIDES those GPUs (it
+# does not multiply the count), so DP_SIZE must divide TP_SIZE. On vLLM,
+# --data-parallel-size multiplies: DP_SIZE * TP_SIZE must equal your allocation,
+# so with 8 GPUs use TP_SIZE=4 DP_SIZE=2, or TP_SIZE=8 DP_SIZE=1. The script
+# checks this per engine and refuses a layout that doesn't fit.
+export TP_SIZE="${TP_SIZE:-8}"
+export DP_SIZE="${DP_SIZE:-1}"
+
+# MoE expert parallelism. On vLLM this adds --enable-expert-parallel; on SGLang
+# it adds --ep-size $TP_SIZE. Worth benching for MoE throughput — K3 is 896
+# experts with 16 active, so EP is likely to matter more than it did for GLM.
+export ENABLE_EP="${ENABLE_EP:-0}"
+
+# Max context. K3 supports 1M, but see the README memory budget: at ~1.6 TB of
+# MXFP4 weights on 2304 GB of HBM there is roughly 88 GB/GPU left for KV cache,
+# activations and graphs. Start conservative and raise it from measurement.
+# (KDA's fixed-size linear-attention state makes long context much cheaper than
+# full attention would, so there is likely real room above this.)
+export CONTEXT_LEN="${CONTEXT_LEN:-131072}"
+
+# Fraction of each GPU's HBM the engine may claim.
+#   SGLang --mem-fraction-static  /  vLLM --gpu-memory-utilization
+# 0.85 is comfortable for the 559 GB stand-in; raise toward 0.92-0.94 for K3
+# where the weights alone are ~65% of HBM.
+export MEM_FRACTION="${MEM_FRACTION:-0.85}"
+
+# KV cache dtype. Leave empty for the engine default, "auto" to force the
+# unquantized default, or set explicitly. Per-engine spellings differ, so the
+# script maps them: fp8 -> fp8_e4m3 on SGLang, fp8 on vLLM.
+export KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-fp8}"
+
+# ── Parsers (tool calling + thinking) ───────────────────────────────────────
+
+# opencode's agentic loop needs tool calling to work, which needs the right
+# parser for the model's output format. kimi_k2 is correct for the K2.x
+# stand-in and exists on both engines. K3 will very likely register its own
+# parser name — list what your image actually supports with:
+#
+#   ./serve-kimik3.sh parsers
+#
+# Set to "none" to pass no parser flag at all.
+export TOOL_PARSER="${TOOL_PARSER:-kimi_k2}"
+export REASONING_PARSER="${REASONING_PARSER:-kimi_k2}"
+
+# ── ROCm / AMD kernel toggles ───────────────────────────────────────────────
+
+# aiter is AMD's fused kernel library and is where the gfx950 FP4 MoE speed
+# comes from. Set to 0 if it is the thing crashing — on vLLM this unsets
+# VLLM_ROCM_USE_AITER*, on SGLang it drops --enable-aiter-allreduce-fusion.
+export ENABLE_AITER="${ENABLE_AITER:-1}"
+
+# SGLang CPU-affinity pinning. The container image enables it, but it pins to
+# CPUs from the full node topology and CRASHES under a SLURM cgroup that owns
+# only a subset of cores ("CPU number N is not eligible"). Keep 0 unless you
+# allocate the whole node's CPUs (e.g. --exclusive or --cpus-per-task=384).
+export SET_CPU_AFFINITY="${SET_CPU_AFFINITY:-0}"
+
+# Seconds to wait for the server to become healthy. A cold K3 start has to read
+# ~1.6 TB off scratch and JIT-compile FP4 kernels, so be generous.
+export READY_TIMEOUT="${READY_TIMEOUT:-10800}"
+
+# ── Performance tuning (optional; all empty = engine defaults) ──────────────
+# Measure every change with ./bench-kimik3.sh. See the README "Performance
+# tuning" section. Left empty here so the baseline launch command is unchanged.
+
+# SGLang --chunked-prefill-size / vLLM --max-num-batched-tokens.
+# Lower if you OOM during prefill.
+export CHUNKED_PREFILL_SIZE="${CHUNKED_PREFILL_SIZE:-}"
+
+# SGLang --max-running-requests / vLLM --max-num-seqs.
+# Lower if you OOM during decode.
+export MAX_RUNNING_REQUESTS="${MAX_RUNNING_REQUESTS:-}"
+
+# SGLang --schedule-policy. "lpm" (longest-prefix-match) reuses shared prefixes,
+# which is a big win for agentic/opencode sessions that resend similar context.
+# vLLM does prefix caching by default; ignored when ENGINE=vllm.
+export SCHEDULE_POLICY="${SCHEDULE_POLICY:-}"
+
+# SGLang --cuda-graph-max-bs / vLLM --cuda-graph-sizes.
+# Raise for more concurrency, costs memory.
+export CUDA_GRAPH_MAX_BS="${CUDA_GRAPH_MAX_BS:-}"
+
+# Extra flags appended verbatim to the engine's launch command. Use this for
+# anything version-specific rather than editing the script, e.g.
+#   export EXTRA_ENGINE_ARGS="--async-scheduling"
+export EXTRA_ENGINE_ARGS="${EXTRA_ENGINE_ARGS:-}"
+
+# ── Benchmark defaults (bench-kimik3.sh) ────────────────────────────────────
+
+export BENCH_INPUT_LEN="${BENCH_INPUT_LEN:-1024}"
+export BENCH_OUTPUT_LEN="${BENCH_OUTPUT_LEN:-512}"
+export BENCH_NUM_PROMPTS="${BENCH_NUM_PROMPTS:-200}"
+export BENCH_CONCURRENCY="${BENCH_CONCURRENCY:-1 8 32 64}"
+export BENCH_MAX_CONCURRENCY="${BENCH_MAX_CONCURRENCY:-64}"
+export BENCH_EXTRA_ARGS="${BENCH_EXTRA_ARGS:-}"

@@ -1,0 +1,6 @@
+kimik3.env
+logs/
+bench/
+*.bak
+*.sif
+cloudflared/

@@ -1,0 +1,24 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "provider": {
+    "kimik3-bunya": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "Kimi K3 (Bunya MI355X)",
+      "options": {
+        "baseURL": "http://__HOST__:__PORT__/v1",
+        "apiKey": "{env:KIMIK3_API_KEY}"
+      },
+      "models": {
+        "__MODEL__": {
+          "name": "Kimi K3",
+          "limit": {
+            "context": __CONTEXT__,
+            "output": 32768
+          },
+          "tool_call": true,
+          "reasoning": true
+        }
+      }
+    }
+  }
+}
