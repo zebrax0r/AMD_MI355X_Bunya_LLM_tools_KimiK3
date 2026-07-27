@@ -32,7 +32,10 @@ fi
 HOST="localhost"
 PORT="${PORT:-30000}"
 MODEL="${SERVED_MODEL_NAME:-kimi-k3}"
-CONTEXT="${CONTEXT_LEN:-131072}"
+# CONTEXT_LEN is empty by default (server uses the model max), so advertise
+# K3's full 1M window to opencode unless it has been explicitly capped.
+CONTEXT="${CONTEXT_LEN:-}"
+CONTEXT="${CONTEXT:-1048576}"
 API_KEY="${KIMIK3_API_KEY:-}"
 EMBED_KEY=0
 CONFIG_PATH="${OPENCODE_CONFIG:-$HOME/.config/opencode/opencode.json}"

@@ -8,7 +8,7 @@
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=192
 #SBATCH --mem=1800G
-#SBATCH --time=24:00:00
+#SBATCH --time=48:00:00
 #SBATCH --output=logs/kimik3-%j.out
 #SBATCH --error=logs/kimik3-%j.out
 #
@@ -25,8 +25,11 @@
 # Confirm the current recipe with:  sinfo -o "%P %.10l %G %f" | grep mi355x
 #
 # Walltime note: a cold Kimi K3 start reads ~1.5 TB of weights off scratch and
-# JIT-compiles FP4 kernels on first run, so budget an hour of the allocation for
-# startup alone. READY_TIMEOUT in kimik3.env must stay below this walltime.
+# JIT-compiles FP4 kernels on first run, so budget a substantial slice of the
+# allocation for startup alone. READY_TIMEOUT in kimik3.env (default 14400s)
+# must stay below this walltime.
+#
+# Memory: --mem=1800G is host RAM for staging the weight load, not HBM.
 #
 # The connection banner (node, endpoint URL, API key location, tunnel command)
 # is printed into the job log. Once the job is RUNNING:

@@ -50,7 +50,8 @@ fi
 
 PORT="${PORT:-30000}"
 SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-kimi-k3}"
-CONTEXT_LEN="${CONTEXT_LEN:-131072}"
+CONTEXT_LEN="${CONTEXT_LEN:-}"
+CONTEXT_LEN="${CONTEXT_LEN:-1048576}"   # empty = server uses the model max (1M)
 MODEL_CACHE_DIR="${MODEL_CACHE_DIR:-}"
 
 [[ -n "$MODEL_CACHE_DIR" ]] || die "MODEL_CACHE_DIR is not set (source kimik3.env or export it). Needed to cache cloudflared and store tunnel state."

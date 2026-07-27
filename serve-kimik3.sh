@@ -1,7 +1,14 @@
 #!/usr/bin/env bash
 #
 # serve-kimik3.sh — one-click Kimi K3 serving on Bunya's AMD MI355X nodes
-# (bun159/160/161, 8x gfx950) via vLLM or SGLang inside an Apptainer container.
+# (bun159/160/161, 8x gfx950) via SGLang inside an Apptainer container.
+#
+# Reproduces SGLang's validated day-0 8x MI355X TP8 recipe
+# (sgl-project/sglang issue #32548), with three deliberate deviations for our
+# environment — see the README "Our deviations from upstream":
+#   1. binds 0.0.0.0 (not 127.0.0.1) so SSH tunnels and off-node opencode work
+#   2. adds --api-key and --served-model-name
+#   3. forces SGLANG_SET_CPU_AFFINITY=0 (SLURM cgroup; upstream has none)
 #
 # Usage:
 #   ./serve-kimik3.sh [serve]    start the server (default; runs until killed)
@@ -11,21 +18,19 @@
 #                                background for the life of the SLURM job) —
 #                                use this to run opencode on the GPU node itself
 #   ./serve-kimik3.sh pull       build the .sif from the container image (once)
-#   ./serve-kimik3.sh download   prefetch model weights only (no GPU needed)
 #   ./serve-kimik3.sh check      can this image load this model? (arch vs registry)
 #   ./serve-kimik3.sh parsers    list tool-call/reasoning parsers this image has
+#   ./serve-kimik3.sh download   prefetch model weights only (no GPU needed)
 #   ./serve-kimik3.sh stop       stop a running server
 #   ./serve-kimik3.sh status     show server state + health endpoint
+#
+# Run 'check' BEFORE 'download' — it is the cheap gate on a 1.5 TB commitment.
 #
 # Apptainer lives ONLY on Bunya compute nodes, never the login nodes — so every
 # mode except a bare 'stop'/'status' must run inside a salloc/sbatch allocation.
 #
 # Configuration comes from kimik3.env next to this script (or $KIMIK3_ENV),
 # see kimik3-env.example. Environment variables you export beforehand win.
-#
-# ENGINE=vllm|sglang selects the engine. The two differ only in the launch
-# command and flag spellings; everything else (Apptainer, SLURM, caches, health,
-# API key, banner) is shared.
 
 set -euo pipefail
 
@@ -55,44 +60,38 @@ else
     warn "No config file at $ENV_FILE (copy kimik3-env.example to kimik3.env); using environment only."
 fi
 
-ENGINE="${ENGINE:-vllm}"
-case "$ENGINE" in
-    vllm|sglang) ;;
-    *) die "ENGINE must be 'vllm' or 'sglang', got '$ENGINE'." ;;
-esac
-
-MODEL_ID="${MODEL_ID:-amd/Kimi-K2.6-MXFP4}"
+MODEL_ID="${MODEL_ID:-moonshotai/Kimi-K3}"
 SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-kimi-k3}"
-VLLM_IMAGE="${VLLM_IMAGE:-docker://rocm/vllm:rocm7.14.0_cdna_ubuntu24.04_py3.14_pytorch_2.11.0_vllm_0.23.0}"
-SGLANG_IMAGE="${SGLANG_IMAGE:-docker://lmsysorg/sglang-rocm:v0.5.16-rocm720-mi35x-20260726}"
+SGLANG_IMAGE="${SGLANG_IMAGE:-docker://lmsysorg/sglang-rocm:rocm720-mi35x-k3-20260727}"
 PORT="${PORT:-30000}"
 TP_SIZE="${TP_SIZE:-8}"
 DP_SIZE="${DP_SIZE:-1}"
-ENABLE_EP="${ENABLE_EP:-0}"
-CONTEXT_LEN="${CONTEXT_LEN:-131072}"
+CONTEXT_LEN="${CONTEXT_LEN:-}"
 MEM_FRACTION="${MEM_FRACTION:-0.85}"
-KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-fp8}"
-TOOL_PARSER="${TOOL_PARSER:-kimi_k2}"
-REASONING_PARSER="${REASONING_PARSER:-kimi_k2}"
+ATTENTION_BACKEND="${ATTENTION_BACKEND:-triton}"
+MODEL_DTYPE="${MODEL_DTYPE:-bfloat16}"
+CUDA_GRAPH_MAX_BS_DECODE="${CUDA_GRAPH_MAX_BS_DECODE:-256}"
+DISABLE_RADIX_CACHE="${DISABLE_RADIX_CACHE:-1}"
+KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-}"
+TOOL_PARSER="${TOOL_PARSER:-kimi_k3}"
+REASONING_PARSER="${REASONING_PARSER:-kimi_k3}"
+SPECULATIVE="${SPECULATIVE:-}"
+DSPARK_MODEL="${DSPARK_MODEL:-RadixArk/Kimi-K3-DSpark}"
 ENABLE_AITER="${ENABLE_AITER:-1}"
 SET_CPU_AFFINITY="${SET_CPU_AFFINITY:-0}"
-READY_TIMEOUT="${READY_TIMEOUT:-10800}"
+READY_TIMEOUT="${READY_TIMEOUT:-14400}"
+LAUNCH_CMD="${LAUNCH_CMD:-sglang serve}"
 CHUNKED_PREFILL_SIZE="${CHUNKED_PREFILL_SIZE:-}"
 MAX_RUNNING_REQUESTS="${MAX_RUNNING_REQUESTS:-}"
 SCHEDULE_POLICY="${SCHEDULE_POLICY:-}"
-CUDA_GRAPH_MAX_BS="${CUDA_GRAPH_MAX_BS:-}"
 EXTRA_ENGINE_ARGS="${EXTRA_ENGINE_ARGS:-}"
 MODEL_CACHE_DIR="${MODEL_CACHE_DIR:-}"
 SIF_PATH="${SIF_PATH:-}"
 
-# Pick the image for the selected engine.
-if [[ "$ENGINE" == "vllm" ]]; then
-    ENGINE_IMAGE="$VLLM_IMAGE"
-    SERVER_PATTERN='vllm serve'
-else
-    ENGINE_IMAGE="$SGLANG_IMAGE"
-    SERVER_PATTERN='sglang.launch_server'
-fi
+case "$SPECULATIVE" in
+    ""|none|dspark) ;;
+    *) die "SPECULATIVE must be empty or 'dspark', got '$SPECULATIVE'." ;;
+esac
 
 # Runtime state (PID + log) lives under MODEL_CACHE_DIR so it survives detach
 # and is reachable by 'stop'/'status' from any shell in the allocation.
@@ -111,18 +110,16 @@ stop_server() {
         local pid; pid="$(<"$PID_FILE")"
         log "Stopping server (pid $pid) ..."
         kill "$pid" 2>/dev/null || true
-        # Give the engine's worker processes a moment, then make sure they're gone.
+        # Give SGLang's worker processes a moment, then make sure they're gone.
         for _ in $(seq 1 20); do kill -0 "$pid" 2>/dev/null || break; sleep 1; done
         kill -0 "$pid" 2>/dev/null && kill -9 "$pid" 2>/dev/null || true
     else
         warn "No running server recorded in $PID_FILE."
     fi
     # Belt-and-braces: this node is a single-user 8-GPU grab, so clean up strays
-    # from BOTH engines (you may have switched ENGINE since starting).
+    # from either invocation form.
     pkill -f 'sglang.launch_server' 2>/dev/null || true
-    pkill -f 'vllm serve'           2>/dev/null || true
-    pkill -f 'VLLM::EngineCore'     2>/dev/null || true
-    pkill -f 'vllm.entrypoints'     2>/dev/null || true
+    pkill -f 'sglang serve'         2>/dev/null || true
     rm -f "$PID_FILE"
 }
 
@@ -142,9 +139,10 @@ case "$MODE" in
         fi
         if curl -fsS -m 5 "http://127.0.0.1:${PORT}/health" >/dev/null 2>&1; then
             log "Health check on port $PORT: OK"
+            key=""
+            [[ -r "${MODEL_CACHE_DIR:-}/kimik3-api-key" ]] && key="$(<"$MODEL_CACHE_DIR/kimik3-api-key")"
             curl -fsS -m 5 "http://127.0.0.1:${PORT}/v1/models" \
-                 -H "Authorization: Bearer ${KIMIK3_API_KEY:-$( [[ -r "${MODEL_CACHE_DIR:-}/kimik3-api-key" ]] && cat "$MODEL_CACHE_DIR/kimik3-api-key" || echo)}" \
-                 2>/dev/null | head -c 400 || true
+                 -H "Authorization: Bearer ${KIMIK3_API_KEY:-$key}" 2>/dev/null | head -c 400 || true
             echo
         else
             warn "http://127.0.0.1:${PORT}/health not responding (not started, or still loading)."
@@ -170,14 +168,12 @@ mkdir -p "$MODEL_CACHE_DIR" 2>/dev/null || true
 [[ -d "$MODEL_CACHE_DIR" && -w "$MODEL_CACHE_DIR" ]] \
     || die "MODEL_CACHE_DIR '$MODEL_CACHE_DIR' does not exist or is not writable."
 
-# Default the .sif next to the HF cache, named per engine so both can coexist
-# and switching ENGINE doesn't force a re-pull.
-SIF_PATH="${SIF_PATH:-$MODEL_CACHE_DIR/kimik3-${ENGINE}-mi355x.sif}"
+SIF_PATH="${SIF_PATH:-$MODEL_CACHE_DIR/kimik3-mi355x.sif}"
 # SIF_PATH must name a .sif FILE, not a directory. If it points at a directory
 # (or ends with '/'), treat it as a folder and drop the default filename in —
 # 'apptainer pull' otherwise refuses ("Image file already exists").
 if [[ "$SIF_PATH" == */ || -d "$SIF_PATH" ]]; then
-    SIF_PATH="${SIF_PATH%/}/kimik3-${ENGINE}-mi355x.sif"
+    SIF_PATH="${SIF_PATH%/}/kimik3-mi355x.sif"
     log "SIF_PATH was a directory — using $SIF_PATH"
 fi
 
@@ -197,9 +193,12 @@ if [[ "$MODE" == "pull" ]]; then
         log "Image already present: $SIF_PATH (delete it to re-pull)."
         exit 0
     fi
-    log "Pulling $ENGINE_IMAGE -> $SIF_PATH (multi-GB; one-time) ..."
-    apptainer pull "$SIF_PATH" "$ENGINE_IMAGE" \
-        || die "apptainer pull failed. Does this node have outbound internet? Check APPTAINER_CACHEDIR space ($APPTAINER_CACHEDIR)."
+    log "Pulling $SGLANG_IMAGE -> $SIF_PATH (multi-GB; one-time) ..."
+    apptainer pull "$SIF_PATH" "$SGLANG_IMAGE" \
+        || die "apptainer pull failed. Does this node have outbound internet? Check APPTAINER_CACHEDIR space ($APPTAINER_CACHEDIR).
+     Note the default image is built from SGLang's unmerged 'kimi-k3' branch and
+     is pinned to a dated tag — if it has been removed, see the README
+     'When the branch merges' for how to pick a current one."
     log "Image ready: $SIF_PATH"
     exit 0
 fi
@@ -207,7 +206,7 @@ fi
 # For every remaining mode we need the .sif. Auto-build it if missing.
 if [[ ! -f "$SIF_PATH" ]]; then
     log "No .sif at $SIF_PATH yet — pulling it now (one-time)."
-    apptainer pull "$SIF_PATH" "$ENGINE_IMAGE" \
+    apptainer pull "$SIF_PATH" "$SGLANG_IMAGE" \
         || die "apptainer pull failed. Run './serve-kimik3.sh pull' explicitly to debug."
     log "Image ready: $SIF_PATH"
 fi
@@ -219,40 +218,23 @@ if [[ -z "${HF_TOKEN:-}" && -n "${HF_TOKEN_FILE:-}" ]]; then
 fi
 
 # ── parsers mode: what can this image actually parse? ───────────────────────
-# K3 will very likely register its own tool-call/reasoning parser names. Rather
-# than guessing and getting an unhelpful argparse error at launch, ask the image.
 
 if [[ "$MODE" == "parsers" ]]; then
-    log "Parsers available in $SIF_PATH (ENGINE=$ENGINE):"
-    if [[ "$ENGINE" == "vllm" ]]; then
-        apptainer exec "$SIF_PATH" python3 - <<'PY' || warn "Could not introspect vLLM parser registries; falling back to --help below."
-try:
-    from vllm.entrypoints.openai.tool_parsers import ToolParserManager
-    print("  tool-call parsers:", ", ".join(sorted(ToolParserManager.tool_parsers)))
-except Exception as e:
-    print("  tool-call parsers: <introspection failed:", e, ">")
-try:
-    from vllm.reasoning import ReasoningParserManager
-    print("  reasoning parsers:", ", ".join(sorted(ReasoningParserManager.reasoning_parsers)))
-except Exception as e:
-    print("  reasoning parsers: <introspection failed:", e, ">")
-PY
-    else
-        apptainer exec "$SIF_PATH" \
-            python3 -m sglang.launch_server --help 2>&1 \
-            | grep -A 6 -iE '\-\-(tool-call|reasoning)-parser' || true
-    fi
+    log "Parsers available in $SIF_PATH:"
+    apptainer exec "$SIF_PATH" \
+        bash -c "sglang serve --help 2>&1 || python3 -m sglang.launch_server --help 2>&1" \
+        | grep -A 6 -iE '\-\-(tool-call|reasoning)-parser' || \
+        warn "Could not read parser choices from --help."
     echo
+    log "K3 ships its own parsers (kimi_k3), NOT kimi_k2."
     log "Set TOOL_PARSER / REASONING_PARSER in kimik3.env from this list ('none' to omit)."
     exit 0
 fi
 
 # ── check mode: can this image load this model? ─────────────────────────────
-# The single most useful question on K3 flip day. Reads the model's
-# 'architectures' from config.json and asks the engine's registry if it knows it.
+# The cheap gate before committing to a ~1.5 TB download.
 
 if [[ "$MODE" == "check" ]]; then
-    log "Engine:  $ENGINE"
     log "Image:   $SIF_PATH"
     log "Model:   $MODEL_ID"
     echo
@@ -264,58 +246,53 @@ if [[ "$MODE" == "check" ]]; then
         --env HF_HOME="$MODEL_CACHE_DIR" \
         --env HF_TOKEN="${HF_TOKEN:-}" \
         --env MODEL_ID="$MODEL_ID" \
-        --env ENGINE="$ENGINE" \
         "$SIF_PATH" python3 - <<'PY' || rc=$?
 import os, sys
 
 model_id = os.environ["MODEL_ID"]
-engine = os.environ["ENGINE"]
 
 try:
     from transformers import AutoConfig
     cfg = AutoConfig.from_pretrained(model_id, trust_remote_code=True)
     archs = getattr(cfg, "architectures", None) or []
     print(f"  config.json architectures : {archs}")
+    text = getattr(cfg, "text_config", None)
+    src = text if text is not None else cfg
     for attr in ("num_hidden_layers", "num_experts", "num_experts_per_tok",
                  "max_position_embeddings", "quantization_config"):
-        if hasattr(cfg, attr):
-            v = getattr(cfg, attr)
+        if hasattr(src, attr):
+            v = getattr(src, attr)
             if attr == "quantization_config" and isinstance(v, dict):
-                v = {k: v[k] for k in list(v)[:6]}
+                grp = (v.get("config_groups") or {}).get("group_0", {})
+                v = grp.get("format", v.get("quant_method", "?"))
             print(f"  {attr:26}: {v}")
 except Exception as e:
     print(f"  !! could not load config for {model_id}: {e}")
-    print("     (not released yet, gated, or no network from this node?)")
+    print("     (gated, or no network from this node?)")
     sys.exit(2)
 
 print()
-missing = []
-if engine == "vllm":
-    from vllm.model_executor.models.registry import ModelRegistry
-    known = set(ModelRegistry.get_supported_archs())
-else:
-    from sglang.srt.models.registry import ModelRegistry  # type: ignore
-    known = set(getattr(ModelRegistry, "models", {}) or {})
-    if not known:
-        from sglang.srt.models import registry as _r
-        known = set(getattr(_r, "ModelRegistry").models)
+from sglang.srt.models.registry import ModelRegistry  # type: ignore
+known = set(getattr(ModelRegistry, "models", {}) or {})
 
+missing = []
 for a in archs:
     if a in known:
-        print(f"  OK   {engine} registry knows '{a}'")
+        print(f"  OK   SGLang registry knows '{a}'")
     else:
-        print(f"  MISS {engine} registry does NOT know '{a}'")
+        print(f"  MISS SGLang registry does NOT know '{a}'")
         missing.append(a)
 
 print(f"\n  ({len(known)} architectures registered in this image)")
-kimi = sorted(a for a in known if "kimi" in a.lower() or "moonshot" in a.lower())
+kimi = sorted(a for a in known if "kimi" in a.lower())
 print(f"  Kimi-family architectures present: {kimi or '<none>'}")
 
 if missing:
-    print("\n  => This image CANNOT serve this model. Use a newer image "
-          "(./check-k3-readiness.sh prints current candidate tags).")
+    print("\n  => This image CANNOT serve this model. It is probably built from "
+          "main rather\n     than the 'kimi-k3' branch — see the README "
+          "'When the branch merges'.")
     sys.exit(1)
-print("\n  => This image can load this model's architecture.")
+print("\n  => This image can load this model. Safe to download the weights.")
 PY
     case "$rc" in
         0) log "check passed." ;;
@@ -333,30 +310,19 @@ weights_dir="$MODEL_CACHE_DIR/hub/models--${MODEL_ID//\//--}"
 weights_cached=0
 [[ -d "$weights_dir/snapshots" ]] && weights_cached=1
 
-if [[ -z "${HF_TOKEN:-}" && "$weights_cached" -eq 0 ]]; then
-    die "No HF_TOKEN / HF_TOKEN_FILE set and weights for $MODEL_ID are not cached yet in $MODEL_CACHE_DIR."
-fi
-
-# Rough download size, used only for the free-space warning.
-# (Measured: amd/Kimi-K2.6-MXFP4 is 559 GB — only experts/shared_experts are
-# FP4, attention and embeddings stay higher precision, so it is roughly double a
-# naive params x 4.25 bits estimate. The K3 figure scales from that ratio.)
-case "$MODEL_ID" in
-    *Kimi-K3*|*Kimi-K3-MXFP4*) est_gb=1600; need_gb=1700 ;;
-    *K2.6*|*K2.5*)             est_gb=560;  need_gb=650  ;;
-    *)                         est_gb=0;    need_gb=0    ;;
-esac
+# Measured from moonshotai/Kimi-K3's safetensors index.
+EST_GB=1561
+NEED_GB=1700
 
 if [[ "$weights_cached" -eq 0 ]]; then
-    if [[ "$need_gb" -gt 0 ]]; then
-        free_gb="$(df -Pk "$MODEL_CACHE_DIR" | awk 'NR==2 {print int($4/1024/1024)}')"
-        if [[ "${free_gb:-0}" -lt "$need_gb" ]]; then
-            warn "Only ${free_gb} GB free in $MODEL_CACHE_DIR; $MODEL_ID needs ~${est_gb} GB (${need_gb} GB recommended). Download may fail."
-        fi
-        log "Weights not cached — first start downloads ~${est_gb} GB. Consider './serve-kimik3.sh download' first."
-    else
-        log "Weights for $MODEL_ID not cached yet — they'll download on first start."
+    [[ -n "${HF_TOKEN:-}" ]] \
+        || die "No HF_TOKEN / HF_TOKEN_FILE set and weights for $MODEL_ID are not cached yet in $MODEL_CACHE_DIR."
+    free_gb="$(df -Pk "$MODEL_CACHE_DIR" | awk 'NR==2 {print int($4/1024/1024)}')"
+    if [[ "${free_gb:-0}" -lt "$NEED_GB" ]]; then
+        warn "Only ${free_gb} GB free in $MODEL_CACHE_DIR; $MODEL_ID is ~${EST_GB} GB (${NEED_GB} GB recommended with the .sif). Download will likely fail."
+        warn "  Check your quota with 'rquota' before starting a multi-hour transfer."
     fi
+    log "Weights not cached — first start downloads ~${EST_GB} GB. Run './serve-kimik3.sh download' first."
 else
     log "Found cached weights for $MODEL_ID."
 fi
@@ -364,7 +330,7 @@ fi
 # ── Download mode (no GPU required) ─────────────────────────────────────────
 
 if [[ "$MODE" == "download" ]]; then
-    log "Prefetching $MODEL_ID into $MODEL_CACHE_DIR (no GPU required) ..."
+    log "Prefetching $MODEL_ID into $MODEL_CACHE_DIR (~${EST_GB} GB, no GPU required) ..."
     apptainer exec \
         --bind "$MODEL_CACHE_DIR":"$MODEL_CACHE_DIR" \
         --env HF_HOME="$MODEL_CACHE_DIR" \
@@ -373,6 +339,18 @@ if [[ "$MODE" == "download" ]]; then
         "$SIF_PATH" \
         bash -c "hf download '$MODEL_ID' || huggingface-cli download '$MODEL_ID'" \
         || die "Weights download failed. Re-run to resume."
+
+    if [[ "$SPECULATIVE" == "dspark" ]]; then
+        log "Prefetching the DSpark draft model $DSPARK_MODEL ..."
+        apptainer exec \
+            --bind "$MODEL_CACHE_DIR":"$MODEL_CACHE_DIR" \
+            --env HF_HOME="$MODEL_CACHE_DIR" \
+            --env HF_TOKEN="${HF_TOKEN:-}" \
+            --env HF_HUB_ENABLE_HF_TRANSFER=1 \
+            "$SIF_PATH" \
+            bash -c "hf download '$DSPARK_MODEL' || huggingface-cli download '$DSPARK_MODEL'" \
+            || die "DSpark draft download failed."
+    fi
     log "Download complete."
     exit 0
 fi
@@ -386,27 +364,18 @@ if command -v rocminfo >/dev/null 2>&1; then
     gfx="$(rocminfo 2>/dev/null | grep -om1 'gfx[0-9a-f]*' || true)"
     case "$gfx" in
         gfx950) log "Detected gfx950 (MI350X/MI355X) — matches the configured MXFP4 image/model." ;;
-        gfx942) warn "Detected gfx942 (MI300X/MI325X). This repo targets MI355X/MXFP4, which gfx942 cannot run.
-        Switch to an FP8 model and an mi30x image — see the README 'Running on MI300X/MI325X' section." ;;
+        gfx942) warn "Detected gfx942 (MI300X/MI325X). K3 needs ~1.5 TB and gfx950's native MXFP4 —
+        this recipe will not work here. See the README 'Running on other hardware'." ;;
         "")     warn "Could not detect GPU arch from rocminfo." ;;
-        *)      warn "Detected $gfx — this recipe is tuned for gfx950 (MI355X)." ;;
+        *)      warn "Detected $gfx — this recipe is validated for gfx950 (MI355X)." ;;
     esac
 fi
 
-# ── Parallelism layout ──────────────────────────────────────────────────────
-# The two engines mean different things by DP, so validate per engine.
-#
-#   SGLang: --tp IS the total GPU count. --dp (with --enable-dp-attention) only
-#           SUBDIVIDES those GPUs for attention, so DP must divide TP.
-#   vLLM:   --data-parallel-size MULTIPLIES: total GPUs = DP * TP.
-
-if [[ "$ENGINE" == "vllm" ]]; then
-    GPUS_USED=$(( TP_SIZE * DP_SIZE ))
-else
-    GPUS_USED="$TP_SIZE"
-    if [[ "${DP_SIZE:-1}" -gt 1 && $(( TP_SIZE % DP_SIZE )) -ne 0 ]]; then
-        die "SGLang: DP_SIZE=$DP_SIZE must divide TP_SIZE=$TP_SIZE (dp-attention splits the $TP_SIZE GPUs into $DP_SIZE groups)."
-    fi
+# --tp IS the total GPU count. --dp (with dp-attention) only subdivides those
+# GPUs for attention — it does NOT multiply the count — so DP must divide TP.
+GPUS_USED="$TP_SIZE"
+if [[ "${DP_SIZE:-1}" -gt 1 && $(( TP_SIZE % DP_SIZE )) -ne 0 ]]; then
+    die "DP_SIZE=$DP_SIZE must divide TP_SIZE=$TP_SIZE (dp-attention splits the $TP_SIZE GPUs into $DP_SIZE groups)."
 fi
 
 GPU_VIS="${ROCR_VISIBLE_DEVICES:-${HIP_VISIBLE_DEVICES:-${CUDA_VISIBLE_DEVICES:-}}}"
@@ -418,10 +387,7 @@ elif [[ -n "${SLURM_GPUS_ON_NODE:-}" ]]; then
 fi
 [[ -n "$GPU_VIS" ]] && log "Allocated GPUs: [$GPU_VIS]"
 if [[ -n "$alloc_count" && "$alloc_count" -gt 0 && "$GPUS_USED" -ne "$alloc_count" ]]; then
-    if [[ "$ENGINE" == "vllm" ]]; then
-        die "vLLM needs DP_SIZE * TP_SIZE to equal the allocation: ${DP_SIZE} * ${TP_SIZE} = ${GPUS_USED}, but ${alloc_count} GPUs are allocated. Use TP_SIZE=${alloc_count} DP_SIZE=1 (or e.g. TP_SIZE=4 DP_SIZE=2 on 8 GPUs)."
-    fi
-    warn "TP_SIZE=$TP_SIZE uses $GPUS_USED GPU(s) but $alloc_count are allocated — you'd leave $((alloc_count - GPUS_USED)) idle (or over-subscribe). Set TP_SIZE=$alloc_count to use them all. (An MI355X node = 8 GPUs -> TP_SIZE=8.)"
+    warn "TP_SIZE=$TP_SIZE uses $GPUS_USED GPU(s) but $alloc_count are allocated. K3 needs all 8 (~1.5 TB of weights); set TP_SIZE=$alloc_count."
 fi
 
 # Port free?
@@ -452,8 +418,8 @@ fi
 # The MXFP4 MoE JIT-compiles FlyDSL kernels and caches them INSIDE the image —
 # but an Apptainer .sif is read-only, so that write fails ("Read-only file
 # system"). Bind a writable scratch dir over that path (and keep the compiled
-# kernels across runs). aiter lives in a different place in each image, so ask
-# the image where it is rather than hardcoding a path.
+# kernels across runs). aiter's location differs between images, so ask the
+# image where it is rather than hardcoding a path.
 
 FLYDSL_CACHE_DIR="${FLYDSL_CACHE_DIR:-$MODEL_CACHE_DIR/flydsl-cache}"
 mkdir -p "$FLYDSL_CACHE_DIR" 2>/dev/null || true
@@ -474,98 +440,58 @@ else
     warn "  FLYDSL_CACHE_TARGET in kimik3.env to the path from that error message."
 fi
 
-# ── Build the engine command ────────────────────────────────────────────────
+# ── Build the launch command ────────────────────────────────────────────────
 
+# shellcheck disable=SC2206  # intentional word splitting of the configured launcher
+launcher=($LAUNCH_CMD)
 # shellcheck disable=SC2206  # intentional word splitting of user-provided extra args
 extra_args=($EXTRA_ENGINE_ARGS)
 
-engine_env=()
-cmd=()
+dp_flag=()
+[[ "${DP_SIZE:-1}" -gt 1 ]] && dp_flag=(--dp "$DP_SIZE" --enable-dp-attention)
 
-if [[ "$ENGINE" == "vllm" ]]; then
-    kv_flag=()
-    case "$KV_CACHE_DTYPE" in
-        ""|auto) ;;
-        fp8|fp8_e4m3) kv_flag=(--kv-cache-dtype fp8) ;;
-        *)            kv_flag=(--kv-cache-dtype "$KV_CACHE_DTYPE") ;;
-    esac
+ctx_flag=()
+[[ -n "$CONTEXT_LEN" ]] && ctx_flag=(--context-length "$CONTEXT_LEN")
 
-    par_flags=(--tensor-parallel-size "$TP_SIZE")
-    [[ "${DP_SIZE:-1}" -gt 1 ]] && par_flags+=(--data-parallel-size "$DP_SIZE")
-    [[ "$ENABLE_EP" == "1" ]]   && par_flags+=(--enable-expert-parallel)
+kv_flag=()
+[[ -n "$KV_CACHE_DTYPE" ]] && kv_flag=(--kv-cache-dtype "$KV_CACHE_DTYPE")
 
-    parser_flags=()
-    [[ "$TOOL_PARSER" != "none" && -n "$TOOL_PARSER" ]] \
-        && parser_flags+=(--enable-auto-tool-choice --tool-call-parser "$TOOL_PARSER")
-    [[ "$REASONING_PARSER" != "none" && -n "$REASONING_PARSER" ]] \
-        && parser_flags+=(--reasoning-parser "$REASONING_PARSER")
+radix_flag=()
+[[ "$DISABLE_RADIX_CACHE" == "1" ]] && radix_flag=(--disable-radix-cache)
 
-    perf_flags=()
-    [[ -n "$CHUNKED_PREFILL_SIZE" ]] && perf_flags+=(--max-num-batched-tokens "$CHUNKED_PREFILL_SIZE")
-    [[ -n "$MAX_RUNNING_REQUESTS" ]] && perf_flags+=(--max-num-seqs "$MAX_RUNNING_REQUESTS")
-    [[ -n "$CUDA_GRAPH_MAX_BS"    ]] && perf_flags+=(--cuda-graph-sizes "$CUDA_GRAPH_MAX_BS")
-    [[ -n "$SCHEDULE_POLICY"      ]] && warn "SCHEDULE_POLICY is SGLang-only and is ignored with ENGINE=vllm (vLLM enables prefix caching by default)."
+parser_flags=()
+[[ "$TOOL_PARSER" != "none" && -n "$TOOL_PARSER" ]] \
+    && parser_flags+=(--tool-call-parser "$TOOL_PARSER")
+[[ "$REASONING_PARSER" != "none" && -n "$REASONING_PARSER" ]] \
+    && parser_flags+=(--reasoning-parser "$REASONING_PARSER")
 
-    if [[ "$ENABLE_AITER" == "1" ]]; then
-        engine_env+=(--env VLLM_ROCM_USE_AITER=1 --env VLLM_ROCM_USE_AITER_MOE=1)
-    else
-        engine_env+=(--env VLLM_ROCM_USE_AITER=0)
-    fi
-    # vLLM's own CPU pinning is off unless asked for; leave VLLM_CPU_OMP_THREADS_BIND
-    # unset so we don't repeat SGLang's SLURM-cgroup affinity crash.
+spec_flags=()
+if [[ "$SPECULATIVE" == "dspark" ]]; then
+    spec_flags=(--speculative-draft-model-path "$DSPARK_MODEL"
+                --speculative-algorithm DSPARK)
+    log "DSpark speculative decoding ENABLED (draft: $DSPARK_MODEL)."
+    warn "  DSpark has an open crash report upstream (sglang issue #32569)."
+    warn "  If startup fails with \"TypeError: 'NoneType' object is not callable\","
+    warn "  unset SPECULATIVE in kimik3.env and retry the baseline config."
+fi
 
-    cmd=(vllm serve "$MODEL_ID"
-         --served-model-name "$SERVED_MODEL_NAME"
-         "${par_flags[@]}"
-         --host 0.0.0.0 --port "$PORT"
-         --max-model-len "$CONTEXT_LEN"
-         --gpu-memory-utilization "$MEM_FRACTION"
-         ${kv_flag[@]+"${kv_flag[@]}"}
-         --api-key "$KIMIK3_API_KEY"
-         --trust-remote-code
-         ${parser_flags[@]+"${parser_flags[@]}"}
-         ${perf_flags[@]+"${perf_flags[@]}"}
-         ${extra_args[@]+"${extra_args[@]}"})
-else
-    kv_flag=()
-    case "$KV_CACHE_DTYPE" in
-        ""|auto) ;;
-        fp8|fp8_e4m3) kv_flag=(--kv-cache-dtype fp8_e4m3) ;;
-        *)            kv_flag=(--kv-cache-dtype "$KV_CACHE_DTYPE") ;;
-    esac
+perf_flags=()
+[[ -n "$CHUNKED_PREFILL_SIZE" ]] && perf_flags+=(--chunked-prefill-size "$CHUNKED_PREFILL_SIZE")
+[[ -n "$MAX_RUNNING_REQUESTS" ]] && perf_flags+=(--max-running-requests "$MAX_RUNNING_REQUESTS")
+if [[ -n "$SCHEDULE_POLICY" ]]; then
+    perf_flags+=(--schedule-policy "$SCHEDULE_POLICY")
+    [[ "$DISABLE_RADIX_CACHE" == "1" ]] \
+        && warn "SCHEDULE_POLICY=$SCHEDULE_POLICY has little effect while DISABLE_RADIX_CACHE=1 (prefix reuse is off)."
+fi
 
-    par_flags=(--tp "$TP_SIZE")
-    [[ "${DP_SIZE:-1}" -gt 1 ]] && par_flags+=(--dp "$DP_SIZE" --enable-dp-attention)
-    [[ "$ENABLE_EP" == "1" ]]   && par_flags+=(--ep-size "$TP_SIZE")
-
-    parser_flags=()
-    [[ "$TOOL_PARSER" != "none" && -n "$TOOL_PARSER" ]] \
-        && parser_flags+=(--tool-call-parser "$TOOL_PARSER")
-    [[ "$REASONING_PARSER" != "none" && -n "$REASONING_PARSER" ]] \
-        && parser_flags+=(--reasoning-parser "$REASONING_PARSER")
-
-    perf_flags=()
-    [[ -n "$SCHEDULE_POLICY"      ]] && perf_flags+=(--schedule-policy "$SCHEDULE_POLICY")
-    [[ -n "$CHUNKED_PREFILL_SIZE" ]] && perf_flags+=(--chunked-prefill-size "$CHUNKED_PREFILL_SIZE")
-    [[ -n "$MAX_RUNNING_REQUESTS" ]] && perf_flags+=(--max-running-requests "$MAX_RUNNING_REQUESTS")
-    [[ -n "$CUDA_GRAPH_MAX_BS"    ]] && perf_flags+=(--cuda-graph-max-bs "$CUDA_GRAPH_MAX_BS")
-    [[ "$ENABLE_AITER" == "1"     ]] && perf_flags+=(--enable-aiter-allreduce-fusion)
-
-    engine_env+=(--env "SGLANG_SET_CPU_AFFINITY=$SET_CPU_AFFINITY")
-
-    cmd=(python3 -m sglang.launch_server
-         --model-path "$MODEL_ID"
-         --served-model-name "$SERVED_MODEL_NAME"
-         "${par_flags[@]}"
-         --host 0.0.0.0 --port "$PORT"
-         --context-length "$CONTEXT_LEN"
-         --mem-fraction-static "$MEM_FRACTION"
-         ${kv_flag[@]+"${kv_flag[@]}"}
-         --api-key "$KIMIK3_API_KEY"
-         --trust-remote-code
-         ${parser_flags[@]+"${parser_flags[@]}"}
-         ${perf_flags[@]+"${perf_flags[@]}"}
-         ${extra_args[@]+"${extra_args[@]}"})
+# Upstream's four K3/AITER variables — this is how the K3 fused FP4 path is
+# turned on. Note there is no --enable-aiter-allreduce-fusion in this recipe.
+aiter_env=()
+if [[ "$ENABLE_AITER" == "1" ]]; then
+    aiter_env=(--env SGLANG_USE_AITER=1
+               --env SGLANG_AITER_K3_OPT=1
+               --env AITER_FLYDSL_FORCE=1
+               --env AITER_SITUV2_A8W4=1)
 fi
 
 # Forward the SLURM GPU-visibility vars into the container (Apptainer inherits
@@ -575,16 +501,36 @@ gpu_env=()
 [[ -n "${HIP_VISIBLE_DEVICES:-}"  ]] && gpu_env+=(--env "HIP_VISIBLE_DEVICES=$HIP_VISIBLE_DEVICES")
 [[ -n "${CUDA_VISIBLE_DEVICES:-}" ]] && gpu_env+=(--env "CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES")
 
+cmd=("${launcher[@]}"
+     --model-path "$MODEL_ID"
+     --served-model-name "$SERVED_MODEL_NAME"
+     --trust-remote-code
+     --tp "$TP_SIZE"
+     ${dp_flag[@]+"${dp_flag[@]}"}
+     --attention-backend "$ATTENTION_BACKEND"
+     --dtype "$MODEL_DTYPE"
+     --mem-fraction-static "$MEM_FRACTION"
+     --cuda-graph-max-bs-decode "$CUDA_GRAPH_MAX_BS_DECODE"
+     --host 0.0.0.0 --port "$PORT"
+     --api-key "$KIMIK3_API_KEY"
+     ${radix_flag[@]+"${radix_flag[@]}"}
+     ${ctx_flag[@]+"${ctx_flag[@]}"}
+     ${kv_flag[@]+"${kv_flag[@]}"}
+     ${parser_flags[@]+"${parser_flags[@]}"}
+     ${spec_flags[@]+"${spec_flags[@]}"}
+     ${perf_flags[@]+"${perf_flags[@]}"}
+     ${extra_args[@]+"${extra_args[@]}"})
+
 # ── Launch ──────────────────────────────────────────────────────────────────
 
-log "Starting $ENGINE: $MODEL_ID  (TP=$TP_SIZE DP=$DP_SIZE -> $GPUS_USED GPUs, ctx=$CONTEXT_LEN, port=$PORT)"
+log "Starting SGLang: $MODEL_ID  (TP=$TP_SIZE -> $GPUS_USED GPUs, ctx=${CONTEXT_LEN:-model max (1M)}, port=$PORT)"
 log "Image: $SIF_PATH"
 log "Logs:  $LOG_FILE"
 
 : > "$LOG_FILE"
 {
     printf '### serve-kimik3.sh  %s\n' "$(date)"
-    printf '### engine=%s image=%s\n' "$ENGINE" "$ENGINE_IMAGE"
+    printf '### image=%s\n' "$SGLANG_IMAGE"
     printf '### command: %s\n\n' "${cmd[*]}"
 } >> "$LOG_FILE"
 
@@ -594,7 +540,8 @@ apptainer exec --rocm \
     --env HF_HOME="$MODEL_CACHE_DIR" \
     --env HF_TOKEN="${HF_TOKEN:-}" \
     --env HF_HUB_ENABLE_HF_TRANSFER=1 \
-    ${engine_env[@]+"${engine_env[@]}"} \
+    --env SGLANG_SET_CPU_AFFINITY="$SET_CPU_AFFINITY" \
+    ${aiter_env[@]+"${aiter_env[@]}"} \
     ${gpu_env[@]+"${gpu_env[@]}"} \
     "$SIF_PATH" \
     "${cmd[@]}" \
@@ -605,8 +552,8 @@ echo "$SERVER_PID" > "$PID_FILE"
 cleanup() {
     log "Shutting down server ..."
     kill "$SERVER_PID" 2>/dev/null || true
-    pkill -f "$SERVER_PATTERN" 2>/dev/null || true
-    [[ "$ENGINE" == "vllm" ]] && pkill -f 'VLLM::EngineCore' 2>/dev/null || true
+    pkill -f 'sglang.launch_server' 2>/dev/null || true
+    pkill -f 'sglang serve'         2>/dev/null || true
     rm -f "$PID_FILE"
 }
 trap cleanup EXIT
@@ -615,7 +562,8 @@ trap 'exit 143' TERM
 
 # ── Wait for readiness ──────────────────────────────────────────────────────
 
-log "Waiting for the server to become healthy (timeout ${READY_TIMEOUT}s; model load takes several minutes, first-run download much longer) ..."
+log "Waiting for the server to become healthy (timeout ${READY_TIMEOUT}s)."
+log "A cold start reads ~1.5 TB off scratch and JIT-compiles FP4 kernels — be patient."
 log "Follow detailed progress in another shell with: tail -f $LOG_FILE"
 
 start_ts="$(date +%s)"
@@ -628,8 +576,10 @@ while true; do
         tail -n 60 "$LOG_FILE" 2>&1 || true
         rm -f "$PID_FILE"
         die "Server process exited during startup. Last 60 log lines above ($LOG_FILE).
-     If it failed on an unknown architecture, run: ./serve-kimik3.sh check
-     If it failed on an unknown parser name, run:  ./serve-kimik3.sh parsers"
+     Unknown architecture?   ./serve-kimik3.sh check
+     Unknown parser name?    ./serve-kimik3.sh parsers
+     KV cache OOM?           set CONTEXT_LEN=262144 in kimik3.env and retry
+     DSpark TypeError?       unset SPECULATIVE (sglang issue #32569)"
     fi
     if (( $(date +%s) - start_ts > READY_TIMEOUT )); then
         die "Server did not become healthy within ${READY_TIMEOUT}s. Check: tail -f $LOG_FILE"
@@ -647,16 +597,18 @@ cat <<EOF
   $SERVED_MODEL_NAME is up and serving on Bunya's MI355X.
 
   Model:       $MODEL_ID
-  Engine:      $ENGINE   (TP=$TP_SIZE DP=$DP_SIZE, ctx=$CONTEXT_LEN)
+  Layout:      TP=$TP_SIZE, ctx=${CONTEXT_LEN:-model max (1M)}, spec=${SPECULATIVE:-off}
   Node:        $NODE_HOST     (job $JOBID)
   Endpoint:    http://$NODE_HOST:$PORT/v1   (OpenAI-compatible)
   Model name:  $SERVED_MODEL_NAME
   API key:     $API_KEY_FILE
                export KIMIK3_API_KEY="\$(cat $API_KEY_FILE)"
 
-  Smoke test (from this node):
-    curl -s http://127.0.0.1:$PORT/v1/models \\
-         -H "Authorization: Bearer \$KIMIK3_API_KEY"
+  Smoke test (from this node) — READ THE REPLY, coherence is the real test:
+    curl -s http://127.0.0.1:$PORT/v1/chat/completions \\
+      -H "Authorization: Bearer \$KIMIK3_API_KEY" \\
+      -H 'Content-Type: application/json' \\
+      -d '{"model":"$SERVED_MODEL_NAME","messages":[{"role":"user","content":"Say hello in one sentence."}]}'
 
   Second shell into this job (to run opencode alongside the server):
     srun --overlap --jobid $JOBID --pty /bin/bash -l
@@ -667,6 +619,9 @@ cat <<EOF
   opencode: run ./opencode-setup.sh --host $NODE_HOST --port $PORT
             (or --host localhost when tunnelling), then pick
             '$SERVED_MODEL_NAME' via /models inside opencode.
+
+  Benchmark: ./bench-kimik3.sh sweep
+             (upstream MI355 TP8 reference: 820 / 2356 / 4898 tok/s @ c=2/8/32)
 
   Stop with Ctrl-C, 'scancel $JOBID', or './serve-kimik3.sh stop'.
 ============================================================================
