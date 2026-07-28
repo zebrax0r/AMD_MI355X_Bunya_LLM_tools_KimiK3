@@ -393,11 +393,24 @@ channels:
    not. aiter shells out to `rocminfo` purely to name the architecture, and
    reports only its exit status — which makes a cosmetic failure look fatal.
 
-   Fix, in `kimik3.env`:
+   What the image's `rocminfo` actually prints on such a node:
 
-   ```bash
-   export AITER_GPU_ARCHS="${AITER_GPU_ARCHS:-gfx950}"
    ```
+   ROCk module version 6.19.14.31400000 is loaded
+   hsa api call failure at: .../rocminfo.cc:357
+   Call returned HSA_STATUS_ERROR_INVALID_ARGUMENT
+   ```
+
+   It loads, reads the driver version, then fails an HSA call against the newer
+   KFD. **Fix: `ROCMINFO_SHIM` (default `auto`, so this is automatic.)** The
+   script snapshots the *host's* working `rocminfo` output and binds a one-line
+   script replaying it over the container's binary. That is real output for
+   this node, so whatever aiter's parser expects it gets, and nothing links
+   against it — no host libraries are involved.
+
+   `AITER_GPU_ARCHS=gfx950` looks like the obvious fix and **does not work**:
+   the `rocm720-mi35x-k3-20260727` build of aiter ignores `GPU_ARCHS` at
+   runtime (tested on bun161, 28 Jul 2026).
 
 `gpucheck` tells you which one you have, in about a minute:
 
@@ -513,7 +526,8 @@ All knobs live in `kimik3.env` (copied from `kimik3-env.example`). Anything you
 | `DSPARK_MODEL` | `RadixArk/Kimi-K3-DSpark` | Draft model for DSpark |
 | `ENABLE_AITER` | `1` | Exports the four `SGLANG_*`/`AITER_*` K3 variables |
 | `ROCM_MODE` | `auto` | GPU passthrough: `auto` probes, `rocm` uses `--rocm`, `devices` binds `/dev/kfd` only |
-| `AITER_GPU_ARCHS` | *(empty)* | Sets `GPU_ARCHS` so aiter skips `rocminfo`. One arch only (e.g. `gfx950`) |
+| `AITER_GPU_ARCHS` | *(empty)* | Sets `GPU_ARCHS`. Ignored at runtime by the pinned aiter build — prefer `ROCMINFO_SHIM` |
+| `ROCMINFO_SHIM` | `auto` | Replay the host's `rocminfo` output inside the container when the image's own fails |
 | `SET_CPU_AFFINITY` | `0` | Keep `0` under a SLURM cgroup (see troubleshooting) |
 | `READY_TIMEOUT` | `14400` | Seconds to wait for health (cold load is ~1.5 TB) |
 | `LAUNCH_CMD` | `sglang serve` | Escape hatch: `python3 -m sglang.launch_server` |
@@ -541,7 +555,8 @@ All knobs live in `kimik3.env` (copied from `kimik3-env.example`). Anything you
   reach the GPUs. Run `./serve-kimik3.sh gpucheck`; see
   [When the node's ROCm changes](#when-the-nodes-rocm-changes) for the three
   causes and which are fixable. Short version: if `gpucheck` shows torch seeing
-  the GPUs, set `AITER_GPU_ARCHS=gfx950` — only `rocminfo` is broken.
+  the GPUs, only `rocminfo` is broken and `ROCMINFO_SHIM=auto` (the default)
+  handles it. `AITER_GPU_ARCHS=gfx950` looks right but is ignored at runtime.
 - **KV cache OOM at startup**: set `CONTEXT_LEN=262144` first, and only then
   consider `MEM_FRACTION`. One knob at a time.
 - **`TypeError: 'NoneType' object is not callable`** with DSpark: known upstream

@@ -82,6 +82,7 @@ ENABLE_AITER="${ENABLE_AITER:-1}"
 FLYDSL_FORCE="${FLYDSL_FORCE:-1}"
 ROCM_MODE="${ROCM_MODE:-auto}"
 AITER_GPU_ARCHS="${AITER_GPU_ARCHS:-}"
+ROCMINFO_SHIM="${ROCMINFO_SHIM:-auto}"
 SET_CPU_AFFINITY="${SET_CPU_AFFINITY:-0}"
 READY_TIMEOUT="${READY_TIMEOUT:-14400}"
 LAUNCH_CMD="${LAUNCH_CMD:-sglang serve}"
@@ -100,6 +101,11 @@ esac
 case "$ROCM_MODE" in
     auto|rocm|devices) ;;
     *) die "ROCM_MODE must be auto, rocm or devices, got '$ROCM_MODE'." ;;
+esac
+
+case "$ROCMINFO_SHIM" in
+    auto|off|force) ;;
+    *) die "ROCMINFO_SHIM must be auto, off or force, got '$ROCMINFO_SHIM'." ;;
 esac
 
 # GPU_ARCHS is a build-time hint that aiter also consults at runtime, and a
@@ -277,6 +283,71 @@ sif_stamp() {
 ROCM_MODE_CACHE="$MODEL_CACHE_DIR/.rocm-mode"
 rocm_cache_key() { printf '%s|%s' "$(hostname -s 2>/dev/null || echo node)" "$(sif_stamp)"; }
 
+# ── rocminfo shim ───────────────────────────────────────────────────────────
+#
+# On bun161 (node ROCm 7.14, image ROCm 7.2) the container's rocminfo loads,
+# reads the driver version, then fails:
+#
+#   ROCk module version 6.19.14.31400000 is loaded
+#   hsa api call failure at: .../rocminfo.cc:357
+#   Call returned HSA_STATUS_ERROR_INVALID_ARGUMENT
+#
+# ...while torch sees all 8 GPUs, because PyTorch's ROCm wheel bundles its own
+# HIP runtime. So the image's ROCm *tools* are broken on this node and its
+# *runtime* is fine. aiter only shells out to rocminfo to read the architecture
+# out of its text — and GPU_ARCHS is not honoured by this aiter build — so give
+# it text that is correct: a snapshot of the HOST's working rocminfo, replayed
+# by a one-line script bound over the container's binary.
+#
+# This is exact rather than synthesised: it is real output for this node, so
+# whatever aiter's parser expects, it gets. Nothing links against it and no
+# host libraries are involved.
+
+make_rocminfo_shim() {   # -> sets global shim_args
+    shim_args=()
+    [[ "$ROCMINFO_SHIM" == "off" ]] && return 0
+
+    local target snap shim
+    target="$(apptainer exec "$SIF_PATH" \
+        sh -c 'ls -d /opt/rocm*/bin/rocminfo 2>/dev/null | head -n1' 2>/dev/null || true)"
+    if [[ -z "$target" ]]; then
+        [[ "$ROCMINFO_SHIM" == "force" ]] \
+            && warn "ROCMINFO_SHIM=force but no rocminfo found in the image — skipping."
+        return 0
+    fi
+
+    # Only step in when the container's own rocminfo is actually broken.
+    if [[ "$ROCMINFO_SHIM" != "force" ]] \
+       && apptainer exec --rocm "$SIF_PATH" "$target" >/dev/null 2>&1; then
+        return 0
+    fi
+
+    if ! command -v rocminfo >/dev/null 2>&1; then
+        warn "The container's rocminfo fails and the host has none to copy — aiter will not
+  be able to detect the GPU architecture."
+        return 0
+    fi
+
+    snap="$MODEL_CACHE_DIR/rocminfo-host.txt"
+    if ! rocminfo > "$snap" 2>/dev/null || ! grep -q 'gfx' "$snap"; then
+        rm -f "$snap"
+        warn "The host's rocminfo did not produce usable output — cannot shim."
+        return 0
+    fi
+
+    # Embed the snapshot in the script so the bind is self-contained.
+    shim="$MODEL_CACHE_DIR/rocminfo-shim.sh"
+    {
+        printf '#!/bin/sh\ncat <<'\''KIMIK3_ROCMINFO_EOF'\''\n'
+        cat "$snap"
+        printf 'KIMIK3_ROCMINFO_EOF\n'
+    } > "$shim"
+    chmod +x "$shim"
+
+    shim_args=(--bind "$shim":"$target")
+    log "rocminfo shim: the image's rocminfo fails on this node; binding the host's output over $target"
+}
+
 set_rocm_mode_args() {   # $1 = mode -> sets global rocm_args
     case "$1" in
         rocm)    rocm_args=(--rocm) ;;
@@ -400,6 +471,8 @@ if [[ "$MODE" == "gpucheck" ]]; then
         probe_extra+=(--env "GPU_ARCHS=$AITER_GPU_ARCHS")
         log "Probing with GPU_ARCHS=$AITER_GPU_ARCHS"
     fi
+    make_rocminfo_shim
+    probe_extra+=(${shim_args[@]+"${shim_args[@]}"})
     echo
 
     # What does the image's rocminfo actually say? aiter only reports the exit
@@ -447,14 +520,18 @@ if [[ "$MODE" == "gpucheck" ]]; then
     if [[ "$best_devices" -gt 0 ]]; then
         warn "Verdict: the GPUs ARE reachable ($best_devices via '$best_mode') — only aiter's
   architecture detection is broken. It shells out to the image's rocminfo, and
-  that binary is failing against this node's driver even though HIP is fine.
-  This does NOT need a new image. Tell aiter the architecture directly:
-
-      AITER_GPU_ARCHS=${host_gfx:-gfx950}    # in kimik3.env
-
-  then re-run './serve-kimik3.sh gpucheck' to confirm. If it still fails, this
-  build of aiter ignores GPU_ARCHS at runtime and the image is the answer after
-  all — see the README 'When the node's ROCm changes'."
+  that binary fails on this node even though HIP is fine. This does NOT need a
+  new image."
+        if [[ ${#shim_args[@]} -gt 0 ]]; then
+            warn "  The rocminfo shim was already applied and aiter still could not read the
+  architecture, so it is not parsing rocminfo the way we assumed. Send the
+  output of:
+      apptainer exec $SIF_PATH \\
+          sed -n '1,90p' /sgl-workspace/aiter/aiter/jit/utils/chip_info.py"
+        else
+            warn "  No shim was applied. Set ROCMINFO_SHIM=force in $ENV_FILE to replay the
+  host's rocminfo output inside the container, then re-run gpucheck."
+        fi
         exit 1
     fi
 
@@ -909,8 +986,11 @@ log "Logs:  $LOG_FILE"
 # construction the configuration we run. (An earlier version tested a
 # separately-built command; it passed while the real launch was missing a
 # bind, which is a very expensive way to be wrong.)
+make_rocminfo_shim
+
 base_args=(--bind "$MODEL_CACHE_DIR":"$MODEL_CACHE_DIR"
     ${cache_bind[@]+"${cache_bind[@]}"}
+    ${shim_args[@]+"${shim_args[@]}"}
     --env HF_HOME="$MODEL_CACHE_DIR"
     --env HF_TOKEN="${HF_TOKEN:-}"
     --env HF_HUB_ENABLE_HF_TRANSFER=1
@@ -961,12 +1041,10 @@ if [[ -z "$chosen_mode" ]]; then
     # rather than a new image. Do not conflate the two.
     if [[ "${probe_best_devices:-0}" -gt 0 ]]; then
         die "The GPUs are reachable ($probe_best_devices seen) but aiter cannot determine the
-  architecture — the image's rocminfo is failing against this node's driver
-  even though HIP works. This does NOT need a new image. Set, in $ENV_FILE:
-
-      export AITER_GPU_ARCHS=\"\${AITER_GPU_ARCHS:-gfx950}\"
-
-  then re-run. Confirm with './serve-kimik3.sh gpucheck'."
+  architecture — the image's rocminfo fails on this node even though HIP works.
+  This does NOT need a new image.
+  rocminfo shim applied: ${shim_args[*]:-<none>}
+  Run './serve-kimik3.sh gpucheck' for the full report."
     fi
     die "No GPU passthrough mode works on this node — the container cannot reach the GPUs.
   Tried: ${ROCM_MODES[*]}

@@ -180,12 +180,29 @@ export DSPARK_MODEL="${DSPARK_MODEL:-RadixArk/Kimi-K3-DSpark}"
 # Run './serve-kimik3.sh gpucheck' (about a minute) to see the per-mode result.
 export ROCM_MODE="${ROCM_MODE:-auto}"
 
-# Tells aiter the GPU architecture directly (as GPU_ARCHS), so it skips its
-# rocminfo shell-out. A workaround for a broken rocminfo, NOT for a GPU the
-# container cannot reach — if torch sees no devices this changes nothing.
+# Tells aiter the GPU architecture directly (as GPU_ARCHS), so it can skip its
+# rocminfo shell-out. NOTE: the rocm720-mi35x-k3-20260727 build of aiter does
+# NOT honour this at runtime — tested on bun161, 28 Jul 2026 — so it is kept
+# only for images that might. Use ROCMINFO_SHIM below instead.
 # Must name exactly ONE arch: a list makes aiter pick the first entry at
 # runtime regardless of the hardware (ROCm/aiter#3807). Empty = leave alone.
 export AITER_GPU_ARCHS="${AITER_GPU_ARCHS:-}"   # e.g. gfx950
+
+# aiter reads the GPU architecture by running the image's rocminfo and parsing
+# its text. On a node whose ROCm is newer than the image's, that binary fails
+#   ROCk module version 6.19.14.31400000 is loaded
+#   hsa api call failure ... HSA_STATUS_ERROR_INVALID_ARGUMENT
+# even though torch sees all 8 GPUs (PyTorch's wheel bundles its own HIP
+# runtime). So the image's ROCm *tools* break while its *runtime* is fine.
+#
+# The shim snapshots the HOST's working rocminfo output and binds a one-line
+# script that replays it over the container's binary. Real output for this
+# node, so whatever aiter's parser expects it gets; nothing links against it.
+#
+#   auto  (default) shim only when the container's own rocminfo fails
+#   off   never
+#   force always (use if detection says it works but aiter still can't read it)
+export ROCMINFO_SHIM="${ROCMINFO_SHIM:-auto}"
 
 # aiter is AMD's fused kernel library and is where the gfx950 FP4 MoE speed
 # comes from. With 1 (default) serve-kimik3.sh exports upstream's four K3
