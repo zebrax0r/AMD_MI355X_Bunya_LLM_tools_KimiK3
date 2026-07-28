@@ -164,6 +164,12 @@ export DSPARK_MODEL="${DSPARK_MODEL:-RadixArk/Kimi-K3-DSpark}"
 # Set to 0 to drop all four if aiter is the thing crashing.
 export ENABLE_AITER="${ENABLE_AITER:-1}"
 
+# AITER_FLYDSL_FORCE routes gemms through the FlyDSL JIT compiler, which writes
+# into aiter/jit inside the read-only .sif. Set to 0 to use aiter's prebuilt
+# gemm path instead: slower than upstream's numbers, but it compiles nothing,
+# so it cannot hit the read-only-filesystem crash at CUDA-graph capture.
+export FLYDSL_FORCE="${FLYDSL_FORCE:-1}"
+
 # SGLang CPU-affinity pinning. The container image enables it, but it pins to
 # CPUs from the full node topology and CRASHES under a SLURM cgroup that owns
 # only a subset of cores ("CPU number N is not eligible"). Keep 0 unless you

@@ -78,6 +78,7 @@ REASONING_PARSER="${REASONING_PARSER:-kimi_k3}"
 SPECULATIVE="${SPECULATIVE:-}"
 DSPARK_MODEL="${DSPARK_MODEL:-RadixArk/Kimi-K3-DSpark}"
 ENABLE_AITER="${ENABLE_AITER:-1}"
+FLYDSL_FORCE="${FLYDSL_FORCE:-1}"
 SET_CPU_AFFINITY="${SET_CPU_AFFINITY:-0}"
 READY_TIMEOUT="${READY_TIMEOUT:-14400}"
 LAUNCH_CMD="${LAUNCH_CMD:-sglang serve}"
@@ -528,8 +529,16 @@ aiter_env=()
 if [[ "$ENABLE_AITER" == "1" ]]; then
     aiter_env=(--env SGLANG_USE_AITER=1
                --env SGLANG_AITER_K3_OPT=1
-               --env AITER_FLYDSL_FORCE=1
                --env AITER_SITUV2_A8W4=1)
+    # AITER_FLYDSL_FORCE is what routes gemms through the FlyDSL JIT compiler,
+    # which writes into aiter/jit/flydsl_cache inside the read-only .sif. Set
+    # FLYDSL_FORCE=0 to fall back to aiter's prebuilt gemm path: slower, but it
+    # compiles nothing and so cannot hit the read-only failure.
+    if [[ "$FLYDSL_FORCE" == "1" ]]; then
+        aiter_env+=(--env AITER_FLYDSL_FORCE=1)
+    else
+        warn "FLYDSL_FORCE=0 — using aiter's prebuilt gemm path, below upstream's numbers."
+    fi
 fi
 
 # Forward the SLURM GPU-visibility vars into the container (Apptainer inherits
