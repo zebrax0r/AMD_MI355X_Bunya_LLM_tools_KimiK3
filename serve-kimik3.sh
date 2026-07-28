@@ -473,20 +473,10 @@ else
     fi
 
     cache_bind=(--bind "$AITER_JIT_DIR":"$AITER_JIT_TARGET")
-    log "aiter JIT dir: $AITER_JIT_DIR -> $AITER_JIT_TARGET (writable)"
-
-    # Prove the bind is writable NOW, not 40 minutes into the weight load.
-    if ! apptainer exec "${cache_bind[@]}" "$SIF_PATH" \
-            sh -c "mkdir -p '$AITER_JIT_TARGET/flydsl_cache' \
-                   && touch '$AITER_JIT_TARGET/flydsl_cache/.write-test' \
-                   && rm -f '$AITER_JIT_TARGET/flydsl_cache/.write-test'" 2>/dev/null; then
-        die "aiter JIT dir is still read-only inside the container.
-  Tried to bind: $AITER_JIT_DIR -> $AITER_JIT_TARGET
-  Without this, startup dies at CUDA-graph capture after the full weight load.
-  Check that $AITER_JIT_DIR is on a writable filesystem, or override
-  AITER_JIT_TARGET in kimik3.env."
-    fi
+    log "aiter JIT dir: $AITER_JIT_DIR -> $AITER_JIT_TARGET"
 fi
+# The writability preflight lives just before the launch, so it can run against
+# the exact argv the server gets — see "Preflight" below.
 
 # ── Build the launch command ────────────────────────────────────────────────
 
@@ -575,22 +565,51 @@ log "Starting SGLang: $MODEL_ID  (TP=$TP_SIZE -> $GPUS_USED GPUs, ctx=${CONTEXT_
 log "Image: $SIF_PATH"
 log "Logs:  $LOG_FILE"
 
+# Assemble the container argv ONCE. Everything below — the preflight and the
+# launch itself — uses this same array, so the configuration we test is by
+# construction the configuration we run. (An earlier version tested a
+# separately-built command; it passed while the real launch was missing a
+# bind, which is a very expensive way to be wrong.)
+apptainer_args=(exec --rocm
+    --bind "$MODEL_CACHE_DIR":"$MODEL_CACHE_DIR"
+    ${cache_bind[@]+"${cache_bind[@]}"}
+    --env HF_HOME="$MODEL_CACHE_DIR"
+    --env HF_TOKEN="${HF_TOKEN:-}"
+    --env HF_HUB_ENABLE_HF_TRANSFER=1
+    --env SGLANG_SET_CPU_AFFINITY="$SET_CPU_AFFINITY"
+    ${aiter_env[@]+"${aiter_env[@]}"}
+    ${gpu_env[@]+"${gpu_env[@]}"})
+
+# ── Preflight: aiter's JIT dir must be writable *as the server will see it* ──
+# The FP4 MoE compiles FlyDSL kernels at CUDA-graph capture, which happens
+# after the ~1.5 TB weight load. Catch a read-only path in seconds instead.
+if [[ "${AITER_JIT_TARGET:-}" == /* ]]; then
+    probe="$AITER_JIT_TARGET/flydsl_cache/.write-test.$$"
+    if ! probe_err="$(apptainer "${apptainer_args[@]}" "$SIF_PATH" \
+            sh -c "mkdir -p '$AITER_JIT_TARGET/flydsl_cache' \
+                   && touch '$probe' && rm -f '$probe'" 2>&1)"; then
+        die "aiter's JIT dir is NOT writable inside the container.
+  Bind attempted : ${cache_bind[*]:-<none — detection failed>}
+  Path tested    : $probe
+  Container said : ${probe_err:-<no output>}
+  Startup would die at CUDA-graph capture after the full weight load.
+  Fix the bind, or set AITER_JIT_TARGET in kimik3.env to the jit/ directory
+  shown in the 'Read-only file system' traceback."
+    fi
+    log "Preflight OK: $AITER_JIT_TARGET is writable in the container."
+else
+    warn "No aiter JIT bind — startup will likely die at CUDA-graph capture."
+fi
+
 : > "$LOG_FILE"
 {
     printf '### serve-kimik3.sh  %s\n' "$(date)"
     printf '### image=%s\n' "$SGLANG_IMAGE"
+    printf '### apptainer: apptainer %s %s\n' "${apptainer_args[*]}" "$SIF_PATH"
     printf '### command: %s\n\n' "${cmd[*]}"
 } >> "$LOG_FILE"
 
-apptainer exec --rocm \
-    --bind "$MODEL_CACHE_DIR":"$MODEL_CACHE_DIR" \
-    ${cache_bind[@]+"${cache_bind[@]}"} \
-    --env HF_HOME="$MODEL_CACHE_DIR" \
-    --env HF_TOKEN="${HF_TOKEN:-}" \
-    --env HF_HUB_ENABLE_HF_TRANSFER=1 \
-    --env SGLANG_SET_CPU_AFFINITY="$SET_CPU_AFFINITY" \
-    ${aiter_env[@]+"${aiter_env[@]}"} \
-    ${gpu_env[@]+"${gpu_env[@]}"} \
+apptainer "${apptainer_args[@]}" \
     "$SIF_PATH" \
     "${cmd[@]}" \
     >>"$LOG_FILE" 2>&1 &
