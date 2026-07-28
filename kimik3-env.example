@@ -126,12 +126,24 @@ export MODEL_DTYPE="${MODEL_DTYPE:-bfloat16}"
 # memory), lower if graph capture OOMs.
 export CUDA_GRAPH_MAX_BS_DECODE="${CUDA_GRAPH_MAX_BS_DECODE:-256}"
 
-# --disable-radix-cache. Upstream sets this (1). Prefix caching would normally
-# help opencode a lot, since it resends similar context every turn — so this is
-# worth benching. Set to 0 to re-enable caching, then run ./bench-kimik3.sh and
-# compare. Upstream presumably disabled it deliberately, possibly because of how
-# KDA's recurrent state interacts with prefix reuse, so opt out knowingly.
-export DISABLE_RADIX_CACHE="${DISABLE_RADIX_CACHE:-1}"
+# --disable-radix-cache. Upstream sets this (1); we default to 0 (caching ON)
+# because we measured it, 29 Jul 2026 on bun161 with DSpark:
+#
+#   c    total tok/s        median TPOT        median TTFT
+#   2    918 -> 964         5.61 -> 5.35 ms    253 -> 255 ms
+#   8    2074 -> 2299       10.13 -> 9.10 ms   299 -> 288 ms
+#   32   3793 -> 4608       21.85 -> 14.04 ms  663 -> 1877 ms
+#
+# Better on throughput and per-token latency everywhere. The one cost is TTFT
+# at c=32 (P99 2383 -> 7998 ms) — the scheduler batches harder, so end-to-end
+# latency still improves (11.8 -> 9.3 s). Set back to 1 if you serve many
+# interactive users at once and first-token latency matters more than total
+# throughput.
+#
+# Note this measurement UNDERSTATES the gain for opencode: the benchmark uses
+# random prompts that share no prefixes, so it never exercises prefix reuse at
+# all. opencode resends a near-identical context every turn.
+export DISABLE_RADIX_CACHE="${DISABLE_RADIX_CACHE:-0}"
 
 # KV cache dtype. Upstream passes none, so this is empty by default. Set e.g.
 # fp8_e4m3 only if you have benched it and it helps.

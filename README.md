@@ -80,6 +80,11 @@ Three, each deliberate:
    SGLang then pins to CPUs from the *full* node topology, which fails under a
    SLURM cgroup owning a subset of cores. Upstream has no cgroup to trip over;
    we do. This one is ours.
+4. **Radix cache left ON** (`DISABLE_RADIX_CACHE=0`); upstream disables it.
+   Added 29 Jul 2026 from measurement, not preference — see
+   [Performance tuning](#performance-tuning). Better throughput *and* per-token
+   latency at every concurrency tested, and the benchmark understates it,
+   because random prompts never exercise the prefix reuse opencode depends on.
 
 ### Memory budget
 
@@ -369,6 +374,30 @@ Compare on metrics that are immune to request sizing instead:
 Use the table above as the local baseline for tuning: change one thing, re-run,
 keep it if the numbers improve.
 
+### Radix cache — measured, and now the default
+
+Upstream passes `--disable-radix-cache`. We do not. Same node, same sweep,
+DSpark on, prefix caching the only variable:
+
+| c | total tok/s | median TPOT | median TTFT |
+|---|---|---|---|
+| 2 | 918 -> **964** | 5.61 -> **5.35 ms** | 253 -> 255 ms |
+| 8 | 2074 -> **2299** | 10.13 -> **9.10 ms** | 299 -> **288 ms** |
+| 32 | 3793 -> **4608** | 21.85 -> **14.04 ms** | 663 -> 1877 ms |
+
+**The benchmark understates this.** `--dataset-name random` generates prompts
+that share no prefixes, so what is being measured is better KV reuse and
+scheduling — *not* prefix caching. The gain that matters for opencode, reusing a
+200k-token context across turns, is not exercised at all. Treat +5% at c=2 as a
+floor.
+
+The one cost is TTFT at c=32: median 663 -> 1877 ms, P99 2383 -> 7998 ms. The
+scheduler admits requests later and batches harder, so end-to-end latency still
+*improves* (11.8 -> 9.3 s) and the sweep finishes faster (81 -> 67 s). Set
+`DISABLE_RADIX_CACHE=1` if you are serving several interactive users at once and
+first-token latency matters more than total throughput. For a single opencode
+session at c=1-2 there is no TTFT penalty at all.
+
 **Read the token totals before believing a throughput number.** sglang's random
 dataset samples each length uniformly from `[len * ratio, len]`, and its default
 ratio is `0.0` — so a nominal 1024/512 sweep really sends about 507 in / 262 out
@@ -588,7 +617,7 @@ All knobs live in `kimik3.env` (copied from `kimik3-env.example`). Anything you
 | `ATTENTION_BACKEND` | `triton` | `--attention-backend` |
 | `MODEL_DTYPE` | `bfloat16` | `--dtype` (compute dtype; weights are MXFP4) |
 | `CUDA_GRAPH_MAX_BS_DECODE` | `256` | `--cuda-graph-max-bs-decode` (note: not `--cuda-graph-max-bs`) |
-| `DISABLE_RADIX_CACHE` | `1` | Upstream default. `0` re-enables prefix caching — bench it |
+| `DISABLE_RADIX_CACHE` | `0` | Prefix caching ON — our deviation, measured. `1` restores upstream's setting |
 | `KV_CACHE_DTYPE` | *(empty)* | Upstream passes none |
 | `TOOL_PARSER` | `kimi_k3` | Tool-call parser; `none` to omit |
 | `REASONING_PARSER` | `kimi_k3` | Thinking parser; `none` to omit |
