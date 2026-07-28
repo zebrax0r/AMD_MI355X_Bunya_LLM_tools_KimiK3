@@ -20,6 +20,7 @@
 #   ./serve-kimik3.sh pull       build the .sif from the container image (once)
 #   ./serve-kimik3.sh check      can this image load this model? (arch vs registry)
 #   ./serve-kimik3.sh gpucheck   can this image reach this node's GPUs? (~1 min)
+#   ./serve-kimik3.sh toolcheck  two-turn tool-call round trip vs a running server
 #   ./serve-kimik3.sh parsers    list tool-call/reasoning parsers this image has
 #   ./serve-kimik3.sh download   prefetch model weights only (no GPU needed)
 #   ./serve-kimik3.sh stop       stop a running server
@@ -174,9 +175,117 @@ case "$MODE" in
         fi
         exit 0
         ;;
+    toolcheck)
+        # Two-turn tool-call round trip against a RUNNING server. No .sif and no
+        # GPU needed — it is pure HTTP, so it also works through a tunnel.
+        #
+        # Half the value is in turn 2. A model emitting a plausible tool_calls
+        # object proves the parser serialises; it does not prove the loop
+        # closes. So the tool returns a value the model cannot guess, and we
+        # check that value appears in the final answer. opencode needs both.
+        key=""
+        [[ -r "${MODEL_CACHE_DIR:-}/kimik3-api-key" ]] && key="$(<"$MODEL_CACHE_DIR/kimik3-api-key")"
+        BASE="${TOOLCHECK_URL:-http://127.0.0.1:$PORT}" \
+        KEY="${KIMIK3_API_KEY:-$key}" \
+        MODEL="$SERVED_MODEL_NAME" \
+        python3 - <<'PY'
+import json, os, sys, urllib.request, urllib.error
+
+BASE, KEY, MODEL = os.environ["BASE"], os.environ["KEY"], os.environ["MODEL"]
+SECRET = 61.4          # unguessable: only the "tool" knows it
+NODE   = "bun161"
+
+TOOLS = [{"type": "function", "function": {
+    "name": "get_gpu_temperature",
+    "description": "Return the current GPU temperature in Celsius for a named Bunya compute node.",
+    "parameters": {"type": "object",
+                   "properties": {"node": {"type": "string",
+                                           "description": "Node hostname, e.g. bun161"}},
+                   "required": ["node"]}}}]
+
+def post(payload):
+    req = urllib.request.Request(
+        BASE + "/v1/chat/completions", data=json.dumps(payload).encode(),
+        headers={"Content-Type": "application/json", "Authorization": "Bearer " + KEY})
+    try:
+        with urllib.request.urlopen(req, timeout=600) as r:
+            return json.load(r)
+    except urllib.error.HTTPError as e:
+        print(f"  HTTP {e.code}: {e.read().decode()[:400]}")
+        sys.exit(1)
+    except Exception as e:
+        print(f"  request failed: {e}\n  Is the server up? ./serve-kimik3.sh status")
+        sys.exit(1)
+
+fails = []
+def check(ok, label, detail=""):
+    print(f"  [{'PASS' if ok else 'FAIL'}] {label}" + (f"  — {detail}" if detail else ""))
+    if not ok:
+        fails.append(label)
+
+msgs = [{"role": "user",
+         "content": f"What is the current GPU temperature on {NODE}? "
+                    "Use the tool, then state the number."}]
+
+print("Turn 1 — does the model emit a tool call?")
+r1 = post({"model": MODEL, "messages": msgs, "tools": TOOLS, "tool_choice": "auto",
+           "max_tokens": 2048, "temperature": 0})
+m1 = r1["choices"][0]["message"]
+fin = r1["choices"][0]["finish_reason"]
+calls = m1.get("tool_calls") or []
+
+check(bool(calls), "model returned tool_calls",
+      f"finish_reason={fin}" + ("" if calls else f", content={(m1.get('content') or '')[:120]!r}"))
+if not calls:
+    # A thinking model that ran out of budget mid-thought looks like a parser
+    # failure but is not. Say which one it is.
+    if fin == "length":
+        print("\n  finish_reason=length: it never finished thinking. Raise max_tokens.")
+    print("\n  If content contains a raw tool call as text, the tool parser is not")
+    print("  matching this model. Check './serve-kimik3.sh parsers' and TOOL_PARSER.")
+    sys.exit(1)
+
+fn = calls[0].get("function", {})
+check(fn.get("name") == "get_gpu_temperature", "correct function name", repr(fn.get("name")))
+
+raw = fn.get("arguments")
+try:
+    args = json.loads(raw) if isinstance(raw, str) else raw
+    ok_json = isinstance(args, dict)
+except Exception as e:
+    args, ok_json = None, False
+    print(f"        arguments did not parse: {e}")
+check(ok_json, "arguments are valid JSON", repr(raw)[:160])
+check(bool(args) and NODE in str(args.get("node", "")), "argument value carried through",
+      repr(args.get("node") if args else None))
+check(bool(calls[0].get("id")), "tool_call has an id", repr(calls[0].get("id")))
+
+print("\nTurn 2 — does the model use the tool result?")
+msgs.append({"role": "assistant", "content": m1.get("content") or "", "tool_calls": calls})
+msgs.append({"role": "tool", "tool_call_id": calls[0].get("id"),
+             "name": "get_gpu_temperature",
+             "content": json.dumps({"node": NODE, "celsius": SECRET})})
+
+r2 = post({"model": MODEL, "messages": msgs, "tools": TOOLS,
+           "max_tokens": 2048, "temperature": 0})
+m2 = r2["choices"][0]["message"]
+final = (m2.get("content") or "").strip()
+check(bool(final), "final answer has content",
+      f"finish_reason={r2['choices'][0]['finish_reason']}")
+check(str(SECRET) in final, f"final answer contains the tool's value ({SECRET})")
+print(f"\n  final answer: {final[:300]}")
+
+print()
+if fails:
+    print(f"TOOL-CALL ROUND TRIP FAILED: {len(fails)} check(s) — {', '.join(fails)}")
+    sys.exit(1)
+print("TOOL-CALL ROUND TRIP OK — opencode's agentic loop should work.")
+PY
+        exit $?
+        ;;
     serve|pull|download|check|gpucheck|parsers) ;;
     *)
-        die "Unknown mode '$MODE'. Use: serve | pull | download | check | gpucheck | parsers | stop | status"
+        die "Unknown mode '$MODE'. Use: serve | pull | download | check | gpucheck | toolcheck | parsers | stop | status"
         ;;
 esac
 

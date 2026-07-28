@@ -253,6 +253,37 @@ correct, and independently the same arithmetic as the memory budget above. The
 thinking finishes — a small `max_tokens` returns `finish_reason: length` and an
 empty `content`, which looks like a broken server and is not. Give it room.
 
+### Step 5b — Prove tool calling round-trips
+
+opencode's whole agentic loop rests on this, and `kimi_k3` is a new parser on an
+unmerged branch, so verify it rather than assume:
+
+```bash
+./serve-kimik3.sh toolcheck        # exit 0 = pass
+```
+
+It runs a **two-turn** exchange, which is the point. Turn 1 checks the model
+emits a well-formed `tool_calls` object with parseable JSON arguments and an id.
+Turn 2 feeds a result back and checks the model *uses* it — the tool returns a
+temperature the model cannot possibly guess, so a correct final answer proves it
+consumed the result instead of inventing one. A parser that serialises tool
+calls but breaks on the way back passes turn 1 and fails turn 2.
+
+It is plain HTTP: no `.sif`, no GPU, no allocation. Point it anywhere, including
+through a tunnel:
+
+```bash
+TOOLCHECK_URL=http://localhost:30000 ./serve-kimik3.sh toolcheck
+```
+
+What the failures mean:
+
+| Symptom | Cause |
+|---|---|
+| `finish_reason=length`, no tool call | K3 is a thinking model and ran out of budget mid-thought. Not a parser fault. |
+| Tool call appears as raw text in `content` | `TOOL_PARSER` is not matching this model. Check `./serve-kimik3.sh parsers`. |
+| Turn 1 passes, turn 2 misses the value | The result is not reaching the model — the round trip is broken where opencode needs it most. |
+
 ### Step 6 — Connect opencode
 
 On the GPU node (attach a second shell to the job first):
@@ -566,6 +597,7 @@ which is out of scope for this repo. `serve-kimik3.sh` detects gfx942 and warns.
 ./serve-kimik3.sh pull           build the .sif from the container image (one-time)
 ./serve-kimik3.sh check          can this image load this model? (run BEFORE download)
 ./serve-kimik3.sh gpucheck       can this image reach this node's GPUs? (~1 min)
+./serve-kimik3.sh toolcheck      two-turn tool-call round trip vs a running server
 ./serve-kimik3.sh parsers        list tool-call/reasoning parsers this image supports
 ./serve-kimik3.sh download       prefetch weights (+ DSpark draft if enabled)
 ./serve-kimik3.sh stop           stop the server
