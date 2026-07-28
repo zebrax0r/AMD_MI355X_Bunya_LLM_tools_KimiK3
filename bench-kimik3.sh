@@ -70,6 +70,15 @@ BENCH_CONCURRENCY="${BENCH_CONCURRENCY:-2 8 32}"
 BENCH_MAX_CONCURRENCY="${BENCH_MAX_CONCURRENCY:-32}"
 BENCH_EXTRA_ARGS="${BENCH_EXTRA_ARGS:-}"
 
+# sglang's random dataset samples each length uniformly from
+# [BENCH_*_LEN * ratio, BENCH_*_LEN]. Its own default is 0.0, which means every
+# request is on average HALF its nominal size — measured 29 Jul 2026: a nominal
+# 1024/512 sweep actually sent 507 in / 262 out per request. Aggregate tok/s at
+# fixed concurrency scales with tokens per request, so that quietly halves the
+# headline number while leaving TPOT alone, and makes the result incomparable to
+# any published figure. Default to 1.0 (fixed sizes, exactly as configured).
+BENCH_RANGE_RATIO="${BENCH_RANGE_RATIO:-1.0}"
+
 # ── Resolve API key ─────────────────────────────────────────────────────────
 
 if [[ -z "${KIMIK3_API_KEY:-}" && -r "$MODEL_CACHE_DIR/kimik3-api-key" ]]; then
@@ -137,6 +146,7 @@ run_one() {
             --dataset-name random \
             --random-input-len "$BENCH_INPUT_LEN" \
             --random-output-len "$BENCH_OUTPUT_LEN" \
+            --random-range-ratio "$BENCH_RANGE_RATIO" \
             --num-prompts "$BENCH_NUM_PROMPTS" \
             --max-concurrency "$conc" \
             --request-rate "$rate" \

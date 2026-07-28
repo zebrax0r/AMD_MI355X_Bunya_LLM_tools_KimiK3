@@ -299,22 +299,34 @@ export SPECULATIVE="dspark"
 ./serve-kimik3.sh stop && ./serve-kimik3.sh serve --detach
 ```
 
-**It is off by default on purpose, and on Bunya it does not work.** SGLang
-issue [#32569](https://github.com/sgl-project/sglang/issues/32569) reports
-DSPARK crashing with `TypeError: 'NoneType' object is not callable`. We did not
-hit the crash — we hit something quieter and worse. Measured on bun161,
-29 Jul 2026:
+**Measured on bun161 (ROCm 7.14), 29 Jul 2026 — it works, and it is the single
+biggest win available.** Same node, same sweep, DSpark the only variable:
 
-```
-accept len: 1.23, accept rate: 0.03      (upstream: 5.29-5.93)
-```
+| c | | total tok/s | median TPOT | accept len |
+|---|---|---|---|---|
+| 2 | baseline | 214 | 26.49 ms | — |
+| 2 | **DSpark** | **673** | **5.93 ms** | **4.92** |
+| 8 | baseline | 655 | 34.06 ms | — |
+| 8 | **DSpark** | **1502** | **10.84 ms** | **5.26** |
+| 32 | baseline | 1572 | 54.87 ms | — |
+| 32 | **DSpark** | **2510** | **25.88 ms** | **5.41** |
 
-Three percent of drafted tokens accepted makes speculation *pure overhead*: a
-full draft forward pass plus verification every step, for barely more than one
-token. The target model is healthy (the coherence check above passes), so this
-is the draft disagreeing with a working model. **Leave `SPECULATIVE` empty**
-until upstream fixes it — and note that this failed silently as a performance
-problem, not as an error, which is exactly why you change one thing at a time.
+3.1x / 2.3x / 1.6x on throughput, and accept length lands inside upstream's
+5.29-5.93 — so the draft model is behaving. **Our c=2 TPOT of 5.93 ms beats
+upstream's own DSpark figure of 8.94 ms.**
+
+SGLang issue [#32569](https://github.com/sgl-project/sglang/issues/32569)
+reports DSPARK crashing with `TypeError: 'NoneType' object is not callable`. We
+have not hit it on this image. It stays off by default anyway, so that a first
+launch has one thing to go wrong instead of two — turn it on once baseline
+serving is proven.
+
+**One caveat, unexplained.** A long-context opencode session (217k tokens) showed
+`accept len: 1.23, accept rate: 0.03` — speculation collapsing to nothing, where
+this 1k-token sweep gets ~5. Whether that is context length, workload content, or
+a warmup artefact of the first decode batch after prefill is not yet established.
+If DSpark seems to hurt in a long agentic session, measure before concluding: one
+decode line is not a benchmark. That mistake was made here once already.
 
 Note the throughput crossover: DSpark *loses* above ~concurrency 16 (3715 vs
 4898 tok/s at c=32). It is a latency optimisation for interactive use, not a
@@ -334,6 +346,20 @@ if the numbers improve. Run from a shell on the serving node:
 Compare against upstream's MI355 TP8 reference — **820 / 2356 / 4898 tok/s at
 c=2/8/32**. A large shortfall means something is mis-set here, not that K3 is
 slow; investigate rather than accept it.
+
+**Read the token totals before believing a throughput number.** sglang's random
+dataset samples each length uniformly from `[len * ratio, len]`, and its default
+ratio is `0.0` — so a nominal 1024/512 sweep really sends about 507 in / 262 out
+per request (measured, 29 Jul 2026). Aggregate tok/s at fixed concurrency scales
+with tokens per request, so that halves the headline figure while leaving TPOT
+untouched, and makes the result incomparable to any published number. This repo
+defaults `BENCH_RANGE_RATIO=1.0` so sizes are exactly what you configured. Check
+`Total input tokens` / `Total generated tokens` in the output against
+`num-prompts x len` whenever a result surprises you.
+
+**Prefer median TPOT for cross-system comparison.** It is per-token and immune to
+request sizing, so it survives differences in benchmark configuration that
+aggregate throughput does not.
 
 In order of expected payoff:
 
@@ -554,6 +580,7 @@ All knobs live in `kimik3.env` (copied from `kimik3-env.example`). Anything you
 | `READY_TIMEOUT` | `14400` | Seconds to wait for health (cold load is ~1.5 TB) |
 | `LAUNCH_CMD` | `sglang serve` | Escape hatch: `python3 -m sglang.launch_server` |
 | `CHUNKED_PREFILL_SIZE` / `MAX_RUNNING_REQUESTS` / `SCHEDULE_POLICY` | — | Optional tuning |
+| `BENCH_RANGE_RATIO` | `1.0` | Fixed-size bench requests. sglang's own default `0.0` halves them (see Performance tuning) |
 | `EXTRA_ENGINE_ARGS` | — | Flags appended verbatim (e.g. `--ep-size 8`) |
 
 ---
