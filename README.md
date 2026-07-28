@@ -415,8 +415,8 @@ All knobs live in `kimik3.env` (copied from `kimik3-env.example`). Anything you
 | `SGLANG_IMAGE` | `lmsysorg/sglang-rocm:rocm720-mi35x-k3-20260727` | Day-0 AMD image (branch build — see above) |
 | `SIF_PATH` | `$MODEL_CACHE_DIR/kimik3-mi355x.sif` | Where the Apptainer image is stored |
 | `APPTAINER_CACHEDIR` / `_TMPDIR` | *(near `$MODEL_CACHE_DIR`)* | Apptainer cache/scratch, kept off `/home` |
-| `FLYDSL_CACHE_DIR` | `$MODEL_CACHE_DIR/flydsl-cache` | Writable dir bound over aiter's in-image FP4 JIT cache |
-| `FLYDSL_CACHE_TARGET` | *(auto-detected)* | In-image path to bind over; set only if detection is wrong |
+| `AITER_JIT_DIR` | `$MODEL_CACHE_DIR/aiter-jit` | Writable copy of aiter's `jit/`, bound over the in-image one |
+| `AITER_JIT_TARGET` | *(auto-detected)* | In-image `jit/` path to bind over; set only if detection is wrong |
 | `KIMIK3_API_KEY` | *(auto-generated)* | Bearer key; saved to `$MODEL_CACHE_DIR/kimik3-api-key` |
 | `PORT` | `30000` | Endpoint port on the node |
 | `TP_SIZE` | `8` | Tensor parallel = **total GPU count** |
@@ -465,11 +465,22 @@ All knobs live in `kimik3.env` (copied from `kimik3-env.example`). Anything you
   SGLang pins to CPUs from the *full* node topology, which fails under a SLURM
   cgroup owning a subset of cores. The script forces `0` by default. Set
   `SET_CPU_AFFINITY=1` only with `--cpus-per-task=384` / `--exclusive`.
-- **Crash: `[Errno 30] Read-only file system: '.../flydsl_cache/...'`**: the FP4
-  MoE JIT-compiles FlyDSL kernels and caches them *inside* the image, but a
-  `.sif` is read-only. The script locates aiter in the image and binds
-  `FLYDSL_CACHE_DIR` over its `jit/flydsl_cache`. If auto-detection fails it
-  warns — set `FLYDSL_CACHE_TARGET` to the path from the error message.
+- **Crash at graph capture: `[Errno 30] Read-only file system:
+  '.../aiter/jit/flydsl_cache/...'`** — *hit for real on 28 Jul 2026.* The FP4
+  MoE JIT-compiles FlyDSL kernels at CUDA-graph capture and writes them into
+  aiter's `jit/` directory *inside* the image, but a `.sif` is read-only. Note
+  where this lands: capture happens **after** the ~1.5 TB weight load, so the
+  failure costs a full load before it appears.
+
+  The script seeds `AITER_JIT_DIR` from the image's `jit/` (once — this keeps
+  the prebuilt `module_*.so`, which a bare empty bind would hide) and binds it
+  back over the same path, then write-tests the bind up front so a broken one
+  fails in seconds instead of after the load. If it cannot find aiter it warns
+  loudly — set `AITER_JIT_TARGET` to the `jit/` directory from the error path
+  (e.g. `/sgl-workspace/aiter/aiter/jit`).
+
+  After changing `SGLANG_IMAGE`, `rm -rf $AITER_JIT_DIR` to force a re-seed; a
+  copy left over from an older image causes undefined-symbol crashes.
 - **Crash during graph capture: `.aiter/jit/module_*.so: undefined symbol`**:
   aiter JIT-compiles kernels into `$HOME/.aiter/jit` (your home is bind-mounted
   into the container). A startup killed *mid-compile* leaves a truncated module

@@ -59,14 +59,21 @@ export SIF_PATH="${SIF_PATH:-}"
 export APPTAINER_CACHEDIR="${APPTAINER_CACHEDIR:-}"
 export APPTAINER_TMPDIR="${APPTAINER_TMPDIR:-}"
 
-# The MXFP4 MoE JIT-compiles FlyDSL kernels into a path INSIDE the image, which
-# is read-only in a .sif. serve-kimik3.sh resolves aiter's location in the image
-# at runtime and binds this scratch dir over its flydsl_cache, so the writes
-# succeed and compiled kernels persist across runs. Defaults to
-# $MODEL_CACHE_DIR/flydsl-cache. Set FLYDSL_CACHE_TARGET to override the
-# in-image path if the auto-detection ever picks the wrong one.
-export FLYDSL_CACHE_DIR="${FLYDSL_CACHE_DIR:-}"
-export FLYDSL_CACHE_TARGET="${FLYDSL_CACHE_TARGET:-}"
+# The MXFP4 MoE JIT-compiles FlyDSL kernels into aiter's jit/ directory INSIDE
+# the image, which is read-only in a .sif — so capture dies with "[Errno 30]
+# Read-only file system: .../aiter/jit/flydsl_cache/...", and it dies only
+# after the full 1.5 TB weight load. serve-kimik3.sh seeds this scratch dir
+# from the image's jit/ (once, to keep the prebuilt module_*.so) and binds it
+# back over the same path, so writes succeed and compiled kernels persist
+# across runs. Defaults to $MODEL_CACHE_DIR/aiter-jit.
+#
+# Delete this directory to force a clean re-seed after changing SGLANG_IMAGE —
+# a stale copy from an older image is a good way to get undefined-symbol
+# crashes at graph capture.
+export AITER_JIT_DIR="${AITER_JIT_DIR:-}"
+# In-image jit/ path. Auto-detected; set only if detection picks the wrong one
+# (it warns loudly when it cannot find aiter at all).
+export AITER_JIT_TARGET="${AITER_JIT_TARGET:-}"
 
 # ── Endpoint auth ───────────────────────────────────────────────────────────
 

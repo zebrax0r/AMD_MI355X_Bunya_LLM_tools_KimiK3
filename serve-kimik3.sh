@@ -414,30 +414,78 @@ if [[ -z "${KIMIK3_API_KEY:-}" ]]; then
     fi
 fi
 
-# ── FlyDSL JIT cache bind ───────────────────────────────────────────────────
-# The MXFP4 MoE JIT-compiles FlyDSL kernels and caches them INSIDE the image —
-# but an Apptainer .sif is read-only, so that write fails ("Read-only file
-# system"). Bind a writable scratch dir over that path (and keep the compiled
-# kernels across runs). aiter's location differs between images, so ask the
-# image where it is rather than hardcoding a path.
+# ── aiter JIT directory bind ────────────────────────────────────────────────
+# The MXFP4 MoE JIT-compiles FlyDSL kernels at CUDA-graph capture time and
+# writes them INSIDE the image, under aiter/jit/. An Apptainer .sif is
+# read-only, so that write dies with:
+#
+#   OSError: [Errno 30] Read-only file system:
+#     '/sgl-workspace/aiter/aiter/jit/flydsl_cache/launch_hgemm_kernel_*/*.lock'
+#
+# ...and it dies *after* the ~1.5 TB weight load, which is an expensive way to
+# find out. Fix: give the container a writable aiter/jit.
+#
+# We bind the whole jit/ directory, not just jit/flydsl_cache, because the
+# image ships prebuilt modules there (module_rmsnorm_quant.so and friends) and
+# aiter writes build artefacts beside the FlyDSL cache. Binding an empty dir
+# over it would hide the prebuilt kernels, so seed the scratch copy from the
+# image once, then bind it back at the SAME path (compiled artefacts can embed
+# absolute paths) and reuse it on every later run.
 
-FLYDSL_CACHE_DIR="${FLYDSL_CACHE_DIR:-$MODEL_CACHE_DIR/flydsl-cache}"
-mkdir -p "$FLYDSL_CACHE_DIR" 2>/dev/null || true
+AITER_JIT_DIR="${AITER_JIT_DIR:-$MODEL_CACHE_DIR/aiter-jit}"
 
-if [[ -z "${FLYDSL_CACHE_TARGET:-}" ]]; then
-    FLYDSL_CACHE_TARGET="$(apptainer exec "$SIF_PATH" python3 -c \
-        'import aiter, os; print(os.path.join(os.path.dirname(aiter.__file__), "jit", "flydsl_cache"))' \
-        2>/dev/null || true)"
+# Pre-fix configs set FLYDSL_CACHE_TARGET to the .../jit/flydsl_cache path.
+# Honour it rather than silently ignoring it, but bind one level up.
+if [[ -z "${AITER_JIT_TARGET:-}" && -n "${FLYDSL_CACHE_TARGET:-}" ]]; then
+    AITER_JIT_TARGET="${FLYDSL_CACHE_TARGET%/flydsl_cache}"
+    warn "FLYDSL_CACHE_TARGET is superseded by AITER_JIT_TARGET; using $AITER_JIT_TARGET"
+fi
+
+# Ask the image where aiter lives. Use find_spec, NOT 'import aiter': importing
+# it needs a GPU (this exec has no --rocm) and prints '[aiter] import [...]'
+# banners to stdout that would corrupt the captured path.
+if [[ -z "${AITER_JIT_TARGET:-}" ]]; then
+    AITER_JIT_TARGET="$(apptainer exec "$SIF_PATH" python3 - <<'PY' 2>/dev/null | tail -n 1
+import importlib.util, os
+spec = importlib.util.find_spec("aiter")
+origin = getattr(spec, "origin", None) if spec is not None else None
+print(os.path.join(os.path.dirname(origin), "jit") if origin else "")
+PY
+)"
 fi
 
 cache_bind=()
-if [[ -n "$FLYDSL_CACHE_TARGET" ]]; then
-    cache_bind=(--bind "$FLYDSL_CACHE_DIR":"$FLYDSL_CACHE_TARGET")
-    log "FlyDSL JIT cache: $FLYDSL_CACHE_DIR -> $FLYDSL_CACHE_TARGET"
+if [[ "${AITER_JIT_TARGET:-}" != /* ]]; then
+    warn "Could not locate aiter's jit/ directory in the image (got: '${AITER_JIT_TARGET:-}')."
+    warn "  Startup will likely die at CUDA-graph capture with"
+    warn "  \"Read-only file system: .../aiter/jit/flydsl_cache/...\"."
+    warn "  Set AITER_JIT_TARGET in kimik3.env to the jit/ directory from that path."
 else
-    warn "Could not locate aiter in the image, so the FlyDSL JIT cache is NOT bound."
-    warn "  If startup dies with \"Read-only file system: .../flydsl_cache/...\", set"
-    warn "  FLYDSL_CACHE_TARGET in kimik3.env to the path from that error message."
+    mkdir -p "$AITER_JIT_DIR" || die "Cannot create $AITER_JIT_DIR"
+
+    if [[ ! -f "$AITER_JIT_DIR/.seeded" ]]; then
+        log "Seeding writable aiter JIT dir from the image (one-off copy) ..."
+        apptainer exec --bind "$MODEL_CACHE_DIR":"$MODEL_CACHE_DIR" "$SIF_PATH" \
+            cp -a "$AITER_JIT_TARGET/." "$AITER_JIT_DIR/" \
+            || die "Failed to copy $AITER_JIT_TARGET out of the image into $AITER_JIT_DIR"
+        touch "$AITER_JIT_DIR/.seeded"
+        log "Seeded $AITER_JIT_DIR ($(du -sh "$AITER_JIT_DIR" 2>/dev/null | cut -f1 || echo '?'))"
+    fi
+
+    cache_bind=(--bind "$AITER_JIT_DIR":"$AITER_JIT_TARGET")
+    log "aiter JIT dir: $AITER_JIT_DIR -> $AITER_JIT_TARGET (writable)"
+
+    # Prove the bind is writable NOW, not 40 minutes into the weight load.
+    if ! apptainer exec "${cache_bind[@]}" "$SIF_PATH" \
+            sh -c "mkdir -p '$AITER_JIT_TARGET/flydsl_cache' \
+                   && touch '$AITER_JIT_TARGET/flydsl_cache/.write-test' \
+                   && rm -f '$AITER_JIT_TARGET/flydsl_cache/.write-test'" 2>/dev/null; then
+        die "aiter JIT dir is still read-only inside the container.
+  Tried to bind: $AITER_JIT_DIR -> $AITER_JIT_TARGET
+  Without this, startup dies at CUDA-graph capture after the full weight load.
+  Check that $AITER_JIT_DIR is on a writable filesystem, or override
+  AITER_JIT_TARGET in kimik3.env."
+    fi
 fi
 
 # ── Build the launch command ────────────────────────────────────────────────
