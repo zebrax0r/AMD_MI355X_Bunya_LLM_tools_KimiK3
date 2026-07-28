@@ -433,9 +433,13 @@ reasons, in order:
 
 1. **n=1 per node.** No variance estimate, so no comparison is possible. Two
    points are not a distribution.
-2. **Driver version is perfectly confounded with node identity.** bun159 and
-   bun161 differ in ROCm *and* in silicon, thermal state, NUMA layout, and
-   whatever else was scheduled. Nothing here separates those.
+2. **Driver version is confounded with which machine you ran on.** The MI355X
+   nodes are identical in specification, but identical spec is not identical
+   measured performance: die binning within a SKU, cooling position and ambient
+   airflow, firmware drift, and above all what else was resident and how warm
+   the node was at the time. These two runs were 90 minutes apart on different
+   machines. Nothing in the design separates "ROCm 7.14 vs 7.2" from "bun161 vs
+   bun159 on the morning of 29 Jul".
 3. **The signs disagree.** TPOT is +11.4% at one concurrency and −1.7% at
    another. A real driver-level effect pushes consistently; mixed directions
    across conditions is what noise looks like.
@@ -448,8 +452,14 @@ the two stacks. If the older ROCm were changing numerics, draft/target agreement
 would be the sensitive detector, and it is not moving. Both stacks appear to be
 computing the same thing.
 
-To actually answer it, use repeats — the sweep supports them, interleaved per
-concurrency so drift hits each alike:
+Note what repeats would and would not fix. They give you the error bar that is
+missing, so you could say whether **bun159 differs from bun161**. They cannot
+un-confound the driver: for that you need the *same* node measured before and
+after an upgrade. If RCC ever brings bun159 to 7.14, that is the run worth
+catching.
+
+To get the error bar, the sweep supports repeats, interleaved per concurrency so
+drift hits each alike:
 
 ```bash
 BENCH_REPEATS=5 ./bench-kimik3.sh sweep     # on each node, then compare spreads
