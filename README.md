@@ -415,6 +415,49 @@ Compare on metrics that are immune to request sizing instead:
 Use the table above as the local baseline for tuning: change one thing, re-run,
 keep it if the numbers improve.
 
+### Does the node's ROCm version matter? (unresolved)
+
+bun161 runs ROCm **7.14** on bare metal; bun159 runs **7.2** — the same version
+the container ships. Same image, same config (DSpark + radix), one sweep each:
+
+| | c=2 | c=8 | c=32 |
+|---|---|---|---|
+| bun161 (host 7.14) | 964 | 2299 | 4608 tok/s |
+| bun159 (host 7.2) | 915 | 2077 | 4396 tok/s |
+| Δ total tok/s | −5.0% | −9.7% | −4.6% |
+| Δ median TPOT | +2.1% | +11.4% | **−1.7%** |
+| Δ accept length | −0.12 | −0.10 | −0.09 |
+
+**This does not establish a difference, and the experiment cannot.** Three
+reasons, in order:
+
+1. **n=1 per node.** No variance estimate, so no comparison is possible. Two
+   points are not a distribution.
+2. **Driver version is perfectly confounded with node identity.** bun159 and
+   bun161 differ in ROCm *and* in silicon, thermal state, NUMA layout, and
+   whatever else was scheduled. Nothing here separates those.
+3. **The signs disagree.** TPOT is +11.4% at one concurrency and −1.7% at
+   another. A real driver-level effect pushes consistently; mixed directions
+   across conditions is what noise looks like.
+
+For scale: within a single run, TPOT P90 sits 15–23% above the median. A 5% gap
+between two single runs is not a result.
+
+What *is* worth noting is the **null**: accept length differs by ~1.4% between
+the two stacks. If the older ROCm were changing numerics, draft/target agreement
+would be the sensitive detector, and it is not moving. Both stacks appear to be
+computing the same thing.
+
+To actually answer it, use repeats — the sweep supports them, interleaved per
+concurrency so drift hits each alike:
+
+```bash
+BENCH_REPEATS=5 ./bench-kimik3.sh sweep     # on each node, then compare spreads
+```
+
+Practically: both nodes clear upstream's DSpark c=32 figure, so pick whichever
+is free.
+
 ### Radix cache — measured, and now the default
 
 Upstream passes `--disable-radix-cache`. We do not. Same node, same sweep,
@@ -674,6 +717,7 @@ All knobs live in `kimik3.env` (copied from `kimik3-env.example`). Anything you
 | `LAUNCH_CMD` | `sglang serve` | Escape hatch: `python3 -m sglang.launch_server` |
 | `CHUNKED_PREFILL_SIZE` / `MAX_RUNNING_REQUESTS` / `SCHEDULE_POLICY` | — | Optional tuning |
 | `BENCH_RANGE_RATIO` | `1.0` | Fixed-size bench requests. sglang's own default `0.0` halves them (see Performance tuning) |
+| `BENCH_REPEATS` | `1` | Repeats per concurrency in a sweep. Use 3–5 before claiming two configs differ |
 | `EXTRA_ENGINE_ARGS` | — | Flags appended verbatim (e.g. `--ep-size 8`) |
 
 ---

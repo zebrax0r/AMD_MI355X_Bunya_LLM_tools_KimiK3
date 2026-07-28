@@ -79,6 +79,14 @@ BENCH_EXTRA_ARGS="${BENCH_EXTRA_ARGS:-}"
 # any published figure. Default to 1.0 (fixed sizes, exactly as configured).
 BENCH_RANGE_RATIO="${BENCH_RANGE_RATIO:-1.0}"
 
+# How many times to repeat each concurrency. A single run gives you a number
+# with no error bar, which is not enough to compare two configurations — or two
+# nodes. Measured 29 Jul 2026: within a run, TPOT P90 sits 15-23% above the
+# median, so a 5% gap between two single runs is not a result. Set 3-5 when you
+# actually need to tell two things apart; each repeat costs a full sweep.
+# Repeats are interleaved per concurrency so slow drift hits every repeat alike.
+BENCH_REPEATS="${BENCH_REPEATS:-1}"
+
 # ── Resolve API key ─────────────────────────────────────────────────────────
 
 if [[ -z "${KIMIK3_API_KEY:-}" && -r "$MODEL_CACHE_DIR/kimik3-api-key" ]]; then
@@ -132,8 +140,8 @@ log "Saving results to $OUT_FILE"
 
 run_one() {
     local conc="$1" rate="$2"
-    log "Run: concurrency=$conc request-rate=$rate  (in=$BENCH_INPUT_LEN out=$BENCH_OUTPUT_LEN n=$BENCH_NUM_PROMPTS)"
-    echo "=== concurrency=$conc request-rate=$rate ===" >> "$OUT_FILE"
+    log "Run: concurrency=$conc request-rate=$rate${rep:+  repeat $rep/$BENCH_REPEATS}  (in=$BENCH_INPUT_LEN out=$BENCH_OUTPUT_LEN n=$BENCH_NUM_PROMPTS)"
+    echo "=== concurrency=$conc request-rate=$rate${rep:+ repeat=$rep} ===" >> "$OUT_FILE"
 
     # shellcheck disable=SC2086  # intentional splitting of BENCH_EXTRA_ARGS
     apptainer exec \
@@ -161,8 +169,14 @@ run_one() {
 case "$MODE" in
     latency)    run_one 1 inf ;;
     throughput) run_one "$BENCH_MAX_CONCURRENCY" inf ;;
-    sweep)      for c in $BENCH_CONCURRENCY; do run_one "$c" inf; done ;;
+    sweep)      for c in $BENCH_CONCURRENCY; do
+                    for rep in $(seq 1 "$BENCH_REPEATS"); do run_one "$c" inf; done
+                done ;;
 esac
 
 log "Done. Full output: $OUT_FILE"
+if [[ "$BENCH_REPEATS" -le 1 ]]; then
+    warn "Single run per point — no error bar. Set BENCH_REPEATS=3 before"
+    warn "  concluding that two configs, or two nodes, actually differ."
+fi
 log "Compare runs with:  ls -t $BENCH_DIR"
