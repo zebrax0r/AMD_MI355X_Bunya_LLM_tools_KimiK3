@@ -262,6 +262,16 @@ unmerged branch, so verify it rather than assume:
 ./serve-kimik3.sh toolcheck        # exit 0 = pass
 ```
 
+**Result on bun161, 29 Jul 2026: PASS**, both turns — `tool_calls` well-formed
+with parseable arguments, and the final answer carried the tool's value back
+(*"The current GPU temperature on bun161 is **61.4°C**"*). The `kimi_k3` parser
+round-trips correctly on this image.
+
+One cosmetic note: tool-call ids come back as `get_gpu_temperature:0` rather than
+OpenAI's `call_<random>` form. Unique per call and accepted on the way back in,
+so it round-trips — but a client that assumes the `call_` prefix would be
+surprised.
+
 It runs a **two-turn** exchange, which is the point. Turn 1 checks the model
 emits a well-formed `tool_calls` object with parseable JSON arguments and an id.
 Turn 2 feeds a result back and checks the model *uses* it — the tool returns a
