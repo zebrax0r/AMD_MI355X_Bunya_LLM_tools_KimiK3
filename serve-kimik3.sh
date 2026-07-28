@@ -435,24 +435,41 @@ fi
 
 AITER_JIT_DIR="${AITER_JIT_DIR:-$MODEL_CACHE_DIR/aiter-jit}"
 
-# Pre-fix configs set FLYDSL_CACHE_TARGET to the .../jit/flydsl_cache path.
-# Honour it rather than silently ignoring it, but bind one level up.
-if [[ -z "${AITER_JIT_TARGET:-}" && -n "${FLYDSL_CACHE_TARGET:-}" ]]; then
-    AITER_JIT_TARGET="${FLYDSL_CACHE_TARGET%/flydsl_cache}"
-    warn "FLYDSL_CACHE_TARGET is superseded by AITER_JIT_TARGET; using $AITER_JIT_TARGET"
+# The old FLYDSL_CACHE_* names are gone. An earlier version quietly remapped
+# FLYDSL_CACHE_TARGET onto the new variable, which was a mistake: it is a HOST
+# path in existing configs, so it overrode detection, bound scratch over a path
+# nothing reads, and still passed the writability probe. Refuse to guess.
+if [[ -n "${FLYDSL_CACHE_TARGET:-}" || -n "${FLYDSL_CACHE_DIR:-}" ]]; then
+    die "FLYDSL_CACHE_DIR / FLYDSL_CACHE_TARGET are obsolete and are NOT read any more.
+  Delete both lines from $ENV_FILE. The writable scratch dir is AITER_JIT_DIR
+  (default \$MODEL_CACHE_DIR/aiter-jit) and the in-image path is auto-detected.
+  Leaving them set previously produced a bind to the wrong destination."
 fi
 
 # Ask the image where aiter lives. Use find_spec, NOT 'import aiter': importing
 # it needs a GPU (this exec has no --rocm) and prints '[aiter] import [...]'
 # banners to stdout that would corrupt the captured path.
-if [[ -z "${AITER_JIT_TARGET:-}" ]]; then
-    AITER_JIT_TARGET="$(apptainer exec "$SIF_PATH" python3 - <<'PY' 2>/dev/null | tail -n 1
+detected_jit="$(apptainer exec "$SIF_PATH" python3 - <<'PY' 2>/dev/null | tail -n 1
 import importlib.util, os
 spec = importlib.util.find_spec("aiter")
 origin = getattr(spec, "origin", None) if spec is not None else None
 print(os.path.join(os.path.dirname(origin), "jit") if origin else "")
 PY
 )"
+
+if [[ -n "${AITER_JIT_TARGET:-}" ]]; then
+    # A manual override must name a directory INSIDE the image. This is the
+    # check whose absence caused three failed 1.5 TB loads: a host path here
+    # binds somewhere harmless and the real path stays read-only.
+    apptainer exec "$SIF_PATH" test -d "$AITER_JIT_TARGET" 2>/dev/null \
+        || die "AITER_JIT_TARGET='$AITER_JIT_TARGET' does not exist inside the image.
+  It must be a path in the CONTAINER (e.g. /sgl-workspace/aiter/aiter/jit),
+  not a host directory. Detected value: ${detected_jit:-<detection failed>}
+  Unset it in $ENV_FILE to use auto-detection."
+    [[ -n "$detected_jit" && "$AITER_JIT_TARGET" != "$detected_jit" ]] \
+        && warn "AITER_JIT_TARGET='$AITER_JIT_TARGET' overrides detected '$detected_jit'."
+else
+    AITER_JIT_TARGET="$detected_jit"
 fi
 
 cache_bind=()
@@ -610,12 +627,25 @@ else
     warn "No aiter JIT bind — startup will likely die at CUDA-graph capture."
 fi
 
+# The log is world-readable on scratch and gets pasted into bug reports, so
+# never write the HF token or the API key into it.
+redact_args() {
+    local out=() prev="" a
+    for a in "$@"; do
+        if [[ "$prev" == "--api-key" ]]; then out+=("<redacted>")
+        elif [[ "$a" == HF_TOKEN=* ]]; then   out+=("HF_TOKEN=<redacted>")
+        else out+=("$a"); fi
+        prev="$a"
+    done
+    printf '%s' "${out[*]}"
+}
+
 : > "$LOG_FILE"
 {
     printf '### serve-kimik3.sh  %s\n' "$(date)"
     printf '### image=%s\n' "$SGLANG_IMAGE"
-    printf '### apptainer: apptainer %s %s\n' "${apptainer_args[*]}" "$SIF_PATH"
-    printf '### command: %s\n\n' "${cmd[*]}"
+    printf '### apptainer: apptainer %s %s\n' "$(redact_args "${apptainer_args[@]}")" "$SIF_PATH"
+    printf '### command: %s\n\n' "$(redact_args "${cmd[@]}")"
 } >> "$LOG_FILE"
 
 apptainer "${apptainer_args[@]}" \
