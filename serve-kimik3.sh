@@ -440,10 +440,16 @@ AITER_JIT_DIR="${AITER_JIT_DIR:-$MODEL_CACHE_DIR/aiter-jit}"
 # path in existing configs, so it overrode detection, bound scratch over a path
 # nothing reads, and still passed the writability probe. Refuse to guess.
 if [[ -n "${FLYDSL_CACHE_TARGET:-}" || -n "${FLYDSL_CACHE_DIR:-}" ]]; then
+    obsolete_src="$ENV_FILE"
+    grep -qE '^[[:space:]]*(export[[:space:]]+)?FLYDSL_CACHE_(DIR|TARGET)=' "$ENV_FILE" 2>/dev/null \
+        || obsolete_src="your shell environment, NOT $ENV_FILE
+          (exported vars override the file) — fix with:
+              unset FLYDSL_CACHE_DIR FLYDSL_CACHE_TARGET"
     die "FLYDSL_CACHE_DIR / FLYDSL_CACHE_TARGET are obsolete and are NOT read any more.
-  Delete both lines from $ENV_FILE. The writable scratch dir is AITER_JIT_DIR
-  (default \$MODEL_CACHE_DIR/aiter-jit) and the in-image path is auto-detected.
-  Leaving them set previously produced a bind to the wrong destination."
+  Set in: $obsolete_src
+  The writable scratch dir is AITER_JIT_DIR (default \$MODEL_CACHE_DIR/aiter-jit)
+  and the in-image path is auto-detected. Leaving them set previously produced
+  a bind to the wrong destination."
 fi
 
 # Ask the image where aiter lives. Use find_spec, NOT 'import aiter': importing
