@@ -384,18 +384,39 @@ channels:
    ROCr cannot parse stops it enumerating any GPU at all, which looks exactly
    like a dead driver. The script now refuses to forward non-index-form values.
 
+…and a fourth possibility, which is what bun161 turned out to be:
+
+4. **Nothing is wrong with the passthrough at all.** `torch.cuda.device_count()`
+   returned **8** in *both* modes — the GPUs were reachable the whole time. Only
+   the `rocminfo` *binary* was failing. PyTorch's ROCm wheel carries its own HIP
+   runtime, so HIP kept working while the image's standalone ROCm 7.2 tools did
+   not. aiter shells out to `rocminfo` purely to name the architecture, and
+   reports only its exit status — which makes a cosmetic failure look fatal.
+
+   Fix, in `kimik3.env`:
+
+   ```bash
+   export AITER_GPU_ARCHS="${AITER_GPU_ARCHS:-gfx950}"
+   ```
+
 `gpucheck` tells you which one you have, in about a minute:
 
 ```bash
 ./serve-kimik3.sh gpucheck
 ```
 
-It prints both ROCm versions, tries every passthrough mode, and gives a verdict.
-`ROCM_MODE=auto` (the default) then does the same thing automatically at launch
-and caches the answer per node+image, so a working node pays for it once.
+It prints both ROCm versions, dumps what the image's `rocminfo` actually says,
+tries every passthrough mode, and gives a verdict — and it distinguishes case 4
+from case 2, because "torch saw 8 GPUs but aiter could not name the arch" and
+"the container cannot reach the GPUs" need completely different responses. Set
+`AITER_GPU_ARCHS` and re-run it to confirm the workaround before committing to
+a long startup.
 
-If **no** mode works and the errors mention KFD/HSA versions or torch sees zero
-devices, you are in case 2 and need a different image. In order of cost:
+`ROCM_MODE=auto` (the default) does the same probing automatically at launch and
+caches the answer per node+image, so a working node pays for it once.
+
+If **torch sees zero devices in every mode**, you are in case 2 and need a
+different image. In order of cost:
 
 ```bash
 # 1. Has K3 support landed in a mainline image on a newer ROCm?
@@ -519,7 +540,8 @@ All knobs live in `kimik3.env` (copied from `kimik3-env.example`). Anything you
   real on 28 Jul 2026 when a node moved to ROCm 7.14.* The container cannot
   reach the GPUs. Run `./serve-kimik3.sh gpucheck`; see
   [When the node's ROCm changes](#when-the-nodes-rocm-changes) for the three
-  causes and which are fixable. Short version: try `ROCM_MODE=devices`.
+  causes and which are fixable. Short version: if `gpucheck` shows torch seeing
+  the GPUs, set `AITER_GPU_ARCHS=gfx950` — only `rocminfo` is broken.
 - **KV cache OOM at startup**: set `CONTEXT_LEN=262144` first, and only then
   consider `MEM_FRACTION`. One knob at a time.
 - **`TypeError: 'NoneType' object is not callable`** with DSpark: known upstream

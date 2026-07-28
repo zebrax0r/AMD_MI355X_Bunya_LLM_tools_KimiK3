@@ -288,8 +288,17 @@ set_rocm_mode_args() {   # $1 = mode -> sets global rocm_args
 # ROCm version string, best effort. /opt/rocm/.info/version is the canonical
 # file; fall back to the versioned directory name.
 ROCM_VER_CMD='cat /opt/rocm/.info/version 2>/dev/null || ls -d /opt/rocm-* 2>/dev/null | sed -n "1s|.*/opt/rocm-||p"'
-host_rocm_ver() { sh -c "$ROCM_VER_CMD" 2>/dev/null | head -n1; }
 sif_rocm_ver()  { apptainer exec "$SIF_PATH" sh -c "$ROCM_VER_CMD" 2>/dev/null | head -n1; }
+host_rocm_ver() {
+    local v
+    v="$(sh -c "$ROCM_VER_CMD" 2>/dev/null | head -n1 || true)"
+    # Bunya installs ROCm from a module tree, not /opt, so fall back to the
+    # version embedded in rocminfo's own path (/…/rocm/7.14.0/bin/rocminfo).
+    [[ -z "$v" ]] && v="$(command -v rocminfo 2>/dev/null \
+        | grep -o '[0-9][0-9]*\.[0-9][0-9]*\(\.[0-9][0-9]*\)\?' | tail -n1 || true)"
+    [[ -z "$v" && -n "${ROCM_PATH:-}" ]] && v="${ROCM_PATH##*/}"
+    printf '%s' "$v"
+}
 
 # Ask the container, under a given mode, the two questions that matter: can
 # torch see the GPUs, and can aiter name the architecture? The second is the
@@ -352,10 +361,15 @@ if [[ "$MODE" == "gpucheck" ]]; then
     echo
     printf '  host ROCm       : %s\n' "$(host_rocm_ver || true)"
     printf '  container ROCm  : %s\n' "$(sif_rocm_ver || true)"
-    printf '  host rocminfo   : %s\n' \
-        "$(command -v rocminfo >/dev/null 2>&1 \
-             && (rocminfo 2>/dev/null | grep -om1 'gfx[0-9a-f]*' || echo 'ran, no gfx line') \
-             || echo 'not on PATH')"
+    host_gfx=""
+    if command -v rocminfo >/dev/null 2>&1; then
+        # grep -m1 would exit early and SIGPIPE rocminfo, which under
+        # 'set -o pipefail' reads as a failed pipeline. Take the head instead.
+        host_gfx="$(rocminfo 2>/dev/null | grep -o 'gfx[0-9a-f]*' | head -n1 || true)"
+        printf '  host rocminfo       : %s\n' "${host_gfx:-ran, but printed no gfx line}"
+    else
+        printf '  host rocminfo       : not on PATH\n'
+    fi
     for v in ROCR_VISIBLE_DEVICES HIP_VISIBLE_DEVICES CUDA_VISIBLE_DEVICES; do
         if [[ -n "${!v:-}" ]]; then
             note=""
@@ -378,11 +392,25 @@ if [[ "$MODE" == "gpucheck" ]]; then
             probe_extra=(--bind "$MODEL_CACHE_DIR":"$MODEL_CACHE_DIR"
                          --bind "$jit_dir":"$jit_target")
             log "Probing with the aiter JIT bind: $jit_dir -> $jit_target"
-            echo
         fi
     fi
+    # Probe with the same GPU_ARCHS the server would get, so this mode can
+    # actually verify the workaround it recommends.
+    if [[ -n "$AITER_GPU_ARCHS" ]]; then
+        probe_extra+=(--env "GPU_ARCHS=$AITER_GPU_ARCHS")
+        log "Probing with GPU_ARCHS=$AITER_GPU_ARCHS"
+    fi
+    echo
+
+    # What does the image's rocminfo actually say? aiter only reports the exit
+    # status, which hides the reason.
+    printf '  in-container rocminfo:\n'
+    apptainer exec --rocm "$SIF_PATH" sh -c \
+        'rocminfo 2>&1 | head -n 12 || true' 2>&1 | sed 's/^/    /' || true
+    echo
 
     gpucheck_ok=""
+    best_mode=""; best_devices=0
     for m in "${ROCM_MODES[@]}"; do
         if gpu_probe "$m" ${probe_extra[@]+"${probe_extra[@]}"}; then
             printf '  %-8s : OK    devices=%s gfx=%s\n' "$m" "$PROBE_DEVICES" "$PROBE_GFX"
@@ -390,6 +418,14 @@ if [[ "$MODE" == "gpucheck" ]]; then
         else
             printf '  %-8s : FAIL  devices=%s gfx=%s\n' "$m" "$PROBE_DEVICES" "$PROBE_GFX"
             printf '             %s\n' "$PROBE_ERR"
+        fi
+        # Track the best result separately: "torch saw the GPUs but aiter could
+        # not name the architecture" is a completely different problem from
+        # "the container cannot reach the GPUs", and only the second one needs
+        # a new image. Reporting both as one failure sends you down a
+        # multi-hour rebuild for a broken rocminfo.
+        if [[ "$PROBE_DEVICES" =~ ^[0-9]+$ && "$PROBE_DEVICES" -gt "$best_devices" ]]; then
+            best_devices="$PROBE_DEVICES"; best_mode="$m"
         fi
     done
     echo
@@ -407,10 +443,24 @@ if [[ "$MODE" == "gpucheck" ]]; then
     fi
 
     rm -f "$ROCM_MODE_CACHE" 2>/dev/null || true
-    warn "Verdict: NO passthrough mode works on this node."
-    warn "  If the errors mention KFD/HSA versions or torch sees 0 devices, the node's
-  kernel driver is newer than the container's ROCm and no bind fixes it — you
-  need an image built for this node's ROCm. See the README
+
+    if [[ "$best_devices" -gt 0 ]]; then
+        warn "Verdict: the GPUs ARE reachable ($best_devices via '$best_mode') — only aiter's
+  architecture detection is broken. It shells out to the image's rocminfo, and
+  that binary is failing against this node's driver even though HIP is fine.
+  This does NOT need a new image. Tell aiter the architecture directly:
+
+      AITER_GPU_ARCHS=${host_gfx:-gfx950}    # in kimik3.env
+
+  then re-run './serve-kimik3.sh gpucheck' to confirm. If it still fails, this
+  build of aiter ignores GPU_ARCHS at runtime and the image is the answer after
+  all — see the README 'When the node's ROCm changes'."
+        exit 1
+    fi
+
+    warn "Verdict: the container cannot reach the GPUs in any mode (torch saw none)."
+    warn "  The node's kernel driver is newer than the container's ROCm and no bind
+  fixes it — you need an image built for this node's ROCm. See the README
   'When the node's ROCm changes'.
     host ROCm $(host_rocm_ver || echo '?')  vs  container ROCm $(sif_rocm_ver || echo '?')"
     exit 1
@@ -890,27 +940,41 @@ elif [[ "$(cut -d' ' -f1 "$ROCM_MODE_CACHE" 2>/dev/null || true)" == "$cache_key
     log "GPU passthrough: $chosen_mode (remembered for this node+image; delete $ROCM_MODE_CACHE to re-probe)"
 else
     log "Probing GPU passthrough modes (~1 min; the answer is cached per node+image) ..."
+    probe_best_devices=0
     for m in "${ROCM_MODES[@]}"; do
         if gpu_probe "$m" "${base_args[@]}"; then
             log "  $m: OK — $PROBE_DEVICES GPU(s), $PROBE_GFX"
             chosen_mode="$m"
             break
         fi
-        warn "  $m: no GPUs (devices=$PROBE_DEVICES gfx=$PROBE_GFX) — $PROBE_ERR"
+        warn "  $m: devices=$PROBE_DEVICES gfx=$PROBE_GFX — $PROBE_ERR"
+        [[ "$PROBE_DEVICES" =~ ^[0-9]+$ && "$PROBE_DEVICES" -gt "$probe_best_devices" ]] \
+            && probe_best_devices="$PROBE_DEVICES"
     done
     [[ -n "$chosen_mode" ]] \
         && printf '%s %s\n' "$cache_key" "$chosen_mode" > "$ROCM_MODE_CACHE" 2>/dev/null || true
 fi
 
 if [[ -z "$chosen_mode" ]]; then
+    # Torch seeing the GPUs while aiter cannot name the architecture is a
+    # broken rocminfo, not a broken container — and needs a one-line fix
+    # rather than a new image. Do not conflate the two.
+    if [[ "${probe_best_devices:-0}" -gt 0 ]]; then
+        die "The GPUs are reachable ($probe_best_devices seen) but aiter cannot determine the
+  architecture — the image's rocminfo is failing against this node's driver
+  even though HIP works. This does NOT need a new image. Set, in $ENV_FILE:
+
+      export AITER_GPU_ARCHS=\"\${AITER_GPU_ARCHS:-gfx950}\"
+
+  then re-run. Confirm with './serve-kimik3.sh gpucheck'."
+    fi
     die "No GPU passthrough mode works on this node — the container cannot reach the GPUs.
   Tried: ${ROCM_MODES[*]}
   node ROCm $(host_rocm_ver || echo '?')  vs  container ROCm $(sif_rocm_ver || echo '?')
-  If the errors above mention KFD/HSA versions, or torch saw 0 devices in every
-  mode, the node's kernel driver is newer than the container's ROCm and no bind
-  fixes it — you need an image built for this node's ROCm. Run
-  './serve-kimik3.sh gpucheck' for the full report, and see the README
-  'When the node's ROCm changes'."
+  torch saw 0 devices in every mode, so the node's kernel driver is newer than
+  the container's ROCm and no bind fixes it — you need an image built for this
+  node's ROCm. Run './serve-kimik3.sh gpucheck' for the full report, and see
+  the README 'When the node's ROCm changes'."
 fi
 
 if [[ "${PROBE_DEVICES:-}" =~ ^[0-9]+$ && "$PROBE_DEVICES" -lt "$GPUS_USED" ]]; then
