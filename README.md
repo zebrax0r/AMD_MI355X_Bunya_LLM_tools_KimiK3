@@ -343,9 +343,31 @@ if the numbers improve. Run from a shell on the serving node:
 ./bench-kimik3.sh sweep     # c=2/8/32 -> $MODEL_CACHE_DIR/bench/
 ```
 
-Compare against upstream's MI355 TP8 reference — **820 / 2356 / 4898 tok/s at
-c=2/8/32**. A large shortfall means something is mis-set here, not that K3 is
-slow; investigate rather than accept it.
+### Measured on bun161, 29 Jul 2026 (DSpark, 1024/512, TP8)
+
+| c | total tok/s | output tok/s | median TPOT | median TTFT | accept len |
+|---|---|---|---|---|---|
+| 2 | 918 | 306 | **5.61 ms** | 253 ms | 7.29 |
+| 8 | 2074 | 691 | 10.13 ms | 299 ms | 7.26 |
+| 32 | 3793 | 1264 | 21.85 ms | 663 ms | 7.25 |
+
+**Do not chase upstream's `820 / 2356 / 4898`.** Those figures do not survive
+arithmetic against a 1024/512 workload: their c=2 row pairs 820 tok/s with a
+20.86 ms TPOT and 1121 ms TTFT, which at concurrency 2 implies an 11.8 s E2E,
+0.17 req/s and ~260 tok/s — not 820. Their *ratios* are internally consistent
+(20.86/8.94 = 2.33 vs 1659/820 = 2.02), so the measurements are real; they are
+simply not this workload, and the config was never published.
+
+Compare on metrics that are immune to request sizing instead:
+
+| | upstream (DSpark) | here |
+|---|---|---|
+| median TPOT @ c=2 | 8.94 ms | **5.61 ms** |
+| accept length | 5.29-5.93 | **7.25-7.29** |
+| total tok/s @ c=32 | 3715 | **3793** |
+
+Use the table above as the local baseline for tuning: change one thing, re-run,
+keep it if the numbers improve.
 
 **Read the token totals before believing a throughput number.** sglang's random
 dataset samples each length uniformly from `[len * ratio, len]`, and its default
