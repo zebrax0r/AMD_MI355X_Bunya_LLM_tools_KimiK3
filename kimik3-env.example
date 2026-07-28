@@ -47,6 +47,11 @@ export SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-kimi-k3}"
 # main. It is pinned to a dated tag on purpose. Once that PR merges, move to a
 # mainline lmsysorg/sglang-rocm:*-mi35x-* tag and re-verify with
 # './serve-kimik3.sh check'. See the README "When the branch merges".
+#
+# The image ships its OWN ROCm (7.2 in this tag). It does not have to match the
+# node's, but the further apart they drift the more likely GPU passthrough
+# breaks — see ROCM_MODE below and './serve-kimik3.sh gpucheck'. After changing
+# this value the aiter JIT dir re-seeds itself automatically.
 export SGLANG_IMAGE="${SGLANG_IMAGE:-docker://lmsysorg/sglang-rocm:rocm720-mi35x-k3-20260727}"
 
 # Path to the Apptainer image FILE (built with './serve-kimik3.sh pull').
@@ -67,9 +72,10 @@ export APPTAINER_TMPDIR="${APPTAINER_TMPDIR:-}"
 # back over the same path, so writes succeed and compiled kernels persist
 # across runs. Defaults to $MODEL_CACHE_DIR/aiter-jit.
 #
-# Delete this directory to force a clean re-seed after changing SGLANG_IMAGE —
-# a stale copy from an older image is a good way to get undefined-symbol
-# crashes at graph capture.
+# The seed marker records which image it came from, so changing SGLANG_IMAGE
+# re-seeds automatically — a stale copy from an older image is otherwise a good
+# way to get undefined-symbol crashes at graph capture. Deleting the directory
+# by hand also works.
 export AITER_JIT_DIR="${AITER_JIT_DIR:-}"
 # In-image jit/ path. Auto-detected; set only if detection picks the wrong one
 # (it warns loudly when it cannot find aiter at all).
@@ -155,6 +161,31 @@ export SPECULATIVE="${SPECULATIVE:-}"
 export DSPARK_MODEL="${DSPARK_MODEL:-RadixArk/Kimi-K3-DSpark}"
 
 # ── ROCm / AMD kernel toggles ───────────────────────────────────────────────
+
+# How the container reaches the GPUs.
+#
+#   auto     (default) probe 'rocm', then 'devices', and use the first that
+#            actually sees the GPUs. The answer is cached per node+image in
+#            $MODEL_CACHE_DIR/.rocm-mode; delete that file to re-probe.
+#   rocm     apptainer --rocm. Binds the NODE's ROCm libraries into the
+#            container and puts them first on LD_LIBRARY_PATH.
+#   devices  no --rocm; bind /dev/kfd and /dev/dri only, so the container uses
+#            its own ROCm end to end.
+#
+# Why this exists: on 28 Jul 2026 RCC moved a node to ROCm 7.14 while the image
+# still shipped 7.2. With --rocm, the container's own /opt/rocm-7.2.0/bin/rocminfo
+# started exiting 1 against the node's 7.14 libraries, and aiter died on import
+# with "Get GPU arch from rocminfo failed". 'devices' avoids that mixing.
+#
+# Run './serve-kimik3.sh gpucheck' (about a minute) to see the per-mode result.
+export ROCM_MODE="${ROCM_MODE:-auto}"
+
+# Tells aiter the GPU architecture directly (as GPU_ARCHS), so it skips its
+# rocminfo shell-out. A workaround for a broken rocminfo, NOT for a GPU the
+# container cannot reach — if torch sees no devices this changes nothing.
+# Must name exactly ONE arch: a list makes aiter pick the first entry at
+# runtime regardless of the hardware (ROCm/aiter#3807). Empty = leave alone.
+export AITER_GPU_ARCHS="${AITER_GPU_ARCHS:-}"   # e.g. gfx950
 
 # aiter is AMD's fused kernel library and is where the gfx950 FP4 MoE speed
 # comes from. With 1 (default) serve-kimik3.sh exports upstream's four K3

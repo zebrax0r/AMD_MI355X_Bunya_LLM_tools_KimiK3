@@ -359,6 +359,63 @@ newer image.
 
 ---
 
+## When the node's ROCm changes
+
+The image ships its own ROCm (7.2 in the pinned tag) and the node has its own.
+They do not have to match — but on **28 Jul 2026** RCC moved a test node to
+**ROCm 7.14** and the unchanged toolkit died on import:
+
+```
+RuntimeError: Get GPU arch from rocminfo failed:
+  Command '['/opt/rocm-7.2.0/bin/rocminfo']' returned non-zero exit status 1.
+```
+
+Note the path: that is the **container's own** 7.2 `rocminfo`, not the node's.
+The image did not change, so the node reached in through one of exactly three
+channels:
+
+1. **`--rocm` library injection.** Apptainer binds the *node's* ROCm libraries
+   into `/.singularity.d/libs` and prepends that to `LD_LIBRARY_PATH`, so the
+   container's binaries run against them. Apptainer's own docs require the two
+   ROCm versions to be compatible. Fixable: `ROCM_MODE=devices`.
+2. **The kernel driver, via `/dev/kfd`.** A KFD ioctl ABI break is *not*
+   fixable by any bind — it needs an image built for the node's ROCm.
+3. **Inherited `*_VISIBLE_DEVICES`.** A UUID-form list the container's older
+   ROCr cannot parse stops it enumerating any GPU at all, which looks exactly
+   like a dead driver. The script now refuses to forward non-index-form values.
+
+`gpucheck` tells you which one you have, in about a minute:
+
+```bash
+./serve-kimik3.sh gpucheck
+```
+
+It prints both ROCm versions, tries every passthrough mode, and gives a verdict.
+`ROCM_MODE=auto` (the default) then does the same thing automatically at launch
+and caches the answer per node+image, so a working node pays for it once.
+
+If **no** mode works and the errors mention KFD/HSA versions or torch sees zero
+devices, you are in case 2 and need a different image. In order of cost:
+
+```bash
+# 1. Has K3 support landed in a mainline image on a newer ROCm?
+export SGLANG_IMAGE="docker://rocm/sgl-dev:v0.5.13.post1-ubuntu24.04-py3.14-rocm7.14"
+export SIF_PATH="$MODEL_CACHE_DIR/kimik3-rocm714.sif"
+./serve-kimik3.sh pull && ./serve-kimik3.sh check   # needs KimiK3ForConditionalGeneration
+
+# 2. Has upstream rebuilt the K3 image on a newer ROCm? (see the tag query above,
+#    and also check rocm/sgl-dev)
+```
+
+Only if both fail is building one worth it: `sglang/docker/rocm.Dockerfile`
+takes `SGL_BRANCH`, `GPU_ARCH=gfx950` and a `BASE_IMAGE_950_*` override, and
+prebuilds aiter's kernels — 45–90 minutes. The Dockerfile is the easy part;
+**Bunya has no Docker**, so it needs an Apptainer def file with fakeroot (check
+with RCC first) or a machine that does. Serving on the ROCm 7.2 nodes while
+waiting for an upstream 7.14 K3 image is a legitimate answer, not a failure.
+
+---
+
 ## Running on other hardware
 
 **MI300X / MI325X (gfx942): no.** K3 needs ~1.5 TB, and a gfx942 node gives
@@ -375,6 +432,7 @@ which is out of scope for this repo. `serve-kimik3.sh` detects gfx942 and warns.
 ./serve-kimik3.sh serve --detach start serving, wait until healthy, return the shell
 ./serve-kimik3.sh pull           build the .sif from the container image (one-time)
 ./serve-kimik3.sh check          can this image load this model? (run BEFORE download)
+./serve-kimik3.sh gpucheck       can this image reach this node's GPUs? (~1 min)
 ./serve-kimik3.sh parsers        list tool-call/reasoning parsers this image supports
 ./serve-kimik3.sh download       prefetch weights (+ DSpark draft if enabled)
 ./serve-kimik3.sh stop           stop the server
@@ -433,6 +491,8 @@ All knobs live in `kimik3.env` (copied from `kimik3-env.example`). Anything you
 | `SPECULATIVE` | *(empty)* | `dspark` enables DSpark speculative decoding |
 | `DSPARK_MODEL` | `RadixArk/Kimi-K3-DSpark` | Draft model for DSpark |
 | `ENABLE_AITER` | `1` | Exports the four `SGLANG_*`/`AITER_*` K3 variables |
+| `ROCM_MODE` | `auto` | GPU passthrough: `auto` probes, `rocm` uses `--rocm`, `devices` binds `/dev/kfd` only |
+| `AITER_GPU_ARCHS` | *(empty)* | Sets `GPU_ARCHS` so aiter skips `rocminfo`. One arch only (e.g. `gfx950`) |
 | `SET_CPU_AFFINITY` | `0` | Keep `0` under a SLURM cgroup (see troubleshooting) |
 | `READY_TIMEOUT` | `14400` | Seconds to wait for health (cold load is ~1.5 TB) |
 | `LAUNCH_CMD` | `sglang serve` | Escape hatch: `python3 -m sglang.launch_server` |
@@ -455,6 +515,11 @@ All knobs live in `kimik3.env` (copied from `kimik3-env.example`). Anything you
 - **Fluent gibberish**: see Step 5. Try `ENABLE_AITER=0` to rule out the fused
   FP4 kernels, and try a different image tag. Do not ship a config that produces
   incoherent output because the throughput looked good.
+- **`RuntimeError: Get GPU arch from rocminfo failed`** at startup — *hit for
+  real on 28 Jul 2026 when a node moved to ROCm 7.14.* The container cannot
+  reach the GPUs. Run `./serve-kimik3.sh gpucheck`; see
+  [When the node's ROCm changes](#when-the-nodes-rocm-changes) for the three
+  causes and which are fixable. Short version: try `ROCM_MODE=devices`.
 - **KV cache OOM at startup**: set `CONTEXT_LEN=262144` first, and only then
   consider `MEM_FRACTION`. One knob at a time.
 - **`TypeError: 'NoneType' object is not callable`** with DSpark: known upstream
@@ -479,8 +544,10 @@ All knobs live in `kimik3.env` (copied from `kimik3-env.example`). Anything you
   loudly — set `AITER_JIT_TARGET` to the `jit/` directory from the error path
   (e.g. `/sgl-workspace/aiter/aiter/jit`).
 
-  After changing `SGLANG_IMAGE`, `rm -rf $AITER_JIT_DIR` to force a re-seed; a
-  copy left over from an older image causes undefined-symbol crashes.
+  The seed marker records which image it came from, so changing `SGLANG_IMAGE`
+  now re-seeds automatically — a copy left over from an older image causes
+  undefined-symbol crashes, and moving between ROCm 7.2 and 7.14 images makes
+  that a certainty rather than a risk.
 - **Crash during graph capture: `.aiter/jit/module_*.so: undefined symbol`**:
   aiter JIT-compiles kernels into `$HOME/.aiter/jit` (your home is bind-mounted
   into the container). A startup killed *mid-compile* leaves a truncated module

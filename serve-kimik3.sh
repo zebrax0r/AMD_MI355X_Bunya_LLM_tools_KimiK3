@@ -19,6 +19,7 @@
 #                                use this to run opencode on the GPU node itself
 #   ./serve-kimik3.sh pull       build the .sif from the container image (once)
 #   ./serve-kimik3.sh check      can this image load this model? (arch vs registry)
+#   ./serve-kimik3.sh gpucheck   can this image reach this node's GPUs? (~1 min)
 #   ./serve-kimik3.sh parsers    list tool-call/reasoning parsers this image has
 #   ./serve-kimik3.sh download   prefetch model weights only (no GPU needed)
 #   ./serve-kimik3.sh stop       stop a running server
@@ -79,6 +80,8 @@ SPECULATIVE="${SPECULATIVE:-}"
 DSPARK_MODEL="${DSPARK_MODEL:-RadixArk/Kimi-K3-DSpark}"
 ENABLE_AITER="${ENABLE_AITER:-1}"
 FLYDSL_FORCE="${FLYDSL_FORCE:-1}"
+ROCM_MODE="${ROCM_MODE:-auto}"
+AITER_GPU_ARCHS="${AITER_GPU_ARCHS:-}"
 SET_CPU_AFFINITY="${SET_CPU_AFFINITY:-0}"
 READY_TIMEOUT="${READY_TIMEOUT:-14400}"
 LAUNCH_CMD="${LAUNCH_CMD:-sglang serve}"
@@ -93,6 +96,20 @@ case "$SPECULATIVE" in
     ""|none|dspark) ;;
     *) die "SPECULATIVE must be empty or 'dspark', got '$SPECULATIVE'." ;;
 esac
+
+case "$ROCM_MODE" in
+    auto|rocm|devices) ;;
+    *) die "ROCM_MODE must be auto, rocm or devices, got '$ROCM_MODE'." ;;
+esac
+
+# GPU_ARCHS is a build-time hint that aiter also consults at runtime, and a
+# LIST makes it pick the first entry regardless of the actual device
+# (ROCm/aiter#3807). One arch or nothing.
+if [[ "$AITER_GPU_ARCHS" == *";"* || "$AITER_GPU_ARCHS" == *","* ]]; then
+    die "AITER_GPU_ARCHS must name exactly one architecture (e.g. gfx950), got '$AITER_GPU_ARCHS'.
+  A list makes aiter select the first entry at runtime even on other hardware
+  — see https://github.com/ROCm/aiter/issues/3807."
+fi
 
 # Runtime state (PID + log) lives under MODEL_CACHE_DIR so it survives detach
 # and is reachable by 'stop'/'status' from any shell in the allocation.
@@ -151,9 +168,9 @@ case "$MODE" in
         fi
         exit 0
         ;;
-    serve|pull|download|check|parsers) ;;
+    serve|pull|download|check|gpucheck|parsers) ;;
     *)
-        die "Unknown mode '$MODE'. Use: serve | pull | download | check | parsers | stop | status"
+        die "Unknown mode '$MODE'. Use: serve | pull | download | check | gpucheck | parsers | stop | status"
         ;;
 esac
 
@@ -216,6 +233,187 @@ fi
 if [[ -z "${HF_TOKEN:-}" && -n "${HF_TOKEN_FILE:-}" ]]; then
     [[ -r "$HF_TOKEN_FILE" ]] || die "HF_TOKEN_FILE '$HF_TOKEN_FILE' is not readable."
     HF_TOKEN="$(<"$HF_TOKEN_FILE")"
+fi
+
+# ── GPU passthrough: how does the container reach the GPUs? ─────────────────
+#
+# The image ships its own ROCm. The HOST's ROCm reaches into it through exactly
+# three channels, and all three have broken a run here:
+#
+#   1. '--rocm' binds the host's ROCm libraries into /.singularity.d/libs and
+#      PREPENDS that to LD_LIBRARY_PATH, so the container's binaries run against
+#      the host's libhsa/libamdhip. Apptainer's docs are explicit that this
+#      requires the two ROCm versions to be compatible. When RCC moved a node to
+#      ROCm 7.14 under our 7.2 image, the container's OWN rocminfo started
+#      exiting 1 and aiter died on import:
+#        RuntimeError: Get GPU arch from rocminfo failed:
+#          Command '['/opt/rocm-7.2.0/bin/rocminfo']' returned non-zero exit status 1
+#   2. The kernel driver, via /dev/kfd. A KFD ioctl ABI break is not fixable
+#      from here — it needs an image built for the node's ROCm.
+#   3. Inherited environment: a *_VISIBLE_DEVICES value the container's ROCr
+#      cannot parse (e.g. UUID form) takes down agent enumeration entirely.
+#
+# So don't assume: probe. 'devices' mode drops --rocm and passes the device
+# nodes only, leaving the container's ROCm userspace intact end to end.
+
+ROCM_MODES=(rocm devices)
+
+# SLURM on a newer ROCm can hand out UUID-form device lists ("GPU-a1b2..."). An
+# older ROCr in the container cannot parse those, and an unparseable value takes
+# down agent enumeration for the WHOLE container — which looks exactly like a
+# broken driver. Only forward index-form lists.
+visible_devices_ok() { [[ "$1" =~ ^[0-9]+(,[0-9]+)*$ ]]; }
+
+# Identity of the .sif, cheap. Used both to key the cached passthrough mode and
+# to detect that the seeded aiter jit/ dir came from a different image.
+sif_stamp() {
+    stat -c '%s:%Y' "$SIF_PATH" 2>/dev/null \
+        || stat -f '%z:%m' "$SIF_PATH" 2>/dev/null \
+        || echo '?'
+}
+
+# Probing costs ~a minute, so remember the answer. Key it to the node AND the
+# image: either one changing invalidates the result.
+ROCM_MODE_CACHE="$MODEL_CACHE_DIR/.rocm-mode"
+rocm_cache_key() { printf '%s|%s' "$(hostname -s 2>/dev/null || echo node)" "$(sif_stamp)"; }
+
+set_rocm_mode_args() {   # $1 = mode -> sets global rocm_args
+    case "$1" in
+        rocm)    rocm_args=(--rocm) ;;
+        devices) rocm_args=(--bind /dev/kfd:/dev/kfd --bind /dev/dri:/dev/dri) ;;
+        *)       die "internal: unknown ROCm mode '$1'" ;;
+    esac
+}
+
+# ROCm version string, best effort. /opt/rocm/.info/version is the canonical
+# file; fall back to the versioned directory name.
+ROCM_VER_CMD='cat /opt/rocm/.info/version 2>/dev/null || ls -d /opt/rocm-* 2>/dev/null | sed -n "1s|.*/opt/rocm-||p"'
+host_rocm_ver() { sh -c "$ROCM_VER_CMD" 2>/dev/null | head -n1; }
+sif_rocm_ver()  { apptainer exec "$SIF_PATH" sh -c "$ROCM_VER_CMD" 2>/dev/null | head -n1; }
+
+# Ask the container, under a given mode, the two questions that matter: can
+# torch see the GPUs, and can aiter name the architecture? The second is the
+# exact call that crashed — testing anything less is testing the wrong thing.
+#
+# aiter prints '[aiter] ...' banners on import, so answers go out as tagged
+# lines and are grepped back rather than read positionally.
+GPU_PROBE_PY='
+n, gfx, err = -1, "", ""
+try:
+    import torch
+    n = torch.cuda.device_count()
+except BaseException as e:
+    err = "torch: %s: %s" % (type(e).__name__, e)
+if not err:
+    try:
+        from aiter.jit.utils.chip_info import get_gfx
+        gfx = str(get_gfx() or "")
+    except BaseException as e:
+        err = "aiter: %s: %s" % (type(e).__name__, e)
+print("KIMIK3_DEVICES %d" % n)
+print("KIMIK3_GFX %s" % (gfx or "-"))
+print("KIMIK3_ERR %s" % (" ".join(err.split()) or "-"))
+'
+
+# gpu_probe <mode> [extra apptainer args ...]
+# Sets PROBE_DEVICES / PROBE_GFX / PROBE_ERR. Returns 0 only if the container
+# saw at least one GPU and aiter named the architecture.
+gpu_probe() {
+    local mode="$1"; shift
+    local out
+    set_rocm_mode_args "$mode"
+    out="$(apptainer exec "${rocm_args[@]}" "$@" "$SIF_PATH" \
+              python3 -c "$GPU_PROBE_PY" 2>&1 || true)"
+
+    PROBE_DEVICES="$(sed -n 's/^KIMIK3_DEVICES //p' <<<"$out" | tail -n1)"
+    PROBE_GFX="$(sed -n 's/^KIMIK3_GFX //p' <<<"$out" | tail -n1)"
+    PROBE_ERR="$(sed -n 's/^KIMIK3_ERR //p' <<<"$out" | tail -n1)"
+
+    # No tagged output at all means python never ran (bad bind, missing device,
+    # apptainer refused). Surface whatever it did say.
+    if [[ -z "$PROBE_DEVICES" ]]; then
+        PROBE_DEVICES="-1"
+        PROBE_GFX="-"
+        PROBE_ERR="$(tail -n 3 <<<"$out" | tr '\n' ' ')"
+        PROBE_ERR="${PROBE_ERR:-container produced no output}"
+    fi
+
+    [[ "$PROBE_DEVICES" =~ ^[0-9]+$ && "$PROBE_DEVICES" -gt 0 \
+       && "$PROBE_GFX" == gfx* ]]
+}
+
+# ── gpucheck mode: can this image reach this node's GPUs? ───────────────────
+# The diagnostic AND the permanent preflight — same code path, so what we debug
+# with is what we run. Costs about a minute; the failure it replaces costs a
+# crash 30 frames deep in aiter, or worse, a 1.5 TB weight load.
+
+if [[ "$MODE" == "gpucheck" ]]; then
+    log "Image:  $SIF_PATH"
+    echo
+    printf '  host ROCm       : %s\n' "$(host_rocm_ver || true)"
+    printf '  container ROCm  : %s\n' "$(sif_rocm_ver || true)"
+    printf '  host rocminfo   : %s\n' \
+        "$(command -v rocminfo >/dev/null 2>&1 \
+             && (rocminfo 2>/dev/null | grep -om1 'gfx[0-9a-f]*' || echo 'ran, no gfx line') \
+             || echo 'not on PATH')"
+    for v in ROCR_VISIBLE_DEVICES HIP_VISIBLE_DEVICES CUDA_VISIBLE_DEVICES; do
+        if [[ -n "${!v:-}" ]]; then
+            note=""
+            visible_devices_ok "${!v}" \
+                || note="   <- NOT index-form; ROCr may fail to enumerate"
+            printf '  %-20s: %s%s\n' "$v" "${!v}" "$note"
+        fi
+    done
+    echo
+
+    # Probe with the same aiter jit/ bind the server gets, when we already know
+    # it — the .seeded marker records the in-image target. Testing a container
+    # configured differently from the one we launch is how the read-only-.sif
+    # bug survived three attempts.
+    probe_extra=()
+    jit_dir="${AITER_JIT_DIR:-$MODEL_CACHE_DIR/aiter-jit}"
+    if [[ -f "$jit_dir/.seeded" ]]; then
+        jit_target="$(cut -d'|' -f2 "$jit_dir/.seeded" 2>/dev/null || true)"
+        if [[ "$jit_target" == /* ]]; then
+            probe_extra=(--bind "$MODEL_CACHE_DIR":"$MODEL_CACHE_DIR"
+                         --bind "$jit_dir":"$jit_target")
+            log "Probing with the aiter JIT bind: $jit_dir -> $jit_target"
+            echo
+        fi
+    fi
+
+    gpucheck_ok=""
+    for m in "${ROCM_MODES[@]}"; do
+        if gpu_probe "$m" ${probe_extra[@]+"${probe_extra[@]}"}; then
+            printf '  %-8s : OK    devices=%s gfx=%s\n' "$m" "$PROBE_DEVICES" "$PROBE_GFX"
+            [[ -z "$gpucheck_ok" ]] && gpucheck_ok="$m"
+        else
+            printf '  %-8s : FAIL  devices=%s gfx=%s\n' "$m" "$PROBE_DEVICES" "$PROBE_GFX"
+            printf '             %s\n' "$PROBE_ERR"
+        fi
+    done
+    echo
+
+    if [[ -n "$gpucheck_ok" ]]; then
+        log "Verdict: use ROCM_MODE=$gpucheck_ok on this node."
+        [[ "$gpucheck_ok" != "rocm" ]] && log \
+            "  '--rocm' injects the host's ROCm libraries; '$gpucheck_ok' does not, which is
+  what a host/container ROCm mismatch needs."
+        [[ "$PROBE_DEVICES" != "$TP_SIZE" ]] && warn \
+            "Container sees $PROBE_DEVICES GPU(s) but TP_SIZE=$TP_SIZE. Fix the allocation or TP_SIZE."
+        # Record it so 'serve' does not pay for the probe again.
+        printf '%s %s\n' "$(rocm_cache_key)" "$gpucheck_ok" > "$ROCM_MODE_CACHE" 2>/dev/null || true
+        exit 0
+    fi
+
+    rm -f "$ROCM_MODE_CACHE" 2>/dev/null || true
+    warn "Verdict: NO passthrough mode works on this node."
+    warn "  If the errors mention KFD/HSA versions or torch sees 0 devices, the node's
+  kernel driver is newer than the container's ROCm and no bind fixes it — you
+  need an image built for this node's ROCm. See the README
+  'When the node's ROCm changes'.
+    host ROCm $(host_rocm_ver || echo '?')  vs  container ROCm $(sif_rocm_ver || echo '?')"
+    exit 1
 fi
 
 # ── parsers mode: what can this image actually parse? ───────────────────────
@@ -372,6 +570,21 @@ if command -v rocminfo >/dev/null 2>&1; then
     esac
 fi
 
+# The image ships its own ROCm and the node has its own. They do not have to
+# match, but a MAJOR difference is the thing most likely to break passthrough —
+# say so up front rather than letting it surface as an aiter import error.
+host_rocm="$(host_rocm_ver || true)"
+sif_rocm="$(sif_rocm_ver || true)"
+if [[ -n "$host_rocm" && -n "$sif_rocm" ]]; then
+    log "ROCm: node $host_rocm / container $sif_rocm"
+    if [[ "$(cut -d. -f1,2 <<<"$host_rocm")" != "$(cut -d. -f1,2 <<<"$sif_rocm")" ]]; then
+        warn "Node and container ROCm versions differ ($host_rocm vs $sif_rocm).
+  '--rocm' injects the NODE's ROCm libraries into the container, which is what
+  breaks first when they diverge. ROCM_MODE=$ROCM_MODE will sort it out; run
+  './serve-kimik3.sh gpucheck' if startup fails in aiter."
+    fi
+fi
+
 # --tp IS the total GPU count. --dp (with dp-attention) only subdivides those
 # GPUs for attention — it does NOT multiply the count — so DP must divide TP.
 GPUS_USED="$TP_SIZE"
@@ -487,12 +700,30 @@ if [[ "${AITER_JIT_TARGET:-}" != /* ]]; then
 else
     mkdir -p "$AITER_JIT_DIR" || die "Cannot create $AITER_JIT_DIR"
 
-    if [[ ! -f "$AITER_JIT_DIR/.seeded" ]]; then
-        log "Seeding writable aiter JIT dir from the image (one-off copy) ..."
+    # The seed marker records WHICH image it came from. A jit/ dir seeded from
+    # one image and bound over another hides that image's prebuilt kernels
+    # behind stale ones — the 'module_*.so: undefined symbol' crash. The README
+    # has always said to delete this dir after changing SGLANG_IMAGE; nothing
+    # enforced it, and moving between ROCm 7.2 and 7.14 images makes that a
+    # certainty rather than a risk. The seed is derived data, so re-deriving it
+    # is always safe.
+    seed_stamp="$SGLANG_IMAGE|$AITER_JIT_TARGET|$(sif_stamp)"
+    if [[ "$(cat "$AITER_JIT_DIR/.seeded" 2>/dev/null || true)" != "$seed_stamp" ]]; then
+        if [[ -e "$AITER_JIT_DIR/.seeded" ]]; then
+            log "Image changed since $AITER_JIT_DIR was seeded — re-seeding."
+            # Guard the rm: this must never be able to point at scratch itself.
+            case "$AITER_JIT_DIR" in
+                ""|/|"$HOME"|"$MODEL_CACHE_DIR")
+                    die "Refusing to clear AITER_JIT_DIR='$AITER_JIT_DIR' — set it to a directory of its own." ;;
+            esac
+            rm -rf "${AITER_JIT_DIR:?}"/* "${AITER_JIT_DIR:?}"/.[!.]* 2>/dev/null || true
+        else
+            log "Seeding writable aiter JIT dir from the image (one-off copy) ..."
+        fi
         apptainer exec --bind "$MODEL_CACHE_DIR":"$MODEL_CACHE_DIR" "$SIF_PATH" \
             cp -a "$AITER_JIT_TARGET/." "$AITER_JIT_DIR/" \
             || die "Failed to copy $AITER_JIT_TARGET out of the image into $AITER_JIT_DIR"
-        touch "$AITER_JIT_DIR/.seeded"
+        printf '%s\n' "$seed_stamp" > "$AITER_JIT_DIR/.seeded"
         log "Seeded $AITER_JIT_DIR ($(du -sh "$AITER_JIT_DIR" 2>/dev/null | cut -f1 || echo '?'))"
     fi
 
@@ -549,8 +780,19 @@ fi
 # Upstream's four K3/AITER variables — this is how the K3 fused FP4 path is
 # turned on. Note there is no --enable-aiter-allreduce-fusion in this recipe.
 aiter_env=()
+
+# GPU_ARCHS lets aiter skip its rocminfo shell-out when that call is the only
+# broken part of the stack. It is NOT a fix for a GPU the container cannot
+# reach: if torch sees no devices this changes nothing. Deliberately outside the
+# ENABLE_AITER gate — sglang imports aiter during module import regardless, so
+# ENABLE_AITER=0 does not avoid the detection path.
+if [[ -n "$AITER_GPU_ARCHS" ]]; then
+    aiter_env+=(--env "GPU_ARCHS=$AITER_GPU_ARCHS")
+    log "AITER_GPU_ARCHS=$AITER_GPU_ARCHS — aiter will skip rocminfo architecture detection."
+fi
+
 if [[ "$ENABLE_AITER" == "1" ]]; then
-    aiter_env=(--env SGLANG_USE_AITER=1
+    aiter_env+=(--env SGLANG_USE_AITER=1
                --env SGLANG_AITER_K3_OPT=1
                --env AITER_SITUV2_A8W4=1)
     # AITER_FLYDSL_FORCE is what routes gemms through the FlyDSL JIT compiler,
@@ -566,10 +808,25 @@ fi
 
 # Forward the SLURM GPU-visibility vars into the container (Apptainer inherits
 # host env by default, but be explicit) so ROCm sees exactly the allocated GPUs.
+#
+# ...but only if the container's ROCr can parse them. A newer host stack can
+# hand out UUID-form lists ("GPU-a1b2..."), and an older ROCr given one of those
+# fails to enumerate ANY agent — which presents as a dead driver rather than as
+# a bad variable. SLURM's cgroup already limits which devices are visible, so
+# dropping an unparseable value is safe.
 gpu_env=()
-[[ -n "${ROCR_VISIBLE_DEVICES:-}" ]] && gpu_env+=(--env "ROCR_VISIBLE_DEVICES=$ROCR_VISIBLE_DEVICES")
-[[ -n "${HIP_VISIBLE_DEVICES:-}"  ]] && gpu_env+=(--env "HIP_VISIBLE_DEVICES=$HIP_VISIBLE_DEVICES")
-[[ -n "${CUDA_VISIBLE_DEVICES:-}" ]] && gpu_env+=(--env "CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES")
+for v in ROCR_VISIBLE_DEVICES HIP_VISIBLE_DEVICES CUDA_VISIBLE_DEVICES; do
+    val="${!v:-}"
+    [[ -z "$val" ]] && continue
+    if visible_devices_ok "$val"; then
+        gpu_env+=(--env "$v=$val")
+    else
+        warn "$v='$val' is not an index list — NOT forwarding it into the container.
+  The container's ROCm may not parse this form, and an unparseable value stops
+  it enumerating any GPU at all. The SLURM allocation still constrains what is
+  visible. Export a plain index list (e.g. 0,1,2,3,4,5,6,7) to override."
+    fi
+done
 
 cmd=("${launcher[@]}"
      --model-path "$MODEL_ID"
@@ -602,8 +859,7 @@ log "Logs:  $LOG_FILE"
 # construction the configuration we run. (An earlier version tested a
 # separately-built command; it passed while the real launch was missing a
 # bind, which is a very expensive way to be wrong.)
-apptainer_args=(exec --rocm
-    --bind "$MODEL_CACHE_DIR":"$MODEL_CACHE_DIR"
+base_args=(--bind "$MODEL_CACHE_DIR":"$MODEL_CACHE_DIR"
     ${cache_bind[@]+"${cache_bind[@]}"}
     --env HF_HOME="$MODEL_CACHE_DIR"
     --env HF_TOKEN="${HF_TOKEN:-}"
@@ -611,6 +867,60 @@ apptainer_args=(exec --rocm
     --env SGLANG_SET_CPU_AFFINITY="$SET_CPU_AFFINITY"
     ${aiter_env[@]+"${aiter_env[@]}"}
     ${gpu_env[@]+"${gpu_env[@]}"})
+
+# ── Pick the GPU passthrough mode ───────────────────────────────────────────
+# Probed against base_args, so the configuration we test is the one we launch.
+
+chosen_mode=""
+cache_key="$(rocm_cache_key)"
+
+if [[ "$ROCM_MODE" != "auto" ]]; then
+    log "ROCM_MODE=$ROCM_MODE (explicit) — verifying it reaches the GPUs ..."
+    if gpu_probe "$ROCM_MODE" "${base_args[@]}"; then
+        chosen_mode="$ROCM_MODE"
+    else
+        die "ROCM_MODE=$ROCM_MODE cannot reach this node's GPUs.
+  devices seen : $PROBE_DEVICES        gfx: $PROBE_GFX
+  container    : $PROBE_ERR
+  Run './serve-kimik3.sh gpucheck' — it tries every mode and names the cause.
+  Or set ROCM_MODE=auto to let this script choose."
+    fi
+elif [[ "$(cut -d' ' -f1 "$ROCM_MODE_CACHE" 2>/dev/null || true)" == "$cache_key" ]]; then
+    chosen_mode="$(cut -d' ' -f2 "$ROCM_MODE_CACHE" 2>/dev/null || true)"
+    log "GPU passthrough: $chosen_mode (remembered for this node+image; delete $ROCM_MODE_CACHE to re-probe)"
+else
+    log "Probing GPU passthrough modes (~1 min; the answer is cached per node+image) ..."
+    for m in "${ROCM_MODES[@]}"; do
+        if gpu_probe "$m" "${base_args[@]}"; then
+            log "  $m: OK — $PROBE_DEVICES GPU(s), $PROBE_GFX"
+            chosen_mode="$m"
+            break
+        fi
+        warn "  $m: no GPUs (devices=$PROBE_DEVICES gfx=$PROBE_GFX) — $PROBE_ERR"
+    done
+    [[ -n "$chosen_mode" ]] \
+        && printf '%s %s\n' "$cache_key" "$chosen_mode" > "$ROCM_MODE_CACHE" 2>/dev/null || true
+fi
+
+if [[ -z "$chosen_mode" ]]; then
+    die "No GPU passthrough mode works on this node — the container cannot reach the GPUs.
+  Tried: ${ROCM_MODES[*]}
+  node ROCm $(host_rocm_ver || echo '?')  vs  container ROCm $(sif_rocm_ver || echo '?')
+  If the errors above mention KFD/HSA versions, or torch saw 0 devices in every
+  mode, the node's kernel driver is newer than the container's ROCm and no bind
+  fixes it — you need an image built for this node's ROCm. Run
+  './serve-kimik3.sh gpucheck' for the full report, and see the README
+  'When the node's ROCm changes'."
+fi
+
+if [[ "${PROBE_DEVICES:-}" =~ ^[0-9]+$ && "$PROBE_DEVICES" -lt "$GPUS_USED" ]]; then
+    warn "Container sees $PROBE_DEVICES GPU(s) but TP_SIZE=$TP_SIZE needs $GPUS_USED. Startup will fail."
+fi
+
+set_rocm_mode_args "$chosen_mode"
+log "GPU passthrough: $chosen_mode (${rocm_args[*]})"
+
+apptainer_args=(exec "${rocm_args[@]}" "${base_args[@]}")
 
 # ── Preflight: aiter's JIT dir must be writable *as the server will see it* ──
 # The FP4 MoE compiles FlyDSL kernels at CUDA-graph capture, which happens
