@@ -237,6 +237,17 @@ curl -s http://127.0.0.1:30000/v1/chat/completions \
 weights producing fluent-looking *gibberish* on gfx950 with ROCm 7.2. A healthy
 `/health` and a 200 response prove nothing about numerics. Read the sentence.
 
+**Result on Bunya, 29 Jul 2026: PASS.** Asked why MXFP4 fits 2.8T parameters in
+2304 GB, the model derived 2.8T x 2 bytes = 5.6 TB for BF16 and 4.25 effective
+bits for MXFP4 (4-bit values + an 8-bit E8M0 scale per 32-element block) —
+correct, and independently the same arithmetic as the memory budget above. The
+#36337 failure mode does not appear on this SGLang build.
+
+**K3 is a thinking model, so the text arrives in `reasoning_content`, not
+`content`.** With the `kimi_k3` reasoning parser, `content` stays empty until
+thinking finishes — a small `max_tokens` returns `finish_reason: length` and an
+empty `content`, which looks like a broken server and is not. Give it room.
+
 ### Step 6 — Connect opencode
 
 On the GPU node (attach a second shell to the job first):
@@ -288,11 +299,22 @@ export SPECULATIVE="dspark"
 ./serve-kimik3.sh stop && ./serve-kimik3.sh serve --detach
 ```
 
-**It is off by default on purpose.** SGLang issue
-[#32569](https://github.com/sgl-project/sglang/issues/32569) reports DSPARK
-crashing with `TypeError: 'NoneType' object is not callable`. Get baseline
-serving working first — that way a failure has one cause instead of two. If you
-hit that error, unset `SPECULATIVE` and carry on.
+**It is off by default on purpose, and on Bunya it does not work.** SGLang
+issue [#32569](https://github.com/sgl-project/sglang/issues/32569) reports
+DSPARK crashing with `TypeError: 'NoneType' object is not callable`. We did not
+hit the crash — we hit something quieter and worse. Measured on bun161,
+29 Jul 2026:
+
+```
+accept len: 1.23, accept rate: 0.03      (upstream: 5.29-5.93)
+```
+
+Three percent of drafted tokens accepted makes speculation *pure overhead*: a
+full draft forward pass plus verification every step, for barely more than one
+token. The target model is healthy (the coherence check above passes), so this
+is the draft disagreeing with a working model. **Leave `SPECULATIVE` empty**
+until upstream fixes it — and note that this failed silently as a performance
+problem, not as an error, which is exactly why you change one thing at a time.
 
 Note the throughput crossover: DSpark *loses* above ~concurrency 16 (3715 vs
 4898 tok/s at c=32). It is a latency optimisation for interactive use, not a
