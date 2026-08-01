@@ -1,0 +1,13 @@
+# >>> kimik3-bunya (managed by kimicode-setup.sh) >>>
+[providers.kimik3-bunya]
+type = "openai"
+base_url = "http://__HOST__:__PORT__/v1"
+api_key = "__APIKEY__"
+
+[models."kimik3-bunya/__MODEL__"]
+provider = "kimik3-bunya"
+model = "__MODEL__"
+display_name = "Kimi K3 (Bunya MI355X)"
+max_context_size = __CONTEXT__
+capabilities = ["thinking", "tool_use"]
+# <<< kimik3-bunya <<<

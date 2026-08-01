@@ -1,10 +1,11 @@
-# Kimi K3 on Bunya's AMD MI355X — SGLang serving for opencode
+# Kimi K3 on Bunya's AMD MI355X — SGLang serving for opencode and kimicode
 
 One-click serving of Moonshot's **Kimi K3** (2.8T-parameter hybrid MoE, Kimi
 Delta Attention, 1M context, native vision) on a **single Bunya MI355X node** —
 8× gfx950, 288 GB HBM each, 2,304 GB total — inside an Apptainer container,
 exposed as an OpenAI-compatible endpoint and wired into
-[opencode](https://opencode.ai).
+[opencode](https://opencode.ai) or
+[kimicode](https://www.kimi.com/code/docs/en/).
 
 Same shape as the [GLM-5.2 sibling repo](https://github.com/zebrax0r/AMD_MI355X_Bunya_LLM_tools_GLM5.2),
 from which all the Bunya-specific knowledge here is inherited.
@@ -158,6 +159,8 @@ scontrol show node bun161 | grep -iE 'Gres|Partitions|State'
 | `kimik3-env.example` | Config template — copy to `kimik3.env` and edit |
 | `opencode-setup.sh` | Writes/merges the opencode provider config on any machine |
 | `opencode.kimik3.json` | The provider template `opencode-setup.sh` fills in |
+| `kimicode-setup.sh` | Writes/merges the kimicode provider config on any machine |
+| `kimicode.kimik3.toml` | The provider template `kimicode-setup.sh` fills in |
 | `share-kimik3.sh` | Optional: public HTTPS tunnel via Cloudflare for users without SSH |
 | `bench-kimik3.sh` | Benchmark tok/s / TTFT / ITL against upstream's numbers |
 
@@ -316,6 +319,92 @@ ssh -N -L 30000:<node>:30000 $USER@bunya1.rcc.uq.edu.au
 ```
 
 Restart opencode, then pick **Kimi K3 (Bunya MI355X)** via `/models`.
+
+### Step 6b — Connect kimicode (optional)
+
+Moonshot's own CLI agent talks to any OpenAI-compatible endpoint, so it will
+drive this server too — Kimi's coding agent on a self-hosted Kimi model. Nothing
+changes on the server side: `--host 0.0.0.0`, `--api-key` and the `kimi_k3`
+parsers already do everything it needs.
+
+> **Not yet verified on Bunya — written 1 Aug 2026 from Moonshot's published
+> config schema, not from a run.** The setup script itself is tested; the
+> end-to-end agentic loop is not. Verify before trusting it, and see the checklist
+> at the end of this section.
+
+**First, get the right `kimi`.** Moonshot ships two products whose binary is both
+called `kimi`, and following a stale blog post lands you in the wrong config file
+with a provider type that does not exist:
+
+| | Legacy | **What this targets** |
+|---|---|---|
+| Name | Kimi CLI | Kimi Code CLI |
+| Runtime | Python / uv / PyPI `kimi-cli` | Node.js |
+| Config | `~/.kimi/config.toml` | `~/.kimi-code/config.toml` |
+| Provider type | `openai_legacy` | `openai` |
+| Status | "will no longer be maintained" | current |
+
+```bash
+curl -fsSL https://code.kimi.com/kimi-code/install.sh | bash
+```
+
+On the GPU node (attach a second shell to the job first):
+
+```bash
+srun --overlap --jobid <jobid> --pty /bin/bash -l
+cd /scratch/user/$USER/kimik3-bunya
+./kimicode-setup.sh --host localhost --port 30000
+kimi -m kimik3-bunya/kimi-k3
+```
+
+From your laptop, tunnel and point at localhost:
+
+```bash
+# terminal 1 (<node> = the hostname the serve banner printed):
+ssh -N -L 30000:<node>:30000 $USER@bunya1.rcc.uq.edu.au
+# terminal 2:
+./kimicode-setup.sh --host localhost --port 30000 --api-key <key>
+kimi -m kimik3-bunya/kimi-k3
+```
+
+The script writes a sentinel-delimited block into `~/.kimi-code/config.toml`,
+leaving the rest of the file — including `default_model` and any managed
+Kimi provider — untouched. Re-running it replaces that block rather than
+appending a second one, so it is safe to run after every reallocation when the
+node changes. A backup lands at `config.toml.bak`.
+
+It deliberately does **not** set `default_model`: that is a top-level TOML key, and
+appending one after the tables would silently bind it to the wrong table. Select
+the model with `-m` as above, or `/model` inside the TUI.
+
+**One real difference from opencode.** Kimi Code's TOML has no `{env:VAR}`
+interpolation, so unlike `opencode-setup.sh` the key is written *literally* into
+the config (created mode 600). If you would rather keep no key on disk, use
+`--no-key` and the environment route instead, which needs no config file at all:
+
+```bash
+export KIMI_MODEL_NAME=kimi-k3
+export KIMI_MODEL_PROVIDER_TYPE=openai
+export KIMI_MODEL_BASE_URL=http://localhost:30000/v1
+export KIMI_MODEL_API_KEY="$(cat $MODEL_CACHE_DIR/kimik3-api-key)"
+export KIMI_MODEL_MAX_CONTEXT_SIZE=1048576
+kimi
+```
+
+Verify in this order, cheapest first:
+
+```bash
+./serve-kimik3.sh toolcheck                       # 1. server-side tool loop
+curl -s http://localhost:30000/v1/models \
+  -H "Authorization: Bearer $KIMIK3_API_KEY"      # 2. reachable from this machine
+grep -A12 'kimik3-bunya' ~/.kimi-code/config.toml # 3. the block landed
+kimi -m kimik3-bunya/kimi-k3                      # 4. starts, model listed in /model
+```
+
+Then **5. ask it to read a file and make a one-line edit.** That is the only step
+that exercises tool calls end to end, and the one most likely to fail — see the
+tool-call id note in [Step 5b](#step-5b--prove-tool-calling-round-trips). If step 1
+fails, kimicode cannot work; fix that before touching the client.
 
 ### Step 7 — Shut down
 
@@ -669,6 +758,9 @@ which is out of scope for this repo. `serve-kimik3.sh` detects gfx942 and warns.
 ./opencode-setup.sh [--host H] [--port P] [--model M] [--context N]
                     [--api-key K] [--embed-key] [--config PATH]
 
+./kimicode-setup.sh [--host H] [--port P] [--model M] [--context N]
+                    [--api-key K] [--no-key] [--config PATH]
+
 ./share-kimik3.sh [share]        open a public HTTPS Cloudflare tunnel (add --detach)
 ./share-kimik3.sh stop | status
 
@@ -755,6 +847,19 @@ All knobs live in `kimik3.env` (copied from `kimik3-env.example`). Anything you
   handles it. `AITER_GPU_ARCHS=gfx950` looks right but is ignored at runtime.
 - **KV cache OOM at startup**: set `CONTEXT_LEN=262144` first, and only then
   consider `MEM_FRACTION`. One knob at a time.
+- **kimicode rejects tool calls, or complains about a tool-call id**: this server
+  returns ids like `get_gpu_temperature:0`, not OpenAI's `call_<random>` — see
+  [Step 5b](#step-5b--prove-tool-calling-round-trips). The round trip is valid and
+  `toolcheck` passes, but a client that validates the prefix would trip on it.
+  This is the most likely way kimicode fails while every HTTP-level check passes.
+- **kimicode shows the model's thinking inline, or drops it**: SGLang returns
+  reasoning in `reasoning_content`, not `content` (Step 5). Kimi Code can be told
+  where to look with `reasoning_key` on the `[models.*]` table.
+- **`kimi` insists on `/login` even with a custom provider configured**: the OAuth
+  flow is for Moonshot's managed service. Check you edited
+  `~/.kimi-code/config.toml` and not `~/.kimi/config.toml` — that is the legacy
+  Python CLI, and its provider type is `openai_legacy`, not `openai`. See the
+  table in [Step 6b](#step-6b--connect-kimicode-optional).
 - **`TypeError: 'NoneType' object is not callable`** with DSpark: known upstream
   bug ([#32569](https://github.com/sgl-project/sglang/issues/32569)). Unset
   `SPECULATIVE`.
@@ -837,6 +942,7 @@ provider block. Manage with `./share-kimik3.sh status` / `stop`.
 - [vLLM K3 preview](https://vllm.ai/blog/2026-07-22-kimi-k3-preview) · [vllm#50000](https://github.com/vllm-project/vllm/pull/50000) — the NVIDIA-only alternative, for when a ROCm build appears
 - [vllm#36337](https://github.com/vllm-project/vllm/issues/36337) — Kimi MXFP4 gibberish on gfx950/ROCm 7.2
 - [UQ-RCC Bunya docs](https://github.com/UQ-RCC/hpc-docs) · [ROCm/aiter](https://github.com/ROCm/aiter) · [opencode providers](https://opencode.ai/docs/providers/)
+- [Kimi Code CLI: providers and models](https://www.kimi.com/code/docs/en/kimi-code-cli/configuration/providers.html) · [config files](https://www.kimi.com/code/docs/en/kimi-code-cli/configuration/config-files.html) · [environment variables](https://www.kimi.com/code/docs/en/kimi-code-cli/configuration/env-vars.html) — **the provider schema Step 6b is built from**
 - [GLM-5.2 sibling repo](https://github.com/zebrax0r/AMD_MI355X_Bunya_LLM_tools_GLM5.2) — where the Bunya-specific knowledge here came from
 
 ---

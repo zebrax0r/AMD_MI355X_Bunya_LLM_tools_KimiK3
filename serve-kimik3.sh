@@ -1283,7 +1283,7 @@ cat <<EOF
       -H 'Content-Type: application/json' \\
       -d '{"model":"$SERVED_MODEL_NAME","messages":[{"role":"user","content":"Say hello in one sentence."}]}'
 
-  Second shell into this job (to run opencode alongside the server):
+  Second shell into this job (to run a client alongside the server):
     srun --overlap --jobid $JOBID --pty /bin/bash -l
 
   From your laptop (tunnel through the login node, then use localhost):
@@ -1292,6 +1292,10 @@ cat <<EOF
   opencode: run ./opencode-setup.sh --host $NODE_HOST --port $PORT
             (or --host localhost when tunnelling), then pick
             '$SERVED_MODEL_NAME' via /models inside opencode.
+
+  kimicode: run ./kimicode-setup.sh --host $NODE_HOST --port $PORT
+            (or --host localhost when tunnelling), then start it with
+            kimi -m kimik3-bunya/$SERVED_MODEL_NAME
 
   Benchmark: ./bench-kimik3.sh sweep
              (upstream MI355 TP8 reference: 820 / 2356 / 4898 tok/s @ c=2/8/32)
