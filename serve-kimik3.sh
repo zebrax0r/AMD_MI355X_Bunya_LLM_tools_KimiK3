@@ -80,6 +80,7 @@ TOOL_PARSER="${TOOL_PARSER:-kimi_k3}"
 REASONING_PARSER="${REASONING_PARSER:-kimi_k3}"
 SPECULATIVE="${SPECULATIVE:-}"
 DSPARK_MODEL="${DSPARK_MODEL:-RadixArk/Kimi-K3-DSpark}"
+DSPARK_REVISION="${DSPARK_REVISION:-}"
 ENABLE_AITER="${ENABLE_AITER:-1}"
 FLYDSL_FORCE="${FLYDSL_FORCE:-1}"
 ROCM_MODE="${ROCM_MODE:-auto}"
@@ -856,9 +857,46 @@ if [[ "$SPECULATIVE" == "dspark" && "$MODE" == "serve" ]]; then
         die "SPECULATIVE=dspark but the draft model '$DSPARK_MODEL' is not cached in $MODEL_CACHE_DIR.
   The draft loads only after the main model finishes, so starting now would waste that whole load.
   Fetch it first:   ./serve-kimik3.sh download
-  Or serve without speculative decoding:   unset SPECULATIVE   (see sglang#32569)"
+  Or serve without speculative decoding:   unset SPECULATIVE"
     fi
-    log "Found cached draft weights for $DSPARK_MODEL."
+
+    # A present directory is not a usable checkpoint. SGLang resolves the draft's
+    # config during ARGUMENT PARSING, before anything loads, and a config without
+    # model_type surfaces as the unhelpful
+    #   ValueError: Unrecognized model in RadixArk/Kimi-K3-DSpark.
+    #               Should have a `model_type` key in its config.json
+    # Check it here instead, where we can say what to do about it. Hit for real
+    # on 1 Aug 2026 after the upstream repo replaced its snapshot.
+    draft_snapshot="$(ls -1dt "$draft_dir"/snapshots/*/ 2>/dev/null | head -1)"
+    draft_snapshot="${draft_snapshot%/}"
+    if [[ -z "$draft_snapshot" || ! -r "$draft_snapshot/config.json" ]]; then
+        die "The draft cache at $draft_dir has no readable config.json.
+  The download is incomplete. Re-run:   ./serve-kimik3.sh download
+  Or serve without speculative decoding: unset SPECULATIVE"
+    fi
+    if ! python3 -c "import json,sys; sys.exit(0 if json.load(open(sys.argv[1])).get('model_type') else 1)" \
+            "$draft_snapshot/config.json" 2>/dev/null; then
+        die "The draft config at $draft_snapshot/config.json has no 'model_type' key,
+  so SGLang cannot resolve the speculative algorithm and dies during argument parsing.
+  Either the download is truncated, or upstream changed the repo under you — it has
+  been rewritten as recently as 31 Jul 2026 ('Sync Kimi-K3-DSpark-0731 snapshot').
+
+  Re-fetch it:                 rm -rf $draft_dir && ./serve-kimik3.sh download
+  Pin the measured-good rev:   DSPARK_REVISION=eb03982e58d4fb79bcfc099e902158f562e2e27b ./serve-kimik3.sh download
+  Or serve without it:         unset SPECULATIVE"
+    fi
+    log "Found cached draft weights for $DSPARK_MODEL ($(basename "$draft_snapshot"))."
+
+    # Pin the exact snapshot when asked, so an upstream rewrite of 'main' cannot
+    # silently change what is served between two runs of the same config.
+    if [[ -n "$DSPARK_REVISION" ]]; then
+        pinned="$draft_dir/snapshots/$DSPARK_REVISION"
+        [[ -d "$pinned" ]] \
+            || die "DSPARK_REVISION=$DSPARK_REVISION is not in the cache.
+  Fetch it first:   DSPARK_REVISION=$DSPARK_REVISION ./serve-kimik3.sh download"
+        DSPARK_MODEL="$pinned"
+        log "Pinned draft revision: $DSPARK_REVISION"
+    fi
 fi
 
 # ── Download mode (no GPU required) ─────────────────────────────────────────
@@ -875,14 +913,19 @@ if [[ "$MODE" == "download" ]]; then
         || die "Weights download failed. Re-run to resume."
 
     if [[ "$SPECULATIVE" == "dspark" ]]; then
-        log "Prefetching the DSpark draft model $DSPARK_MODEL ..."
+        # Upstream rewrites this repo (a full snapshot swap landed 31 Jul 2026),
+        # so allow pinning the exact commit that was measured rather than
+        # whatever 'main' happens to be today.
+        rev_arg=""
+        [[ -n "$DSPARK_REVISION" ]] && rev_arg=" --revision '$DSPARK_REVISION'"
+        log "Prefetching the DSpark draft model $DSPARK_MODEL${DSPARK_REVISION:+ @ $DSPARK_REVISION} ..."
         apptainer exec \
             --bind "$MODEL_CACHE_DIR":"$MODEL_CACHE_DIR" \
             --env HF_HOME="$MODEL_CACHE_DIR" \
             --env HF_TOKEN="${HF_TOKEN:-}" \
             --env HF_HUB_ENABLE_HF_TRANSFER=1 \
             "$SIF_PATH" \
-            bash -c "hf download '$DSPARK_MODEL' || huggingface-cli download '$DSPARK_MODEL'" \
+            bash -c "hf download '$DSPARK_MODEL'$rev_arg || huggingface-cli download '$DSPARK_MODEL'$rev_arg" \
             || die "DSpark draft download failed."
     fi
     log "Download complete."

@@ -280,6 +280,14 @@ export PRESHARDED_PATH="${PRESHARDED_PATH:-}"
 # count, and only with a cold-run measurement to compare against.
 export PREFETCH_BLOCK_SIZE_MB="${PREFETCH_BLOCK_SIZE_MB:-}"
 
+# Pin the DSpark draft to one commit. RadixArk/Kimi-K3-DSpark is rewritten under
+# you — a full snapshot swap landed 31 Jul 2026 — and a changed draft either
+# changes what you serve or breaks the launch outright. The measured-good
+# revision for the numbers in the README is:
+#   export DSPARK_REVISION="eb03982e58d4fb79bcfc099e902158f562e2e27b"
+# Empty tracks 'main' and accepts the drift.
+export DSPARK_REVISION="${DSPARK_REVISION:-}"
+
 # ── Escape hatches ──────────────────────────────────────────────────────────
 
 # How the server is invoked inside the container. Upstream uses the 'sglang'

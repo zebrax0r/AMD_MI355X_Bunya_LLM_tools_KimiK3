@@ -456,6 +456,38 @@ have not hit it on this image. It stays off by default anyway, so that a first
 launch has one thing to go wrong instead of two — turn it on once baseline
 serving is proven.
 
+### The draft repo is a moving target — pin it
+
+`RadixArk/Kimi-K3-DSpark` is **rewritten under you**. The numbers above were
+measured against commit `eb03982e` (27 Jul 2026). Since then:
+
+| Commit | Date | What |
+|---|---|---|
+| `eb03982e` | 27 Jul 2026 | **the revision these numbers were measured on** |
+| `9c4b2577` | 31 Jul 2026 | *"Sync Kimi-K3-DSpark-0731 snapshot"* — the model itself replaced |
+| `56ce616a` | 1 Aug 2026 | README only |
+
+*Hit for real on 1 Aug 2026*: a re-download picked up a newer revision and the
+server then died during **argument parsing**, before loading anything, with
+`ValueError: Unrecognized model in RadixArk/Kimi-K3-DSpark. Should have a
+model_type key in its config.json`. SGLang resolves the draft's config to pick
+the speculative algorithm, so a bad or truncated draft config kills the launch
+early — which at least is cheap.
+
+Pin the revision you measured:
+
+```bash
+# kimik3.env
+export DSPARK_REVISION="eb03982e58d4fb79bcfc099e902158f562e2e27b"
+./serve-kimik3.sh download     # fetches that exact commit
+```
+
+With `DSPARK_REVISION` set, the script passes the pinned snapshot path to SGLang
+instead of the repo id, so `main` moving cannot change what you serve. Leave it
+empty to track `main` and accept the drift. Either way the serve preflight now
+checks the cached draft has a parseable `config.json` with a `model_type`, and
+says what to do rather than letting upstream raise the confusing error.
+
 **One caveat, unexplained.** A long-context opencode session (217k tokens) showed
 `accept len: 1.23, accept rate: 0.03` — speculation collapsing to nothing, where
 this 1k-token sweep gets ~5. Whether that is context length, workload content, or
@@ -908,6 +940,7 @@ All knobs live in `kimik3.env` (copied from `kimik3-env.example`). Anything you
 | `ROCMINFO_SHIM` | `auto` | Replay the host's `rocminfo` output inside the container when the image's own fails |
 | `SET_CPU_AFFINITY` | `0` | Keep `0` under a SLURM cgroup (see troubleshooting) |
 | `READY_TIMEOUT` | `14400` | Seconds to wait for health (cold load is ~1.5 TB) |
+| `DSPARK_REVISION` | *(empty)* | Pin the draft to one commit. Upstream rewrites `main` — see [Speculative decoding](#the-draft-repo-is-a-moving-target--pin-it) |
 | `WEIGHT_LOAD_THREADS` | `8` | Loader threads. Naming it is what stops SGLang silently going single-threaded (see [Weight loading](#weight-loading--why-a-cold-start-sawtooths)). `0` = image default |
 | `LOAD_FORMAT` | *(empty)* | `--load-format`. `presharded` dumps a per-rank checkpoint so later starts skip re-quantisation |
 | `PRESHARDED_PATH` | *(empty)* | Where `presharded` writes. Needs up to another 1561 GB |
@@ -969,6 +1002,13 @@ All knobs live in `kimik3.env` (copied from `kimik3-env.example`). Anything you
 - **`TypeError: 'NoneType' object is not callable`** with DSpark: known upstream
   bug ([#32569](https://github.com/sgl-project/sglang/issues/32569)). Unset
   `SPECULATIVE`.
+- **`ValueError: Unrecognized model in RadixArk/Kimi-K3-DSpark. Should have a
+  'model_type' key in its config.json`** — *hit for real on 1 Aug 2026.* The
+  cached draft config is truncated, or upstream rewrote the repo (it does — see
+  [The draft repo is a moving target](#the-draft-repo-is-a-moving-target--pin-it)).
+  This fires during argument parsing, before any load. Re-fetch with
+  `rm -rf $MODEL_CACHE_DIR/hub/models--RadixArk--Kimi-K3-DSpark && ./serve-kimik3.sh download`,
+  or pin `DSPARK_REVISION` to the revision you measured.
 - **`RuntimeError: Cannot find any model weights with 'RadixArk/Kimi-K3-DSpark'`**
   — *hit for real on 1 Aug 2026.* The draft is a **separate** checkpoint, and
   `download` only fetches it when `SPECULATIVE=dspark` was set at the time. Worse,
