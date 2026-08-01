@@ -241,6 +241,45 @@ export SET_CPU_AFFINITY="${SET_CPU_AFFINITY:-0}"
 # off scratch and JIT-compiles FP4 kernels, so be generous.
 export READY_TIMEOUT="${READY_TIMEOUT:-14400}"
 
+# ── Weight loading ──────────────────────────────────────────────────────────
+#
+# SGLang quietly falls back to SINGLE-THREADED weight loading whenever its
+# checkpoint prefetch is on and you have not asked for threads explicitly — it
+# logs "falling back to single-threaded weight loading to avoid I/O
+# oversubscription with the prefetch threads". One sequential reader against
+# GPFS is what makes a cold start sawtooth: a burst while a shard streams, a dip
+# while it is converted and copied to HBM, then the next shard.
+#
+# Setting this names num_threads in --model-loader-extra-config, which is what
+# suppresses that fallback. Upstream reports ~3x. 0 = pass nothing and take the
+# image's default.
+#
+# Memory: the buffered loader holds ~(threads + 2) shards at once and K3's are
+# ~5 GB, so 8 is ~50 GB against --mem=1800G. Past ~16 the GPFS client, not the
+# thread count, is normally the limit.
+#
+# NOT yet measured on Bunya — see the README "Weight loading" table, and run
+# './serve-kimik3.sh loadstat' after a start to see what actually happened.
+export WEIGHT_LOAD_THREADS="${WEIGHT_LOAD_THREADS:-8}"
+
+# Empty = the image's default (auto). The interesting one is 'presharded': the
+# first run loads normally then dumps a per-rank, already-quantised checkpoint,
+# and every later run reads only its own 1/8 and skips re-quantisation. That is
+# the big win for a 48 h allocation you restart in, and it costs one slow load
+# plus up to another 1561 GB of scratch.
+export LOAD_FORMAT="${LOAD_FORMAT:-}"
+
+# Where 'presharded' writes. Must be writable and on a filesystem all ranks
+# see; the HF cache path itself is not a good target. Ignored unless
+# LOAD_FORMAT=presharded.
+#   e.g. export PRESHARDED_PATH="/scratch/user/$USER/kimik3/presharded"
+export PRESHARDED_PATH="${PRESHARDED_PATH:-}"
+
+# SGLANG_PREFETCH_BLOCK_SIZE_MB — the sequential read size prefetch uses to warm
+# the page cache. Empty = SGLang's default. Only worth touching after the thread
+# count, and only with a cold-run measurement to compare against.
+export PREFETCH_BLOCK_SIZE_MB="${PREFETCH_BLOCK_SIZE_MB:-}"
+
 # ── Escape hatches ──────────────────────────────────────────────────────────
 
 # How the server is invoked inside the container. Upstream uses the 'sglang'

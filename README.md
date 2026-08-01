@@ -617,6 +617,93 @@ In order of expected payoff:
 
 ---
 
+## Weight loading — why a cold start sawtooths
+
+A cold start moves 1561 GB off scratch, and it does not move it smoothly: bursts,
+dips, and long slow stretches on storage and a network capable of far more. The
+cause is one line of upstream behaviour.
+
+**SGLang silently falls back to single-threaded weight loading** whenever its
+checkpoint prefetch is active and you have not asked for threads explicitly
+(`model_loader/loader.py`):
+
+```
+--weight-loader-prefetch-checkpoints is enabled; falling back to single-threaded
+weight loading to avoid I/O oversubscription with the prefetch threads. Set
+enable_multithread_load=true in --model-loader-extra-config to keep
+multi-threaded loading.
+```
+
+One sequential reader against a parallel filesystem gives exactly the observed
+shape: a burst while a shard streams, a dip while it is converted and copied to
+HBM, then the next shard. Naming either `enable_multithread_load` or `num_threads`
+in the JSON suppresses the fallback — that is what `WEIGHT_LOAD_THREADS` (default
+**8**) does.
+
+Check which one you got:
+
+```bash
+./serve-kimik3.sh loadstat
+```
+
+### Bunya is GPFS, not Lustre
+
+Worth stating because it invalidates the reflex. The [Bunya User
+Guide](https://github.com/UQ-RCC/hpc-docs/blob/main/guides/Bunya-User-Guide.md)
+is explicit — "the GPFS filesystem that underpins your `/scratch` and `/home`, as
+well as `$TMPDIR`" — so there is **no `lfs setstripe`** to reach for, and `$TMPDIR`
+is the same filesystem, so staging weights there buys nothing. The lever is
+client-side parallelism, not storage layout.
+
+### What is actually achievable
+
+Not "hundreds of gigabits". 400 Gb/s would put 1561 GB in ~31 s; the floor is set
+by H2D copy, MXFP4 handling, and how much aggregate GPFS bandwidth a *single*
+client can absorb. Expect single-digit to low-tens of GB/s — minutes, not seconds.
+The win available is a large constant factor and *consistency*, not two orders of
+magnitude.
+
+### Measured
+
+> **Not yet measured on Bunya — the knobs landed 1 Aug 2026, the A/B has not been
+> run.** `WEIGHT_LOAD_THREADS=8` is upstream's own recommendation, not a local
+> measurement. Fill this table before treating any of it as fact.
+
+| Config | Cold? | Time to ready | Effective GB/s |
+|---|---|---|---|
+| `WEIGHT_LOAD_THREADS=0` (baseline) | | | |
+| `WEIGHT_LOAD_THREADS=8` (default) | | | |
+| `WEIGHT_LOAD_THREADS=16` | | | |
+| `LOAD_FORMAT=presharded`, dump run | | | |
+| `LOAD_FORMAT=presharded`, restart | | | |
+
+Every start appends a row to `$MODEL_CACHE_DIR/kimik3-loadtimes.log`, which
+survives the server log being truncated on each launch. `loadstat` prints it.
+
+> ⚠️ **Compare cold runs only.** Host RAM is 1800 GB and the weights are 1561 GB,
+> so after any successful load most of the model is in page cache and the *next*
+> start is fast no matter what the thread count is. A/B-ing back to back on one
+> node flatters whichever ran second and proves nothing. Use a fresh allocation
+> or a different node for each timed run, and record which were cold.
+
+### Presharded, for allocations you restart in
+
+`LOAD_FORMAT=presharded` loads normally once, then dumps a per-rank,
+already-quantised checkpoint to `PRESHARDED_PATH`. Every later start reads only
+its own 1/8 and skips re-quantisation — the structural fix rather than a faster
+version of the same work. It costs one slow load and up to another 1561 GB of
+scratch, so it pays off across a 48-hour allocation and not in a single run. The
+script preflights the free space and refuses a dump it cannot finish.
+
+### If more threads do not help
+
+Watch `rocm-smi` and the log during a start. If HBM fills in bursts while the CPUs
+idle, the bottleneck is read-side and threads are the right knob. If reads are
+smooth but HBM lags, it is conversion and H2D — more reader threads will not help,
+and `presharded` (which removes the re-quantisation work entirely) is the lever.
+
+---
+
 ## When the branch merges
 
 The default image is built from SGLang's **unmerged `kimi-k3` branch**
@@ -751,6 +838,7 @@ which is out of scope for this repo. `serve-kimik3.sh` detects gfx942 and warns.
 ./serve-kimik3.sh gpucheck       can this image reach this node's GPUs? (~1 min)
 ./serve-kimik3.sh toolcheck      two-turn tool-call round trip vs a running server
 ./serve-kimik3.sh parsers        list tool-call/reasoning parsers this image supports
+./serve-kimik3.sh loadstat       why the last cold start was slow + time-to-ready history
 ./serve-kimik3.sh download       prefetch weights (+ DSpark draft if enabled)
 ./serve-kimik3.sh stop           stop the server
 ./serve-kimik3.sh status         server state + health check + /v1/models
@@ -816,6 +904,10 @@ All knobs live in `kimik3.env` (copied from `kimik3-env.example`). Anything you
 | `ROCMINFO_SHIM` | `auto` | Replay the host's `rocminfo` output inside the container when the image's own fails |
 | `SET_CPU_AFFINITY` | `0` | Keep `0` under a SLURM cgroup (see troubleshooting) |
 | `READY_TIMEOUT` | `14400` | Seconds to wait for health (cold load is ~1.5 TB) |
+| `WEIGHT_LOAD_THREADS` | `8` | Loader threads. Naming it is what stops SGLang silently going single-threaded (see [Weight loading](#weight-loading--why-a-cold-start-sawtooths)). `0` = image default |
+| `LOAD_FORMAT` | *(empty)* | `--load-format`. `presharded` dumps a per-rank checkpoint so later starts skip re-quantisation |
+| `PRESHARDED_PATH` | *(empty)* | Where `presharded` writes. Needs up to another 1561 GB |
+| `PREFETCH_BLOCK_SIZE_MB` | *(empty)* | `SGLANG_PREFETCH_BLOCK_SIZE_MB`. Tune after the thread count, not before |
 | `LAUNCH_CMD` | `sglang serve` | Escape hatch: `python3 -m sglang.launch_server` |
 | `CHUNKED_PREFILL_SIZE` / `MAX_RUNNING_REQUESTS` / `SCHEDULE_POLICY` | — | Optional tuning |
 | `BENCH_RANGE_RATIO` | `1.0` | Fixed-size bench requests. sglang's own default `0.0` halves them (see Performance tuning) |
@@ -847,6 +939,16 @@ All knobs live in `kimik3.env` (copied from `kimik3-env.example`). Anything you
   handles it. `AITER_GPU_ARCHS=gfx950` looks right but is ignored at runtime.
 - **KV cache OOM at startup**: set `CONTEXT_LEN=262144` first, and only then
   consider `MEM_FRACTION`. One knob at a time.
+- **Cold start crawls, with bursts and dips**: SGLang went single-threaded. Run
+  `./serve-kimik3.sh loadstat` — it looks for the `falling back to
+  single-threaded weight loading` line. Set `WEIGHT_LOAD_THREADS=8`. See
+  [Weight loading](#weight-loading--why-a-cold-start-sawtooths).
+- **`unrecognized arguments: --model-loader-extra-config`**: the pinned day-0
+  branch image predates the flag. The script probes `--help` and drops it with a
+  warning rather than dying after a 1.5 TB load, so if you see this it came from
+  `EXTRA_ENGINE_ARGS`. Set `WEIGHT_LOAD_THREADS=0`.
+- **Host OOM during weight load**: `WEIGHT_LOAD_THREADS` is too high. The buffered
+  loader holds ~`(threads + 2)` shards at ~5 GB each; check that against `--mem`.
 - **kimicode rejects tool calls, or complains about a tool-call id**: this server
   returns ids like `get_gpu_temperature:0`, not OpenAI's `call_<random>` — see
   [Step 5b](#step-5b--prove-tool-calling-round-trips). The round trip is valid and

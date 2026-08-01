@@ -22,6 +22,7 @@
 #   ./serve-kimik3.sh gpucheck   can this image reach this node's GPUs? (~1 min)
 #   ./serve-kimik3.sh toolcheck  two-turn tool-call round trip vs a running server
 #   ./serve-kimik3.sh parsers    list tool-call/reasoning parsers this image has
+#   ./serve-kimik3.sh loadstat   why the last cold start was slow (reads the log)
 #   ./serve-kimik3.sh download   prefetch model weights only (no GPU needed)
 #   ./serve-kimik3.sh stop       stop a running server
 #   ./serve-kimik3.sh status     show server state + health endpoint
@@ -93,6 +94,15 @@ SCHEDULE_POLICY="${SCHEDULE_POLICY:-}"
 EXTRA_ENGINE_ARGS="${EXTRA_ENGINE_ARGS:-}"
 MODEL_CACHE_DIR="${MODEL_CACHE_DIR:-}"
 SIF_PATH="${SIF_PATH:-}"
+WEIGHT_LOAD_THREADS="${WEIGHT_LOAD_THREADS:-8}"
+LOAD_FORMAT="${LOAD_FORMAT:-}"
+PRESHARDED_PATH="${PRESHARDED_PATH:-}"
+PREFETCH_BLOCK_SIZE_MB="${PREFETCH_BLOCK_SIZE_MB:-}"
+
+# Measured from the safetensors index; used for the effective-GB/s readout and
+# the presharded space preflight. Kept next to EST_GB below, which is the same
+# number for the same reason.
+WEIGHTS_GB=1561
 
 case "$SPECULATIVE" in
     ""|none|dspark) ;;
@@ -109,6 +119,24 @@ case "$ROCMINFO_SHIM" in
     *) die "ROCMINFO_SHIM must be auto, off or force, got '$ROCMINFO_SHIM'." ;;
 esac
 
+[[ "$WEIGHT_LOAD_THREADS" =~ ^[0-9]+$ ]] \
+    || die "WEIGHT_LOAD_THREADS must be a non-negative integer, got '$WEIGHT_LOAD_THREADS' (0 disables the flag)."
+[[ -z "$PREFETCH_BLOCK_SIZE_MB" || "$PREFETCH_BLOCK_SIZE_MB" =~ ^[0-9]+$ ]] \
+    || die "PREFETCH_BLOCK_SIZE_MB must be a positive integer or empty, got '$PREFETCH_BLOCK_SIZE_MB'."
+
+# The buffered multi-thread loader holds ~(num_threads + 2) shards in host RAM at
+# once. K3's shards are ~5 GB, so 8 threads is ~50 GB against --mem=1800G. Well
+# past that and you are trading a weight-load win for a host OOM.
+if (( WEIGHT_LOAD_THREADS > 32 )); then
+    warn "WEIGHT_LOAD_THREADS=$WEIGHT_LOAD_THREADS holds roughly $(( (WEIGHT_LOAD_THREADS + 2) * 5 )) GB of shards in host RAM.
+  Check that against your --mem. Past ~16 the GPFS client, not the thread count, is usually the limit."
+fi
+
+if [[ -n "$PRESHARDED_PATH" && "$LOAD_FORMAT" != "presharded" ]]; then
+    warn "PRESHARDED_PATH is set but LOAD_FORMAT is '${LOAD_FORMAT:-auto}' — the path will be ignored.
+  Set LOAD_FORMAT=presharded to use it."
+fi
+
 # GPU_ARCHS is a build-time hint that aiter also consults at runtime, and a
 # LIST makes it pick the first entry regardless of the actual device
 # (ROCm/aiter#3807). One arch or nothing.
@@ -123,9 +151,11 @@ fi
 if [[ -n "$MODEL_CACHE_DIR" ]]; then
     PID_FILE="${PID_FILE:-$MODEL_CACHE_DIR/kimik3-server.pid}"
     LOG_FILE="${LOG_FILE:-$MODEL_CACHE_DIR/kimik3-server.log}"
+    LOADTIMES_FILE="${LOADTIMES_FILE:-$MODEL_CACHE_DIR/kimik3-loadtimes.log}"
 else
     PID_FILE="${PID_FILE:-$SCRIPT_DIR/kimik3-server.pid}"
     LOG_FILE="${LOG_FILE:-$SCRIPT_DIR/kimik3-server.log}"
+    LOADTIMES_FILE="${LOADTIMES_FILE:-$SCRIPT_DIR/kimik3-loadtimes.log}"
 fi
 
 server_running() { [[ -f "$PID_FILE" ]] && kill -0 "$(<"$PID_FILE")" 2>/dev/null; }
@@ -283,9 +313,9 @@ print("TOOL-CALL ROUND TRIP OK — opencode's agentic loop should work.")
 PY
         exit $?
         ;;
-    serve|pull|download|check|gpucheck|parsers) ;;
+    serve|pull|download|check|gpucheck|parsers|loadstat) ;;
     *)
-        die "Unknown mode '$MODE'. Use: serve | pull | download | check | gpucheck | toolcheck | parsers | stop | status"
+        die "Unknown mode '$MODE'. Use: serve | pull | download | check | gpucheck | toolcheck | parsers | loadstat | stop | status"
         ;;
 esac
 
@@ -653,6 +683,58 @@ if [[ "$MODE" == "gpucheck" ]]; then
 fi
 
 # ── parsers mode: what can this image actually parse? ───────────────────────
+
+if [[ "$MODE" == "loadstat" ]]; then
+    # Answers one question: was the last cold start single-threaded, and how
+    # fast was it really? The repo used to have no load baseline at all, so
+    # "slow" was never comparable between runs.
+    log "Weight loading report from $LOG_FILE"
+    echo
+
+    if [[ ! -r "$LOG_FILE" ]]; then
+        warn "No server log at $LOG_FILE — start the server once, then re-run this."
+    else
+        if grep -qi "falling back to single-threaded" "$LOG_FILE"; then
+            warn "SINGLE-THREADED weight loading was used. This is the sawtooth:"
+            grep -i -m1 "falling back to single-threaded" "$LOG_FILE" | sed 's/^/    /'
+            echo
+            log "Fix: set WEIGHT_LOAD_THREADS=8 in kimik3.env and restart."
+        else
+            log "No single-threaded fallback warning found."
+        fi
+
+        echo
+        log "Loader flags on the last launch (from the recorded argv):"
+        grep -m1 -oE '\-\-load-format [^ ]+|\-\-model-loader-extra-config [^ ]+' "$LOG_FILE" \
+            | sed 's/^/    /' || echo "    (none — upstream defaults)"
+    fi
+
+    # The server log is truncated on every launch; this history is not, so it is
+    # the only place an A/B between runs survives.
+    echo
+    log "Time-to-ready history ($LOADTIMES_FILE):"
+    if [[ -r "$LOADTIMES_FILE" ]]; then
+        tail -10 "$LOADTIMES_FILE" | sed 's/^/    /'
+        echo
+        log "Compare COLD runs only. Host RAM is 1800 GB and the weights are 1561 GB,"
+        log "so a restart on the same node is served largely from page cache and will"
+        log "look fast whatever the thread count is set to."
+    else
+        echo "    (nothing recorded yet — it is written when the ready-wait sees /health)"
+    fi
+
+    echo
+    log "Load formats this image supports:"
+    apptainer exec "$SIF_PATH" \
+        bash -c "sglang serve --help 2>&1 || python3 -m sglang.launch_server --help 2>&1" 2>/dev/null \
+        | grep -A 12 -- '--load-format' | head -20 | sed 's/^/    /' \
+        || warn "Could not read --load-format choices from the image."
+
+    echo
+    log "Bunya is GPFS, not Lustre — there is no 'lfs setstripe' here, and \$TMPDIR is"
+    log "the same filesystem, so staging there buys nothing. The lever is thread count."
+    exit 0
+fi
 
 if [[ "$MODE" == "parsers" ]]; then
     log "Parsers available in $SIF_PATH:"
@@ -1064,6 +1146,68 @@ for v in ROCR_VISIBLE_DEVICES HIP_VISIBLE_DEVICES CUDA_VISIBLE_DEVICES; do
     fi
 done
 
+# ── Weight loading ──────────────────────────────────────────────────────────
+#
+# SGLang silently falls back to SINGLE-THREADED weight loading whenever
+# checkpoint prefetch is on and the user has not asked for threads explicitly:
+#
+#   "--weight-loader-prefetch-checkpoints is enabled; falling back to
+#    single-threaded weight loading to avoid I/O oversubscription with the
+#    prefetch threads. Set enable_multithread_load=true in
+#    --model-loader-extra-config to keep multi-threaded loading."
+#
+# One sequential reader against GPFS is what makes a cold start sawtooth: a
+# burst while a shard streams, a dip while it is converted and copied to HBM,
+# then the next shard. Naming either key in the JSON suppresses that fallback,
+# which is the whole reason this flag is set by default.
+#
+# Bunya is GPFS, not Lustre, so there is no 'lfs setstripe' to reach for and
+# $TMPDIR is the same filesystem — the fix has to be client-side parallelism.
+load_flags=()
+loader_cfg=""
+
+if (( WEIGHT_LOAD_THREADS > 0 )); then
+    loader_cfg="\"enable_multithread_load\":true,\"num_threads\":$WEIGHT_LOAD_THREADS"
+fi
+
+if [[ "$LOAD_FORMAT" == "presharded" && -n "$PRESHARDED_PATH" ]]; then
+    # presharded takes its target root in the SAME extra-config object, so both
+    # settings have to be merged into one flag rather than passed twice.
+    [[ -n "$loader_cfg" ]] && loader_cfg+=","
+    loader_cfg+="\"presharded_path\":\"$PRESHARDED_PATH\""
+fi
+
+# The pinned image is a day-0 BRANCH build, not mainline, so these flags may
+# simply not exist in it. Probing --help costs a second; finding out the other
+# way costs a full 1.5 TB load before the server dies on an unknown argument.
+if [[ -n "$loader_cfg" || -n "$LOAD_FORMAT" ]]; then
+    image_help="$(apptainer exec "$SIF_PATH" \
+        bash -c "sglang serve --help 2>&1 || python3 -m sglang.launch_server --help 2>&1" 2>/dev/null || true)"
+
+    if [[ -z "$image_help" ]]; then
+        warn "Could not read --help from the image; passing the weight-loading flags unverified."
+    else
+        if [[ -n "$loader_cfg" ]] && ! grep -q -- '--model-loader-extra-config' <<<"$image_help"; then
+            warn "This image has no --model-loader-extra-config, so multi-threaded weight
+  loading cannot be requested and the cold start will stay single-threaded.
+  Set WEIGHT_LOAD_THREADS=0 in kimik3.env to silence this."
+            loader_cfg=""
+        fi
+        if [[ -n "$LOAD_FORMAT" ]] && ! grep -q -- "$LOAD_FORMAT" <<<"$image_help"; then
+            die "This image's --load-format does not offer '$LOAD_FORMAT'.
+  Run './serve-kimik3.sh loadstat' to see what it does support, then set
+  LOAD_FORMAT in kimik3.env accordingly (empty = the image's default)."
+        fi
+    fi
+fi
+
+[[ -n "$LOAD_FORMAT" ]] && load_flags+=(--load-format "$LOAD_FORMAT")
+[[ -n "$loader_cfg" ]] && load_flags+=(--model-loader-extra-config "{$loader_cfg}")
+
+if [[ -n "$loader_cfg" ]]; then
+    log "Weight loading: ${WEIGHT_LOAD_THREADS} threads${LOAD_FORMAT:+, format=$LOAD_FORMAT}"
+fi
+
 cmd=("${launcher[@]}"
      --model-path "$MODEL_ID"
      --served-model-name "$SERVED_MODEL_NAME"
@@ -1082,6 +1226,7 @@ cmd=("${launcher[@]}"
      ${parser_flags[@]+"${parser_flags[@]}"}
      ${spec_flags[@]+"${spec_flags[@]}"}
      ${perf_flags[@]+"${perf_flags[@]}"}
+     ${load_flags[@]+"${load_flags[@]}"}
      ${extra_args[@]+"${extra_args[@]}"})
 
 # ── Launch ──────────────────────────────────────────────────────────────────
@@ -1097,13 +1242,37 @@ log "Logs:  $LOG_FILE"
 # bind, which is a very expensive way to be wrong.)
 make_rocminfo_shim
 
+# presharded writes a second, per-rank copy of the checkpoint. Refuse to start a
+# dump that cannot finish — the same reasoning as the weights-cache accounting
+# above, and the same failure mode if skipped: hours lost, then no space.
+presharded_bind=()
+if [[ "$LOAD_FORMAT" == "presharded" && -n "$PRESHARDED_PATH" ]]; then
+    mkdir -p "$PRESHARDED_PATH" 2>/dev/null || true
+    [[ -d "$PRESHARDED_PATH" && -w "$PRESHARDED_PATH" ]] \
+        || die "PRESHARDED_PATH '$PRESHARDED_PATH' does not exist or is not writable."
+    ps_free_gb="$(df -Pk "$PRESHARDED_PATH" | awk 'NR==2 {print int($4/1024/1024)}')"
+    if [[ "${ps_free_gb:-0}" -lt "$WEIGHTS_GB" ]]; then
+        warn "Only ${ps_free_gb} GB free at $PRESHARDED_PATH; the presharded dump is up to ${WEIGHTS_GB} GB
+  (less with dedup, but do not count on it). The dump happens AFTER a full load."
+    fi
+    # Only needs its own bind when it sits outside the cache dir already bound.
+    [[ "$PRESHARDED_PATH" != "$MODEL_CACHE_DIR"/* ]] \
+        && presharded_bind=(--bind "$PRESHARDED_PATH":"$PRESHARDED_PATH")
+fi
+
+prefetch_env=()
+[[ -n "$PREFETCH_BLOCK_SIZE_MB" ]] \
+    && prefetch_env=(--env SGLANG_PREFETCH_BLOCK_SIZE_MB="$PREFETCH_BLOCK_SIZE_MB")
+
 base_args=(--bind "$MODEL_CACHE_DIR":"$MODEL_CACHE_DIR"
     ${cache_bind[@]+"${cache_bind[@]}"}
     ${shim_args[@]+"${shim_args[@]}"}
+    ${presharded_bind[@]+"${presharded_bind[@]}"}
     --env HF_HOME="$MODEL_CACHE_DIR"
     --env HF_TOKEN="${HF_TOKEN:-}"
     --env HF_HUB_ENABLE_HF_TRANSFER=1
     --env SGLANG_SET_CPU_AFFINITY="$SET_CPU_AFFINITY"
+    ${prefetch_env[@]+"${prefetch_env[@]}"}
     ${aiter_env[@]+"${aiter_env[@]}"}
     ${gpu_env[@]+"${gpu_env[@]}"})
 
@@ -1242,6 +1411,26 @@ log "Follow detailed progress in another shell with: tail -f $LOG_FILE"
 start_ts="$(date +%s)"
 while true; do
     if curl -fsS -m 5 "http://127.0.0.1:${PORT}/health" >/dev/null 2>&1; then
+        ready_secs=$(( $(date +%s) - start_ts ))
+        # Effective GB/s over the whole startup, not just the read: it includes
+        # conversion, H2D and graph capture. It is a comparable number between
+        # runs, which is the point — the repo had no load baseline at all.
+        ready_gbs="$(awk -v g="$WEIGHTS_GB" -v s="$ready_secs" \
+            'BEGIN {printf "%.2f", (s > 0 ? g / s : 0)}')"
+        log "Ready in ${ready_secs}s (${ready_gbs} GB/s effective over ${WEIGHTS_GB} GB of weights)"
+
+        # $LOG_FILE is truncated on every launch, so the comparison you actually
+        # want — this run against the last one — would be gone. Keep a small
+        # append-only history instead. This is what makes an A/B possible.
+        printf '%s\t%s\tthreads=%s\tformat=%s\tspec=%s\t%ss\t%s GB/s\n' \
+            "$(date -Is)" "$(hostname -s 2>/dev/null || hostname)" \
+            "$WEIGHT_LOAD_THREADS" "${LOAD_FORMAT:-auto}" "${SPECULATIVE:-none}" \
+            "$ready_secs" "$ready_gbs" >> "$LOADTIMES_FILE" 2>/dev/null || true
+
+        if grep -qi "falling back to single-threaded" "$LOG_FILE" 2>/dev/null; then
+            warn "SGLang fell back to SINGLE-THREADED weight loading — that is the sawtooth.
+  Set WEIGHT_LOAD_THREADS=8 in kimik3.env. See './serve-kimik3.sh loadstat'."
+        fi
         break
     fi
     if ! kill -0 "$SERVER_PID" 2>/dev/null; then
