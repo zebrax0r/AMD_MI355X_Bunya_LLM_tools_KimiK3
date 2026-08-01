@@ -844,6 +844,23 @@ else
     log "Found cached weights for $MODEL_ID."
 fi
 
+# The draft is a SEPARATE checkpoint, and nothing above covers it. Without this
+# check a missing draft surfaces as
+#   RuntimeError: Cannot find any model weights with `RadixArk/Kimi-K3-DSpark`
+# raised from the draft worker — which the scheduler only builds AFTER the main
+# model has finished loading. That is the whole 1.5 TB thrown away to learn a
+# second repo was never fetched. Hit for real on 1 Aug 2026.
+if [[ "$SPECULATIVE" == "dspark" && "$MODE" == "serve" ]]; then
+    draft_dir="$MODEL_CACHE_DIR/hub/models--${DSPARK_MODEL//\//--}"
+    if [[ ! -d "$draft_dir/snapshots" ]]; then
+        die "SPECULATIVE=dspark but the draft model '$DSPARK_MODEL' is not cached in $MODEL_CACHE_DIR.
+  The draft loads only after the main model finishes, so starting now would waste that whole load.
+  Fetch it first:   ./serve-kimik3.sh download
+  Or serve without speculative decoding:   unset SPECULATIVE   (see sglang#32569)"
+    fi
+    log "Found cached draft weights for $DSPARK_MODEL."
+fi
+
 # ── Download mode (no GPU required) ─────────────────────────────────────────
 
 if [[ "$MODE" == "download" ]]; then
@@ -1175,6 +1192,12 @@ if [[ "$LOAD_FORMAT" == "presharded" && -n "$PRESHARDED_PATH" ]]; then
     # settings have to be merged into one flag rather than passed twice.
     [[ -n "$loader_cfg" ]] && loader_cfg+=","
     loader_cfg+="\"presharded_path\":\"$PRESHARDED_PATH\""
+    # The speculative draft is a separate model and gets its own root. Without
+    # it the draft dumps to <draft_model_path>/presharded — inside the HF cache,
+    # which is exactly the read-only mount upstream warns against.
+    if [[ "$SPECULATIVE" == "dspark" ]]; then
+        loader_cfg+=",\"draft_presharded_path\":\"$PRESHARDED_PATH/dspark\""
+    fi
 fi
 
 # The pinned image is a day-0 BRANCH build, not mainline, so these flags may
@@ -1248,6 +1271,7 @@ make_rocminfo_shim
 presharded_bind=()
 if [[ "$LOAD_FORMAT" == "presharded" && -n "$PRESHARDED_PATH" ]]; then
     mkdir -p "$PRESHARDED_PATH" 2>/dev/null || true
+    [[ "$SPECULATIVE" == "dspark" ]] && mkdir -p "$PRESHARDED_PATH/dspark" 2>/dev/null || true
     [[ -d "$PRESHARDED_PATH" && -w "$PRESHARDED_PATH" ]] \
         || die "PRESHARDED_PATH '$PRESHARDED_PATH' does not exist or is not writable."
     ps_free_gb="$(df -Pk "$PRESHARDED_PATH" | awk 'NR==2 {print int($4/1024/1024)}')"

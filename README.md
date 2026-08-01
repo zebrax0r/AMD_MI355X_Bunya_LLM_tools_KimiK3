@@ -695,6 +695,10 @@ version of the same work. It costs one slow load and up to another 1561 GB of
 scratch, so it pays off across a 48-hour allocation and not in a single run. The
 script preflights the free space and refuses a dump it cannot finish.
 
+With `SPECULATIVE=dspark` the draft is a second model and needs its own dump root,
+or it writes into the read-only HF cache mount. The script sets
+`draft_presharded_path` to `$PRESHARDED_PATH/dspark` for you.
+
 ### If more threads do not help
 
 Watch `rocm-smi` and the log during a start. If HBM fills in bursts while the CPUs
@@ -965,6 +969,13 @@ All knobs live in `kimik3.env` (copied from `kimik3-env.example`). Anything you
 - **`TypeError: 'NoneType' object is not callable`** with DSpark: known upstream
   bug ([#32569](https://github.com/sgl-project/sglang/issues/32569)). Unset
   `SPECULATIVE`.
+- **`RuntimeError: Cannot find any model weights with 'RadixArk/Kimi-K3-DSpark'`**
+  — *hit for real on 1 Aug 2026.* The draft is a **separate** checkpoint, and
+  `download` only fetches it when `SPECULATIVE=dspark` was set at the time. Worse,
+  the scheduler builds the draft worker *after* the main model has finished
+  loading, so this used to appear at the end of a full 1.5 TB load. The script now
+  preflights the draft cache and refuses to start without it. Fix with
+  `./serve-kimik3.sh download`, or `unset SPECULATIVE` to serve without it.
 - **Crash: "CPU number N is not eligible; choose between [...]"** in
   `set_gpu_proc_affinity`: the image sets `SGLANG_SET_CPU_AFFINITY=1`, but
   SGLang pins to CPUs from the *full* node topology, which fails under a SLURM
