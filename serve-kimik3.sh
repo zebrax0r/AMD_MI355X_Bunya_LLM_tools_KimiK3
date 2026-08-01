@@ -860,6 +860,27 @@ if [[ "$SPECULATIVE" == "dspark" && "$MODE" == "serve" ]]; then
   Or serve without speculative decoding:   unset SPECULATIVE"
     fi
 
+    # Resolve the snapshot the SAME WAY the hub does — refs/<branch> -> sha —
+    # not "newest directory by mtime". Those differ, and an earlier version of
+    # this check compared the wrong one: it validated a good snapshot while
+    # SGLang read the one refs/main pointed at, so the preflight passed and the
+    # launch still died. A cache can hold several snapshots at once; only one of
+    # them is what a bare repo id resolves to.
+    if [[ -n "$DSPARK_REVISION" ]]; then
+        draft_snapshot="$draft_dir/snapshots/$DSPARK_REVISION"
+        [[ -d "$draft_snapshot" ]] \
+            || die "DSPARK_REVISION=$DSPARK_REVISION is not in the cache.
+  Fetch it first:   DSPARK_REVISION=$DSPARK_REVISION ./serve-kimik3.sh download"
+    else
+        draft_ref="$draft_dir/refs/main"
+        if [[ -r "$draft_ref" ]]; then
+            draft_snapshot="$draft_dir/snapshots/$(<"$draft_ref")"
+        else
+            draft_snapshot="$(ls -1dt "$draft_dir"/snapshots/*/ 2>/dev/null | head -1)"
+            draft_snapshot="${draft_snapshot%/}"
+        fi
+    fi
+
     # A present directory is not a usable checkpoint. SGLang resolves the draft's
     # config during ARGUMENT PARSING, before anything loads, and a config without
     # model_type surfaces as the unhelpful
@@ -867,16 +888,20 @@ if [[ "$SPECULATIVE" == "dspark" && "$MODE" == "serve" ]]; then
     #               Should have a `model_type` key in its config.json
     # Check it here instead, where we can say what to do about it. Hit for real
     # on 1 Aug 2026 after the upstream repo replaced its snapshot.
-    draft_snapshot="$(ls -1dt "$draft_dir"/snapshots/*/ 2>/dev/null | head -1)"
-    draft_snapshot="${draft_snapshot%/}"
-    if [[ -z "$draft_snapshot" || ! -r "$draft_snapshot/config.json" ]]; then
-        die "The draft cache at $draft_dir has no readable config.json.
-  The download is incomplete. Re-run:   ./serve-kimik3.sh download
-  Or serve without speculative decoding: unset SPECULATIVE"
+    if [[ -z "$draft_snapshot" || ! -d "$draft_snapshot" ]]; then
+        die "Could not resolve a draft snapshot under $draft_dir/snapshots.
+  Re-fetch it:   rm -rf $draft_dir && ./serve-kimik3.sh download"
+    fi
+    # -e not -r: these are symlinks into blobs/, and a dangling one is exactly
+    # what a half-finished download leaves behind.
+    if [[ ! -e "$draft_snapshot/config.json" ]]; then
+        die "The draft snapshot $draft_snapshot has no config.json (or it is a dangling symlink).
+  The download is incomplete. Re-fetch:   rm -rf $draft_dir && ./serve-kimik3.sh download
+  Or serve without speculative decoding:  unset SPECULATIVE"
     fi
     if ! python3 -c "import json,sys; sys.exit(0 if json.load(open(sys.argv[1])).get('model_type') else 1)" \
             "$draft_snapshot/config.json" 2>/dev/null; then
-        die "The draft config at $draft_snapshot/config.json has no 'model_type' key,
+        die "The draft config at $draft_snapshot/config.json is unparseable or has no 'model_type',
   so SGLang cannot resolve the speculative algorithm and dies during argument parsing.
   Either the download is truncated, or upstream changed the repo under you — it has
   been rewritten as recently as 31 Jul 2026 ('Sync Kimi-K3-DSpark-0731 snapshot').
@@ -885,18 +910,12 @@ if [[ "$SPECULATIVE" == "dspark" && "$MODE" == "serve" ]]; then
   Pin the measured-good rev:   DSPARK_REVISION=eb03982e58d4fb79bcfc099e902158f562e2e27b ./serve-kimik3.sh download
   Or serve without it:         unset SPECULATIVE"
     fi
-    log "Found cached draft weights for $DSPARK_MODEL ($(basename "$draft_snapshot"))."
 
-    # Pin the exact snapshot when asked, so an upstream rewrite of 'main' cannot
-    # silently change what is served between two runs of the same config.
-    if [[ -n "$DSPARK_REVISION" ]]; then
-        pinned="$draft_dir/snapshots/$DSPARK_REVISION"
-        [[ -d "$pinned" ]] \
-            || die "DSPARK_REVISION=$DSPARK_REVISION is not in the cache.
-  Fetch it first:   DSPARK_REVISION=$DSPARK_REVISION ./serve-kimik3.sh download"
-        DSPARK_MODEL="$pinned"
-        log "Pinned draft revision: $DSPARK_REVISION"
-    fi
+    # Hand SGLang the resolved PATH, never the repo id. The repo id makes it
+    # re-resolve through the hub, which is how it ended up reading a different
+    # snapshot than the one checked here.
+    log "Draft: $DSPARK_MODEL -> $(basename "$draft_snapshot")${DSPARK_REVISION:+ (pinned)}"
+    DSPARK_MODEL="$draft_snapshot"
 fi
 
 # ── Download mode (no GPU required) ─────────────────────────────────────────
