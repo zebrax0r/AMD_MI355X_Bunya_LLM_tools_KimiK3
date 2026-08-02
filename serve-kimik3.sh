@@ -80,7 +80,17 @@ TOOL_PARSER="${TOOL_PARSER:-kimi_k3}"
 REASONING_PARSER="${REASONING_PARSER:-kimi_k3}"
 SPECULATIVE="${SPECULATIVE:-}"
 DSPARK_MODEL="${DSPARK_MODEL:-RadixArk/Kimi-K3-DSpark}"
-DSPARK_REVISION="${DSPARK_REVISION:-}"
+# Pinned, not tracking main: the draft repo was rewritten three times in the four
+# days to 1 Aug 2026, twice breaking the launch outright. This is the revision
+# every DSpark number in the README was measured on. Set to "main" to follow the
+# branch and accept the drift.
+DSPARK_REVISION="${DSPARK_REVISION:-eb03982e58d4fb79bcfc099e902158f562e2e27b}"
+DSPARK_BLOCK_SIZE="${DSPARK_BLOCK_SIZE:-}"
+REPLAYSSM_SPEC="${REPLAYSSM_SPEC:-0}"
+MAMBA_FULL_MEMORY_RATIO="${MAMBA_FULL_MEMORY_RATIO:-}"
+MAMBA_SSM_DTYPE="${MAMBA_SSM_DTYPE:-}"
+MAMBA_RADIX_STRATEGY="${MAMBA_RADIX_STRATEGY:-}"
+MAMBA_SKIP_DECODE_LOCK="${MAMBA_SKIP_DECODE_LOCK:-0}"
 ENABLE_AITER="${ENABLE_AITER:-1}"
 FLYDSL_FORCE="${FLYDSL_FORCE:-1}"
 ROCM_MODE="${ROCM_MODE:-auto}"
@@ -124,6 +134,45 @@ esac
     || die "WEIGHT_LOAD_THREADS must be a non-negative integer, got '$WEIGHT_LOAD_THREADS' (0 disables the flag)."
 [[ -z "$PREFETCH_BLOCK_SIZE_MB" || "$PREFETCH_BLOCK_SIZE_MB" =~ ^[0-9]+$ ]] \
     || die "PREFETCH_BLOCK_SIZE_MB must be a positive integer or empty, got '$PREFETCH_BLOCK_SIZE_MB'."
+
+# ── KDA state pool + DSpark shaping ─────────────────────────────────────────
+#
+# K3 is a hybrid: 69 of its 93 layers are KDA (linear attention) holding a
+# recurrent STATE per request, and 24 are MLA holding a normal KV cache. These
+# knobs size and shape that state pool. All default to upstream behaviour — the
+# argv is unchanged until one is set.
+case "$MAMBA_RADIX_STRATEGY" in
+    ""|auto|extra_buffer|extra_buffer_lazy|no_buffer) ;;
+    *) die "MAMBA_RADIX_STRATEGY must be empty, auto, extra_buffer, extra_buffer_lazy or no_buffer, got '$MAMBA_RADIX_STRATEGY'." ;;
+esac
+
+case "$MAMBA_SSM_DTYPE" in
+    ""|bfloat16|float16|float32) ;;
+    *) die "MAMBA_SSM_DTYPE must be empty, bfloat16, float16 or float32, got '$MAMBA_SSM_DTYPE'." ;;
+esac
+
+[[ -z "$MAMBA_FULL_MEMORY_RATIO" || "$MAMBA_FULL_MEMORY_RATIO" =~ ^[0-9]+(\.[0-9]+)?$ ]] \
+    || die "MAMBA_FULL_MEMORY_RATIO must be a positive number or empty, got '$MAMBA_FULL_MEMORY_RATIO'."
+
+[[ -z "$DSPARK_BLOCK_SIZE" || "$DSPARK_BLOCK_SIZE" =~ ^[0-9]+$ ]] \
+    || die "DSPARK_BLOCK_SIZE must be a positive integer or empty, got '$DSPARK_BLOCK_SIZE' (empty = infer from the draft checkpoint)."
+
+# DSPARK-only flags. Fail here rather than after a 1.5 TB load: SGLang rejects
+# both combinations at argument-parse time, but only once the container is up.
+if [[ -n "$DSPARK_BLOCK_SIZE" && "$SPECULATIVE" != "dspark" ]]; then
+    warn "DSPARK_BLOCK_SIZE=$DSPARK_BLOCK_SIZE is ignored while SPECULATIVE is '${SPECULATIVE:-off}'."
+fi
+if [[ "$REPLAYSSM_SPEC" == "1" ]]; then
+    [[ "$SPECULATIVE" == "dspark" ]] \
+        || die "REPLAYSSM_SPEC=1 needs SPECULATIVE=dspark — the ReplaySSM ring is spec-verify-only
+  scratch, and a server that never runs verify rejects the flag at startup."
+    # Upstream: "--enable-gdn-replayssm-spec is not validated with
+    # --mamba-radix-cache-strategy extra_buffer_lazy yet; use extra_buffer."
+    if [[ "$DISABLE_RADIX_CACHE" != "1" && "$MAMBA_RADIX_STRATEGY" == "extra_buffer_lazy" ]]; then
+        die "REPLAYSSM_SPEC=1 with the radix cache on is not validated against
+  MAMBA_RADIX_STRATEGY=extra_buffer_lazy. Use extra_buffer (or leave it empty for auto)."
+    fi
+fi
 
 # The buffered multi-thread loader holds ~(num_threads + 2) shards in host RAM at
 # once. K3's shards are ~5 GB, so 8 threads is ~50 GB against --mem=1800G. Well
@@ -866,13 +915,19 @@ if [[ "$SPECULATIVE" == "dspark" && "$MODE" == "serve" ]]; then
     # SGLang read the one refs/main pointed at, so the preflight passed and the
     # launch still died. A cache can hold several snapshots at once; only one of
     # them is what a bare repo id resolves to.
-    if [[ -n "$DSPARK_REVISION" ]]; then
+    # A 40-hex revision names a snapshot directly; anything else is a branch or
+    # tag, which the cache stores as refs/<name> -> sha. DSPARK_REVISION defaults
+    # to a sha, but "main" has to keep working for anyone who wants the drift.
+    draft_pin="pinned"
+    if [[ "$DSPARK_REVISION" =~ ^[0-9a-f]{40}$ ]]; then
         draft_snapshot="$draft_dir/snapshots/$DSPARK_REVISION"
         [[ -d "$draft_snapshot" ]] \
             || die "DSPARK_REVISION=$DSPARK_REVISION is not in the cache.
-  Fetch it first:   DSPARK_REVISION=$DSPARK_REVISION ./serve-kimik3.sh download"
+  Fetch it first:   DSPARK_REVISION=$DSPARK_REVISION ./serve-kimik3.sh download
+  Or track the branch instead:   DSPARK_REVISION=main"
     else
-        draft_ref="$draft_dir/refs/main"
+        draft_pin="tracking ${DSPARK_REVISION:-main}"
+        draft_ref="$draft_dir/refs/${DSPARK_REVISION:-main}"
         if [[ -r "$draft_ref" ]]; then
             draft_snapshot="$draft_dir/snapshots/$(<"$draft_ref")"
         else
@@ -914,7 +969,7 @@ if [[ "$SPECULATIVE" == "dspark" && "$MODE" == "serve" ]]; then
     # Hand SGLang the resolved PATH, never the repo id. The repo id makes it
     # re-resolve through the hub, which is how it ended up reading a different
     # snapshot than the one checked here.
-    log "Draft: $DSPARK_MODEL -> $(basename "$draft_snapshot")${DSPARK_REVISION:+ (pinned)}"
+    log "Draft: $DSPARK_MODEL -> $(basename "$draft_snapshot") ($draft_pin)"
     DSPARK_MODEL="$draft_snapshot"
 fi
 
@@ -1132,6 +1187,27 @@ fi
 
 # ── Build the launch command ────────────────────────────────────────────────
 
+# Ask the image what flags it actually has. The pinned image is a day-0 BRANCH
+# build, not mainline, so any given flag may simply not exist in it — and finding
+# that out the other way costs a full 1.5 TB load before the server dies on an
+# unknown argument.
+#
+# Memoised: several callers below ask about different flags, and shelling into
+# the image once per question is a second each for the same answer. Empty means
+# the probe itself failed, which is not the same as "the flag is absent" — every
+# caller has to tell those two apart.
+IMAGE_HELP=""
+IMAGE_HELP_PROBED=0
+image_help() {
+    if (( ! IMAGE_HELP_PROBED )); then
+        IMAGE_HELP_PROBED=1
+        IMAGE_HELP="$(apptainer exec "$SIF_PATH" \
+            bash -c "sglang serve --help 2>&1 || python3 -m sglang.launch_server --help 2>&1" 2>/dev/null || true)"
+    fi
+    printf '%s' "$IMAGE_HELP"
+}
+
+
 # shellcheck disable=SC2206  # intentional word splitting of the configured launcher
 launcher=($LAUNCH_CMD)
 # shellcheck disable=SC2206  # intentional word splitting of user-provided extra args
@@ -1159,10 +1235,65 @@ spec_flags=()
 if [[ "$SPECULATIVE" == "dspark" ]]; then
     spec_flags=(--speculative-draft-model-path "$DSPARK_MODEL"
                 --speculative-algorithm DSPARK)
+
+    # gamma, the number of proposed draft tokens. Omitted, SGLang infers it from
+    # the draft checkpoint's block_size — which is 7 today, so setting 7 changes
+    # nothing. That is the point: it is an anchor against the draft repo being
+    # rewritten under us again, not a speedup.
+    [[ -n "$DSPARK_BLOCK_SIZE" ]] \
+        && spec_flags+=(--speculative-dspark-block-size "$DSPARK_BLOCK_SIZE")
+
+    # NOTE THE FLAG NAME. Upstream's own K3 cookbook prescribes
+    # --enable-linear-replayssm-spec for every DSPARK recipe; that flag DOES NOT
+    # EXIST (no such attribute anywhere in the tree, checked 2 Aug 2026). The
+    # real one is --enable-gdn-replayssm-spec.
+    #
+    # Do not "fix" this to the similarly named --enable-linear-replayssm. That is
+    # a different, mutually exclusive flag whose own help says KDA decode is
+    # SLOWER than the packed baseline — so the plausible-looking name is a silent
+    # regression rather than an error.
+    if [[ "$REPLAYSSM_SPEC" == "1" ]]; then
+        if grep -q -- '--enable-gdn-replayssm-spec' <<<"$(image_help)"; then
+            spec_flags+=(--enable-gdn-replayssm-spec)
+            log "ReplaySSM spec-verify ENABLED (--enable-gdn-replayssm-spec)."
+        elif [[ -z "$(image_help)" ]]; then
+            warn "Could not read --help from the image; passing --enable-gdn-replayssm-spec unverified."
+            spec_flags+=(--enable-gdn-replayssm-spec)
+        else
+            die "This image has no --enable-gdn-replayssm-spec.
+  Coexistence with the extra_buffer radix strategy landed upstream on 31 Jul 2026
+  (sglang #32692), AFTER the pinned rocm720-mi35x-k3-20260727 build. Pull a
+  20260731-or-later K3 tag into a SECOND SIF_PATH and test it there — see the
+  README, 'When the branch merges' — or set REPLAYSSM_SPEC=0."
+        fi
+    fi
+
     log "DSpark speculative decoding ENABLED (draft: $DSPARK_MODEL)."
     warn "  DSpark has an open crash report upstream (sglang issue #32569)."
     warn "  If startup fails with \"TypeError: 'NoneType' object is not callable\","
     warn "  unset SPECULATIVE in kimik3.env and retry the baseline config."
+fi
+
+# K3's KDA layers hold a recurrent state per request, sized against the MLA KV
+# pool. Every one of these is empty by default, so the argv is unchanged until
+# you set one — measure with ./bench-kimik3.sh, one variable at a time.
+mamba_flags=()
+[[ -n "$MAMBA_FULL_MEMORY_RATIO" ]] && mamba_flags+=(--mamba-full-memory-ratio "$MAMBA_FULL_MEMORY_RATIO")
+[[ -n "$MAMBA_SSM_DTYPE" ]]        && mamba_flags+=(--mamba-ssm-dtype "$MAMBA_SSM_DTYPE")
+[[ -n "$MAMBA_RADIX_STRATEGY" ]]   && mamba_flags+=(--mamba-radix-cache-strategy "$MAMBA_RADIX_STRATEGY")
+
+if (( ${#mamba_flags[@]} )); then
+    unknown_mamba=()
+    for f in "${mamba_flags[@]}"; do
+        [[ "$f" == --* ]] || continue
+        grep -q -- "$f" <<<"$(image_help)" || unknown_mamba+=("$f")
+    done
+    if [[ -n "$(image_help)" ]] && (( ${#unknown_mamba[@]} )); then
+        die "This image does not offer: ${unknown_mamba[*]}
+  These are K3 hybrid-attention flags; an older or non-K3 image will not have them.
+  Unset the matching MAMBA_* variables in kimik3.env, or use a newer K3 image."
+    fi
+    log "KDA state pool: ${mamba_flags[*]}"
 fi
 
 perf_flags=()
@@ -1201,6 +1332,16 @@ if [[ "$ENABLE_AITER" == "1" ]]; then
     else
         warn "FLYDSL_FORCE=0 — using aiter's prebuilt gemm path, below upstream's numbers."
     fi
+fi
+
+# Skips the decode-time mamba lock, freeing one resident KDA state slot per
+# request (extra_buffer 5->4, extra_buffer_lazy 4->3; no_buffer is unaffected).
+# Upstream labels it experimental and ships it off. An env var, not a flag, so it
+# cannot be capability-probed from --help — an image that does not know it simply
+# ignores it, which is the safe direction.
+if [[ "$MAMBA_SKIP_DECODE_LOCK" == "1" ]]; then
+    aiter_env+=(--env SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK=1)
+    log "SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK=1 — one fewer KDA state slot per request (experimental)."
 fi
 
 # Forward the SLURM GPU-visibility vars into the container (Apptainer inherits
@@ -1262,23 +1403,19 @@ if [[ "$LOAD_FORMAT" == "presharded" && -n "$PRESHARDED_PATH" ]]; then
     fi
 fi
 
-# The pinned image is a day-0 BRANCH build, not mainline, so these flags may
-# simply not exist in it. Probing --help costs a second; finding out the other
-# way costs a full 1.5 TB load before the server dies on an unknown argument.
 if [[ -n "$loader_cfg" || -n "$LOAD_FORMAT" ]]; then
-    image_help="$(apptainer exec "$SIF_PATH" \
-        bash -c "sglang serve --help 2>&1 || python3 -m sglang.launch_server --help 2>&1" 2>/dev/null || true)"
+    help_text="$(image_help)"
 
-    if [[ -z "$image_help" ]]; then
+    if [[ -z "$help_text" ]]; then
         warn "Could not read --help from the image; passing the weight-loading flags unverified."
     else
-        if [[ -n "$loader_cfg" ]] && ! grep -q -- '--model-loader-extra-config' <<<"$image_help"; then
+        if [[ -n "$loader_cfg" ]] && ! grep -q -- '--model-loader-extra-config' <<<"$help_text"; then
             warn "This image has no --model-loader-extra-config, so multi-threaded weight
   loading cannot be requested and the cold start will stay single-threaded.
   Set WEIGHT_LOAD_THREADS=0 in kimik3.env to silence this."
             loader_cfg=""
         fi
-        if [[ -n "$LOAD_FORMAT" ]] && ! grep -q -- "$LOAD_FORMAT" <<<"$image_help"; then
+        if [[ -n "$LOAD_FORMAT" ]] && ! grep -q -- "$LOAD_FORMAT" <<<"$help_text"; then
             die "This image's --load-format does not offer '$LOAD_FORMAT'.
   Run './serve-kimik3.sh loadstat' to see what it does support, then set
   LOAD_FORMAT in kimik3.env accordingly (empty = the image's default)."
@@ -1310,6 +1447,7 @@ cmd=("${launcher[@]}"
      ${kv_flag[@]+"${kv_flag[@]}"}
      ${parser_flags[@]+"${parser_flags[@]}"}
      ${spec_flags[@]+"${spec_flags[@]}"}
+     ${mamba_flags[@]+"${mamba_flags[@]}"}
      ${perf_flags[@]+"${perf_flags[@]}"}
      ${load_flags[@]+"${load_flags[@]}"}
      ${extra_args[@]+"${extra_args[@]}"})

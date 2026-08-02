@@ -465,7 +465,11 @@ measured against commit `eb03982e` (27 Jul 2026). Since then:
 |---|---|---|
 | `eb03982e` | 27 Jul 2026 | **the revision these numbers were measured on** |
 | `9c4b2577` | 31 Jul 2026 | *"Sync Kimi-K3-DSpark-0731 snapshot"* — the model itself replaced |
-| `56ce616a` | 1 Aug 2026 | README only |
+| `56ce616a` | 1 Aug 2026 | current `main` — healthy (`model_type: qwen3`, `block_size: 7`), never benchmarked here |
+
+Three rewrites in four days, two of which broke the launch. So as of 2 Aug 2026
+**`DSPARK_REVISION` defaults to `eb03982e…`** — the script pins rather than
+tracks, and following `main` is the thing you now opt into.
 
 *Hit for real on 1 Aug 2026*: a re-download picked up a newer revision and the
 server then died during **argument parsing**, before loading anything, with
@@ -474,19 +478,26 @@ model_type key in its config.json`. SGLang resolves the draft's config to pick
 the speculative algorithm, so a bad or truncated draft config kills the launch
 early — which at least is cheap.
 
-Pin the revision you measured:
+The pin is the default, so all you need is to have fetched it:
+
+```bash
+./serve-kimik3.sh download     # fetches the pinned DSPARK_REVISION
+```
+
+To follow the branch instead, set it to a ref rather than a sha:
 
 ```bash
 # kimik3.env
-export DSPARK_REVISION="eb03982e58d4fb79bcfc099e902158f562e2e27b"
-./serve-kimik3.sh download     # fetches that exact commit
+export DSPARK_REVISION="main"      # accept the drift
 ```
 
-With `DSPARK_REVISION` set, the script passes the pinned snapshot path to SGLang
-instead of the repo id, so `main` moving cannot change what you serve. Leave it
-empty to track `main` and accept the drift. Either way the serve preflight now
-checks the cached draft has a parseable `config.json` with a `model_type`, and
-says what to do rather than letting upstream raise the confusing error.
+A 40-hex value names a snapshot directly; anything else is resolved through
+`refs/<name>` the way the hub does. Either way the script hands SGLang the
+**resolved snapshot path**, never the repo id — a repo id makes it re-resolve
+through the hub, which is how an earlier version of this preflight validated one
+snapshot while the server read another. The preflight also checks the cached
+draft has a parseable `config.json` with a `model_type`, and says what to do
+rather than letting upstream raise the confusing error.
 
 **One caveat, unexplained.** A long-context opencode session (217k tokens) showed
 `accept len: 1.23, accept rate: 0.03` — speculation collapsing to nothing, where
@@ -647,6 +658,80 @@ In order of expected payoff:
    (16 of 896 active). Worth a try via
    `EXTRA_ENGINE_ARGS="--ep-size 8"` — bench before believing it.
 
+### K3's KDA state pool — the knobs we did not pass
+
+K3 is a **hybrid**: of its 93 layers, 69 are KDA (Kimi Delta Attention, linear)
+and 24 are MLA. The MLA layers hold an ordinary KV cache; the KDA layers hold a
+**recurrent state per request**. `--mem-fraction-static` buys one pool of memory
+and these knobs decide how it is split — and how many slots each request costs.
+At high concurrency what limits admission is usually state slots, not KV.
+
+Until 2 Aug 2026 this repo passed none of them, so everything below ran at
+upstream defaults. They are now exposed, still defaulting to those same values:
+
+| Variable | Flag | Default | What it trades |
+|---|---|---|---|
+| `MAMBA_FULL_MEMORY_RATIO` | `--mamba-full-memory-ratio` | 0.9 | KDA state pool vs MLA KV pool |
+| `MAMBA_SSM_DTYPE` | `--mamba-ssm-dtype` | fp32 | `bfloat16` halves state memory |
+| `MAMBA_RADIX_STRATEGY` | `--mamba-radix-cache-strategy` | auto → `extra_buffer` | slots/request: 5, `extra_buffer_lazy` 4, `no_buffer` 3 |
+| `MAMBA_SKIP_DECODE_LOCK` | `SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK` | off | one more slot/request, experimental |
+| `REPLAYSSM_SPEC` | `--enable-gdn-replayssm-spec` | off | DSPARK only — frees slots for concurrency |
+| `DSPARK_BLOCK_SIZE` | `--speculative-dspark-block-size` | inferred (7) | pins gamma against draft drift |
+
+The one to look at first is **`MAMBA_FULL_MEMORY_RATIO`**. Its default of 0.9 is
+a default, not a fit for any particular workload: the right split follows your
+**mean request length**, since state cost is per-request while KV cost is
+per-token. Upstream publishes a calculator on the [Kimi-K3 cookbook
+page](https://docs.sglang.io/cookbook/autoregressive/Moonshotai/Kimi-K3) — use it
+rather than guessing.
+
+When testing `MAMBA_SSM_DTYPE=bfloat16`, **watch accept length, not just
+throughput**. Draft/target agreement is the sensitive detector for a numerics
+change — the same reasoning as the ROCm-version section above, where the *null*
+result on accept length was the informative part. If it drops, revert.
+
+#### The flag upstream documents does not exist
+
+The K3 cookbook prescribes `--enable-linear-replayssm-spec` for **every** DSPARK
+recipe. That flag does not exist — there is no such argument anywhere in the tree
+(checked against the `kimi-k3` branch, 2 Aug 2026). The real one is
+**`--enable-gdn-replayssm-spec`**. Copying the cookbook verbatim gets a startup
+rejection after the container is up.
+
+Worse is the plausible correction. There *is* an `--enable-linear-replayssm`, and
+it is a different, mutually exclusive flag — its own help says **KDA decode is
+slower** with it than the packed baseline. So the obvious repair to the cookbook
+name is a silent regression rather than an error.
+
+`REPLAYSSM_SPEC=1` selects the right one. It is off by default because the pinned
+`rocm720-mi35x-k3-20260727` image **predates** sglang #32692 (31 Jul), which is
+what lets ReplaySSM coexist with the `extra_buffer` radix strategy we run. The
+script probes the image and refuses up front rather than letting you find out
+after a 1.5 TB load. To try it, pull a `20260731`-or-later K3 tag into a *second*
+`SIF_PATH` — see [When the branch merges](#when-the-branch-merges).
+
+#### Measured
+
+Nothing yet. Each row is one variable against the 29 Jul DSpark baseline
+(1024/512, TP8) — and a knob that does not help is a result worth writing down,
+same as the rest of this file.
+
+| Variable | Value | Node / date | c=2 | c=8 | c=32 | accept len | Verdict |
+|---|---|---|---|---|---|---|---|
+| — | baseline | | | | | | |
+| `DSPARK_BLOCK_SIZE` | 7 | | | | | | |
+| `MAMBA_SSM_DTYPE` | bfloat16 | | | | | | |
+| `MAMBA_FULL_MEMORY_RATIO` | | | | | | | |
+| `MAMBA_RADIX_STRATEGY` | extra_buffer_lazy | | | | | | |
+| `MAMBA_SKIP_DECODE_LOCK` | 1 | | | | | | |
+| `REPLAYSSM_SPEC` | 1 | | | | | | |
+
+**Not recommended: `--moe-runner-backend`.** It appears in every NVIDIA cell as
+`marlin`, and `aiter` turns up in the AMD *Inkling* recipe — but the K3 MI35x
+cell deliberately omits it and drives the MoE through the `SGLANG_USE_AITER` /
+`SGLANG_AITER_K3_OPT` / `AITER_FLYDSL_FORCE` / `AITER_SITUV2_A8W4` variables this
+repo already sets. Adding it would be borrowing a setting from a different model.
+
 ---
 
 ## Weight loading — why a cold start sawtooths
@@ -737,6 +822,73 @@ Watch `rocm-smi` and the log during a start. If HBM fills in bursts while the CP
 idle, the bottleneck is read-side and threads are the right knob. If reads are
 smooth but HBM lags, it is conversion and H2D — more reader threads will not help,
 and `presharded` (which removes the re-quantisation work entirely) is the lever.
+
+---
+
+## Upstream drift — checked 2 Aug 2026
+
+Everything here moves fast enough that a snapshot goes stale in days, so this
+section records **what was found and how to re-run the check**, not just the
+answer.
+
+### Containers
+
+| | |
+|---|---|
+| Pinned here | `lmsysorg/sglang-rocm:rocm720-mi35x-k3-20260727` (29.2 GB, pushed 28 Jul) |
+| Newest K3 tag | `rocm720-mi35x-k3-20260801` (28.6 GB) — rebuilt **daily** since |
+| Upstream recommends | **still `rocm720-mi35x-k3-20260727`** — the dailies are unblessed |
+| Mainline | PR #32541 **still open** (54 commits, last touched 2 Aug). No mainline K3 image |
+| ROCm 7.14 | **no 7.14 + K3 image exists anywhere** |
+
+That last row is the one that matters for bun161. The 7.14 track is a separate
+series of `*-rocm7_14-mi35x-test-*` tags, last built **20 Jul** at
+`v0.5.15.post1` — before K3 support existed, and not rebuilt since. `rocm/sgl-dev`
+mirrors the same K3 tags, so there is no separate AMD build to try either. **The
+`ROCMINFO_SHIM` workaround stays necessary**, and waiting is still the right
+posture.
+
+Branch commits between the pinned build and 2 Aug worth knowing about:
+
+- **#32692** (31 Jul) — lets ReplaySSM coexist with the `extra_buffer` radix
+  strategy. This is the one concrete reason to move images; see
+  [the KDA section](#k3s-kda-state-pool--the-knobs-we-did-not-pass).
+- **#33037** (31 Jul) — disables `--enable-symm-mem` under CUDA graphs on Kimi
+  hybrid models.
+- *"[Kimi K3] Add reasoning, tool-call, and OpenAI serving"* (1 Aug) — re-run
+  `./serve-kimik3.sh parsers` against any newer image before trusting `kimi_k3`.
+- The AMD/gfx950 commits in that window (FP4 MoE expert memory bloat, fused-RMS
+  FP8 scale metadata, MoE weight loading from mmap views) are all **DeepSeek-V4**,
+  not K3. Tempting, and not ours.
+
+Upstream's own MI355X cell is marked `verified: false`,
+`verificationStatus: "in-progress"` — so the numbers in this file are ahead of
+upstream's verification of this hardware, not behind it.
+
+### Weights
+
+- **`moonshotai/Kimi-K3` has not moved since 27 Jul.** No 1.5 TB re-download.
+  Single MXFP4 checkpoint; no quantization variants published.
+- `RadixArk/Kimi-K3-DSpark` moved again on 1 Aug — see
+  [the draft pinning section](#the-draft-repo-is-a-moving-target--pin-it).
+
+### Re-running the check
+
+```bash
+# newest K3 image tags
+curl -s "https://hub.docker.com/v2/repositories/lmsysorg/sglang-rocm/tags?page_size=100&ordering=last_updated" \
+  | python3 -c "import json,sys;[print(t['name'],t['last_updated'][:10]) for t in json.load(sys.stdin)['results'] if 'k3' in t['name']]"
+
+# have the weights changed under you?
+for m in moonshotai/Kimi-K3 RadixArk/Kimi-K3-DSpark; do
+  curl -s "https://huggingface.co/api/models/$m" \
+    | python3 -c "import json,sys;d=json.load(sys.stdin);print('$m', d['lastModified'][:10], d['sha'][:8])"
+done
+
+# has the branch merged yet?
+curl -s https://api.github.com/repos/sgl-project/sglang/pulls/32541 \
+  | python3 -c "import json,sys;d=json.load(sys.stdin);print(d['state'], d['merged_at'], d['commits'],'commits')"
+```
 
 ---
 
@@ -934,13 +1086,19 @@ All knobs live in `kimik3.env` (copied from `kimik3-env.example`). Anything you
 | `REASONING_PARSER` | `kimi_k3` | Thinking parser; `none` to omit |
 | `SPECULATIVE` | *(empty)* | `dspark` enables DSpark speculative decoding |
 | `DSPARK_MODEL` | `RadixArk/Kimi-K3-DSpark` | Draft model for DSpark |
+| `DSPARK_BLOCK_SIZE` | *(empty)* | `--speculative-dspark-block-size`. Empty infers gamma from the draft (7 today); setting it anchors against draft drift |
+| `REPLAYSSM_SPEC` | `0` | `--enable-gdn-replayssm-spec` — **not** the cookbook's non-existent `--enable-linear-replayssm-spec`. Needs a 20260731+ image ([why](#k3s-kda-state-pool--the-knobs-we-did-not-pass)) |
+| `MAMBA_FULL_MEMORY_RATIO` | *(empty → 0.9)* | KDA state pool vs MLA KV pool. Follows mean request length, not a universal default |
+| `MAMBA_SSM_DTYPE` | *(empty → fp32)* | `bfloat16` halves KDA state memory. Watch accept length |
+| `MAMBA_RADIX_STRATEGY` | *(empty → `extra_buffer`)* | State slots per request: 5 / `extra_buffer_lazy` 4 / `no_buffer` 3 |
+| `MAMBA_SKIP_DECODE_LOCK` | `0` | `SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK=1` — one fewer state slot per request (experimental) |
 | `ENABLE_AITER` | `1` | Exports the four `SGLANG_*`/`AITER_*` K3 variables |
 | `ROCM_MODE` | `auto` | GPU passthrough: `auto` probes, `rocm` uses `--rocm`, `devices` binds `/dev/kfd` only |
 | `AITER_GPU_ARCHS` | *(empty)* | Sets `GPU_ARCHS`. Ignored at runtime by the pinned aiter build — prefer `ROCMINFO_SHIM` |
 | `ROCMINFO_SHIM` | `auto` | Replay the host's `rocminfo` output inside the container when the image's own fails |
 | `SET_CPU_AFFINITY` | `0` | Keep `0` under a SLURM cgroup (see troubleshooting) |
 | `READY_TIMEOUT` | `14400` | Seconds to wait for health (cold load is ~1.5 TB) |
-| `DSPARK_REVISION` | *(empty)* | Pin the draft to one commit. Upstream rewrites `main` — see [Speculative decoding](#the-draft-repo-is-a-moving-target--pin-it) |
+| `DSPARK_REVISION` | `eb03982e…` | **Pinned by default.** A 40-hex value is a snapshot, anything else a ref — `main` tracks the branch. Upstream rewrites it; see [Speculative decoding](#the-draft-repo-is-a-moving-target--pin-it) |
 | `WEIGHT_LOAD_THREADS` | `8` | Loader threads. Naming it is what stops SGLang silently going single-threaded (see [Weight loading](#weight-loading--why-a-cold-start-sawtooths)). `0` = image default |
 | `LOAD_FORMAT` | *(empty)* | `--load-format`. `presharded` dumps a per-rank checkpoint so later starts skip re-quantisation |
 | `PRESHARDED_PATH` | *(empty)* | Where `presharded` writes. Needs up to another 1561 GB |
@@ -1007,8 +1165,20 @@ All knobs live in `kimik3.env` (copied from `kimik3-env.example`). Anything you
   cached draft config is truncated, or upstream rewrote the repo (it does — see
   [The draft repo is a moving target](#the-draft-repo-is-a-moving-target--pin-it)).
   This fires during argument parsing, before any load. Re-fetch with
-  `rm -rf $MODEL_CACHE_DIR/hub/models--RadixArk--Kimi-K3-DSpark && ./serve-kimik3.sh download`,
-  or pin `DSPARK_REVISION` to the revision you measured.
+  `rm -rf $MODEL_CACHE_DIR/hub/models--RadixArk--Kimi-K3-DSpark && ./serve-kimik3.sh download`.
+  `DSPARK_REVISION` is pinned by default now, so this should only bite you if you
+  set it to `main`.
+- **`DSPARK_REVISION=… is not in the cache`** — the pin names a revision you have
+  never fetched. `./serve-kimik3.sh download` gets it, or set `DSPARK_REVISION=main`
+  to use whatever you already have.
+- **`This image has no --enable-gdn-replayssm-spec`** — `REPLAYSSM_SPEC=1` against
+  an image older than 20260731. Expected on the pinned image; see
+  [KDA state pool](#k3s-kda-state-pool--the-knobs-we-did-not-pass). Pull a newer
+  tag into a *second* `SIF_PATH`, or set `REPLAYSSM_SPEC=0`.
+- **The server rejects `--enable-linear-replayssm-spec`** — because it does not
+  exist, anywhere. It is an error in upstream's cookbook. Use `REPLAYSSM_SPEC=1`,
+  which passes `--enable-gdn-replayssm-spec`. Do **not** substitute
+  `--enable-linear-replayssm`: that is a different flag and is *slower* on KDA.
 - **`RuntimeError: Cannot find any model weights with 'RadixArk/Kimi-K3-DSpark'`**
   — *hit for real on 1 Aug 2026.* The draft is a **separate** checkpoint, and
   `download` only fetches it when `SPECULATIVE=dspark` was set at the time. Worse,
@@ -1090,6 +1260,8 @@ provider block. Manage with `./share-kimik3.sh status` / `stop`.
 - [sglang#32541 — day-0 Kimi K3 support](https://github.com/sgl-project/sglang/pull/32541) — branch, NVIDIA and AMD image tags
 - [sglang#32548 — [Kimi-K3][AMD] Day 0 and Performance Tracking](https://github.com/sgl-project/sglang/issues/32548) — **the MI355X recipe and every perf number in this README**
 - [sglang#32569](https://github.com/sgl-project/sglang/issues/32569) — the open DSPARK crash
+- [SGLang Kimi-K3 cookbook](https://docs.sglang.io/cookbook/autoregressive/Moonshotai/Kimi-K3) — the MI35x cell, the KDA knob surface and the `--mamba-full-memory-ratio` calculator. **Its `--enable-linear-replayssm-spec` does not exist** — see [KDA state pool](#k3s-kda-state-pool--the-knobs-we-did-not-pass)
+- [sglang#32692](https://github.com/sgl-project/sglang/pull/32692) — ReplaySSM with `extra_buffer`, landed 31 Jul 2026, after the pinned image
 - [moonshotai/Kimi-K3](https://huggingface.co/moonshotai/Kimi-K3) · [RadixArk/Kimi-K3-DSpark](https://huggingface.co/RadixArk/Kimi-K3-DSpark)
 - [LMSYS: Kimi K3 day-0 support](https://www.lmsys.org/blog/2026-07-27-kimi-k3-day0-support) · [Kimi K3 tech blog](https://www.kimi.com/blog/kimi-k3) — KDA, Attention Residuals, 16/896 sparsity
 - [vLLM K3 preview](https://vllm.ai/blog/2026-07-22-kimi-k3-preview) · [vllm#50000](https://github.com/vllm-project/vllm/pull/50000) — the NVIDIA-only alternative, for when a ROCm build appears

@@ -172,6 +172,74 @@ export REASONING_PARSER="${REASONING_PARSER:-kimi_k3}"
 export SPECULATIVE="${SPECULATIVE:-}"
 export DSPARK_MODEL="${DSPARK_MODEL:-RadixArk/Kimi-K3-DSpark}"
 
+# gamma — how many draft tokens DSpark proposes per step. Empty (default) lets
+# SGLang infer it from the draft checkpoint's block_size, which reads 7 today, so
+# setting 7 changes nothing about how the server runs. It is worth setting anyway
+# as an ANCHOR: the draft repo has been rewritten three times in four days, and a
+# rewrite that changes block_size silently changes the accept-length numbers in
+# the README. Upstream's own recipe passes 7 explicitly for the same reason.
+export DSPARK_BLOCK_SIZE="${DSPARK_BLOCK_SIZE:-}"
+
+# ReplaySSM spec-verify: --enable-gdn-replayssm-spec. Replaces the recurrent
+# verify's per-draft full-state snapshots with a per-slot ring, so the KDA state
+# pool admits more concurrent requests at a given MAMBA_FULL_MEMORY_RATIO.
+# Upstream layers it onto EVERY DSPARK recipe.
+#
+# READ THE FLAG NAME. Upstream's K3 cookbook says --enable-linear-replayssm-spec;
+# that flag does not exist (checked against the branch, 2 Aug 2026) and the
+# server refuses to start. There IS an --enable-linear-replayssm, and it is a
+# different, mutually exclusive flag whose own help says KDA decode is SLOWER
+# with it — so the obvious "correction" is a silent regression, not a fix.
+#
+# Off by default because the pinned rocm720-mi35x-k3-20260727 image PREDATES
+# sglang #32692 (31 Jul), which is what lets this coexist with the extra_buffer
+# radix strategy we run. serve-kimik3.sh probes the image and refuses rather than
+# letting you discover that after a 1.5 TB load. To try it, pull a 20260731+ K3
+# tag into a SECOND SIF_PATH so the working image stays intact.
+export REPLAYSSM_SPEC="${REPLAYSSM_SPEC:-0}"
+
+# ── KDA state pool (K3 hybrid attention) ────────────────────────────────────
+#
+# K3 is a hybrid: 69 of its 93 layers are KDA (linear attention), which holds a
+# recurrent STATE per request, and 24 are MLA, which holds an ordinary KV cache.
+# --mem-fraction-static buys one pool of memory; these knobs decide how it is
+# split and how much each request costs. They matter most at high concurrency,
+# where admission is limited by state slots rather than by KV.
+#
+# ALL EMPTY BY DEFAULT — the server is launched with exactly the argv it was
+# before these existed. Change one, re-run ./bench-kimik3.sh, keep it if the
+# numbers improve. None of these are measured on Bunya yet; see the README table.
+
+# --mamba-full-memory-ratio: KDA state pool vs MLA KV pool. Upstream's default is
+# 0.9, which is a default and not a fit for any particular workload. The right
+# value follows your MEAN REQUEST LENGTH (input + output) — short interactive
+# turns want more state, long contexts want more KV. Upstream publishes a
+# calculator on the Kimi-K3 cookbook page; use it rather than guessing.
+export MAMBA_FULL_MEMORY_RATIO="${MAMBA_FULL_MEMORY_RATIO:-}"
+
+# --mamba-ssm-dtype. Empty = FP32. bfloat16 halves KDA state memory, which buys
+# concurrency directly. Watch ACCEPT LENGTH when testing this, not just
+# throughput: draft/target agreement is the sensitive detector for a numerics
+# change, exactly as in the README's ROCm-version section. If accept length
+# drops, revert. float16 exists only for stochastic rounding; nothing here has
+# tried it.
+export MAMBA_SSM_DTYPE="${MAMBA_SSM_DTYPE:-}"
+
+# --mamba-radix-cache-strategy. How KDA state buffers for prefix reuse, in state
+# slots per request: extra_buffer 5 (the default that 'auto' resolves to),
+# extra_buffer_lazy 4, no_buffer 3. Fewer slots means more concurrent requests
+# and less prefix reuse. Has no meaning with DISABLE_RADIX_CACHE=1.
+# NOTE: extra_buffer_lazy is rejected alongside REPLAYSSM_SPEC=1 while the radix
+# cache is on — serve-kimik3.sh catches that combination before launching.
+export MAMBA_RADIX_STRATEGY="${MAMBA_RADIX_STRATEGY:-}"
+
+# SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK=1 — skips the decode-time mamba lock, freeing
+# one more resident state slot per request (extra_buffer 5->4, extra_buffer_lazy
+# 4->3; no_buffer unaffected). Upstream ships it off and labels it experimental.
+# It is an env var, not a flag, so it cannot be capability-probed: an image that
+# does not know it ignores it silently.
+export MAMBA_SKIP_DECODE_LOCK="${MAMBA_SKIP_DECODE_LOCK:-0}"
+
 # ── ROCm / AMD kernel toggles ───────────────────────────────────────────────
 
 # How the container reaches the GPUs.
@@ -280,13 +348,20 @@ export PRESHARDED_PATH="${PRESHARDED_PATH:-}"
 # count, and only with a cold-run measurement to compare against.
 export PREFETCH_BLOCK_SIZE_MB="${PREFETCH_BLOCK_SIZE_MB:-}"
 
-# Pin the DSpark draft to one commit. RadixArk/Kimi-K3-DSpark is rewritten under
-# you — a full snapshot swap landed 31 Jul 2026 — and a changed draft either
-# changes what you serve or breaks the launch outright. The measured-good
-# revision for the numbers in the README is:
-#   export DSPARK_REVISION="eb03982e58d4fb79bcfc099e902158f562e2e27b"
-# Empty tracks 'main' and accepts the drift.
-export DSPARK_REVISION="${DSPARK_REVISION:-}"
+# Which DSpark draft revision to serve. PINNED BY DEFAULT, and deliberately so:
+# RadixArk/Kimi-K3-DSpark was rewritten three times between 29 Jul and 1 Aug 2026,
+# twice breaking the launch outright. A changed draft either changes what you
+# serve or stops it starting, and neither announces itself.
+#
+# The default below is the revision every DSpark number in the README was
+# measured on. A 40-hex value names a snapshot directly; anything else is treated
+# as a branch or tag, so:
+#   export DSPARK_REVISION="main"    # follow the branch, accept the drift
+# Upstream 'main' was 56ce616ad7486f0e96cbb51ef23ed5a1bce1d92d as of 1 Aug 2026 —
+# healthy, but never benchmarked here.
+#
+# Whatever you set, ./serve-kimik3.sh download must have fetched that revision.
+export DSPARK_REVISION="${DSPARK_REVISION:-eb03982e58d4fb79bcfc099e902158f562e2e27b}"
 
 # ── Escape hatches ──────────────────────────────────────────────────────────
 
