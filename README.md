@@ -161,7 +161,6 @@ scontrol show node bun161 | grep -iE 'Gres|Partitions|State'
 | `opencode.kimik3.json` | The provider template `opencode-setup.sh` fills in |
 | `kimicode-setup.sh` | Writes/merges the kimicode provider config on any machine |
 | `kimicode.kimik3.toml` | The provider template `kimicode-setup.sh` fills in |
-| `share-kimik3.sh` | Optional: public HTTPS tunnel via Cloudflare for users without SSH |
 | `bench-kimik3.sh` | Benchmark tok/s / TTFT / ITL against upstream's numbers |
 
 Secrets never live in the repo: `kimik3.env` (your HF token), the generated API
@@ -1037,9 +1036,6 @@ which is out of scope for this repo. `serve-kimik3.sh` detects gfx942 and warns.
 ./kimicode-setup.sh [--host H] [--port P] [--model M] [--context N]
                     [--api-key K] [--no-key] [--config PATH]
 
-./share-kimik3.sh [share]        open a public HTTPS Cloudflare tunnel (add --detach)
-./share-kimik3.sh stop | status
-
 ./bench-kimik3.sh [sweep]        tok/s at concurrency 2/8/32
 ./bench-kimik3.sh latency        single-stream latency only
 ./bench-kimik3.sh throughput     saturate at BENCH_MAX_CONCURRENCY
@@ -1228,30 +1224,6 @@ All knobs live in `kimik3.env` (copied from `kimik3-env.example`). Anything you
 - **opencode doesn't see the model**: it only reads config at startup — restart
   it after `opencode-setup.sh`, and make sure `KIMIK3_API_KEY` is exported in
   that shell (or you used `--embed-key`).
-
----
-
-## Sharing with someone who has no SSH access (optional)
-
-`share-kimik3.sh` exposes the running endpoint over public HTTPS via a
-**Cloudflare quick tunnel** — outbound-only, no root, no Cloudflare account:
-
-```bash
-./share-kimik3.sh share --detach     # prints https://<random>.trycloudflare.com
-```
-
-It downloads `cloudflared` into `$MODEL_CACHE_DIR/cloudflared/`, checks the
-server is healthy, opens the tunnel, and prints a ready-to-paste opencode
-provider block. Manage with `./share-kimik3.sh status` / `stop`.
-
-> ⚠️ Needs the compute node to have **outbound internet**. If that's blocked,
-> use the SSH tunnel in Step 6 instead.
-
-> ⚠️ **The public URL + API key together grant full use of your model and your
-> Bunya GPU-hours (billed to `a_rcc`).** Share the key over a private channel
-> only, rotate it if it leaks (delete `$MODEL_CACHE_DIR/kimik3-api-key` and
-> restart), and **check RCC's acceptable-use policy before exposing HPC compute
-> externally** — the API key is the only gate.
 
 ---
 
