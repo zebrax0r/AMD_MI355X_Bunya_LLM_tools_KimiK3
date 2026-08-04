@@ -1207,6 +1207,48 @@ image_help() {
     printf '%s' "$IMAGE_HELP"
 }
 
+# Which HIP renorm bindings does this image have? DSpark's verify step reaches
+# for top_k_renorm_prob / top_p_renorm_prob, and on ROCm those are bound in
+# dflash_utils.py by an is_hip() branch that arrived in two halves:
+#
+#   sglang #32621 (28 Jul 07:37 UTC)  aliased top_P  -> a Triton kernel
+#   sglang #32641 (31 Jul 06:21 UTC)  added  top_K   -> a Triton kernel
+#
+# Our pinned rocm720-mi35x-k3-20260727 was pushed 28 Jul 05:48 UTC — about two
+# hours before the first of those. It has NEITHER, so both names are None, and
+# calling one is `TypeError: 'NoneType' object is not callable` inside the
+# scheduler's event loop. That kills the SERVER, not the request (sglang #32569).
+#
+# Grep for the alias names rather than infer from the image tag: the tag is a
+# build date, the aliases are the thing that actually has to be there. Textual,
+# not an import — importing sglang.srt.speculative drags in torch, which is slow
+# and unhappy on a login node. Empty output means "could not tell", which is not
+# the same as "absent"; the caller distinguishes them.
+RENORM_BINDINGS=""
+RENORM_PROBED=0
+renorm_bindings() {
+    if (( ! RENORM_PROBED )); then
+        RENORM_PROBED=1
+        RENORM_BINDINGS="$(apptainer exec "$SIF_PATH" bash -c '
+            f=/sgl-workspace/sglang/python/sglang/srt/speculative/dflash_utils.py
+            # Search only image-owned roots. A bare `find /` here would walk the
+            # bound MODEL_CACHE_DIR — 1.5 TB of weights — to find a 30 KB file.
+            [[ -r "$f" ]] || f=$(find /sgl-workspace /opt /usr/lib /usr/local \
+                -name dflash_utils.py -path "*sglang/srt/speculative*" 2>/dev/null | head -1)
+            [[ -n "$f" && -r "$f" ]] || exit 0
+            grep -q top_k_renorm_probs_triton "$f" && echo k
+            grep -q top_p_renorm_probs_triton "$f" && echo p
+            echo probed
+        ' 2>/dev/null || true)"
+    fi
+    printf '%s' "$RENORM_BINDINGS"
+}
+
+# Markers are one per line and matched WHOLE-LINE on purpose. Substring tests
+# here are a trap: `probed` contains a `p`, so a *p* glob reports "top_p is fine"
+# for the image where nothing is fine.
+renorm_has() { grep -qxF "$1" <<<"$(renorm_bindings)"; }
+
 
 # shellcheck disable=SC2206  # intentional word splitting of the configured launcher
 launcher=($LAUNCH_CMD)
@@ -1269,9 +1311,33 @@ if [[ "$SPECULATIVE" == "dspark" ]]; then
     fi
 
     log "DSpark speculative decoding ENABLED (draft: $DSPARK_MODEL)."
-    warn "  DSpark has an open crash report upstream (sglang issue #32569)."
-    warn "  If startup fails with \"TypeError: 'NoneType' object is not callable\","
-    warn "  unset SPECULATIVE in kimik3.env and retry the baseline config."
+
+    # This does NOT fail at startup, which is what makes it worth a warning here.
+    # The server comes up healthy and serves correctly for as long as every
+    # request leaves top_p at 1.0 and top_k unset — which is exactly what our
+    # bench and toolcheck do, and why the README's numbers exist at all. The
+    # first request that sets either one reaches the renorm call in SGLang's
+    # verify step and takes the scheduler down with it, mid-session. See the
+    # README, 'The sampling landmine'.
+    if ! renorm_has probed; then
+        warn "  Could not read the image's sampling bindings; cannot tell whether"
+        warn "  top_p/top_k requests are safe with DSpark on (sglang #32569)."
+    elif renorm_has k && renorm_has p; then
+        log "  Sampling bindings OK: this image has the HIP top_k and top_p renorm kernels."
+    else
+        warn "  This image is missing the HIP renorm kernels DSpark's verify step needs."
+        if renorm_has p; then
+            warn "  top_p works here; a request setting TOP_K raises NameError and KILLS"
+            warn "  THE SERVER — not just that request. Safe while no client sets top_k."
+        else
+            warn "  A request setting TOP_P (<1.0) or TOP_K raises"
+            warn "  \"TypeError: 'NoneType' object is not callable\" and KILLS THE SERVER —"
+            warn "  not just that request. One such request poisons its whole batch."
+            warn "  Safe only while every client leaves top_p at 1.0 and top_k unset."
+        fi
+        warn "  Real fix: a 20260731-or-later K3 tag (sglang #32621 + #32641), tested"
+        warn "  in a SECOND SIF_PATH first. Zero-risk fix: unset SPECULATIVE."
+    fi
 fi
 
 # K3's KDA layers hold a recurrent state per request, sized against the MLA KV

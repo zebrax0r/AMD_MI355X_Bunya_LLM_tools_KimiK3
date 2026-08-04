@@ -449,11 +449,51 @@ biggest win available.** Same node, same sweep, DSpark the only variable:
 5.29-5.93 — so the draft model is behaving. **Our c=2 TPOT of 5.93 ms beats
 upstream's own DSpark figure of 8.94 ms.**
 
+### The sampling landmine — read this before enabling DSpark
+
 SGLang issue [#32569](https://github.com/sgl-project/sglang/issues/32569)
-reports DSPARK crashing with `TypeError: 'NoneType' object is not callable`. We
-have not hit it on this image. It stays off by default anyway, so that a first
-launch has one thing to go wrong instead of two — turn it on once baseline
-serving is proven.
+reports DSPARK crashing with `TypeError: 'NoneType' object is not callable`, on
+this exact image tag with these exact env vars. **The bug is live in our build.
+Every number above was measured over it** — we have never sent the request that
+fires it, which is not the same as being safe.
+
+DSpark's verify step calls `top_k_renorm_prob` / `top_p_renorm_prob`. On ROCm
+those are bound in `dflash_utils.py` by an `is_hip()` branch that landed in two
+halves, both *after* our pin:
+
+| Image | `top_k` | `top_p` | Symptom |
+|---|---|---|---|
+| **`…k3-20260727` — ours**, pushed 28 Jul 05:48 UTC | `None` | `None` | `TypeError: 'NoneType' object is not callable` |
+| `…k3-20260728`–`0730` — [#32621](https://github.com/sgl-project/sglang/pull/32621), 28 Jul 07:37 UTC | unbound | Triton | `NameError: top_k_renorm_prob` |
+| `…k3-20260731`+ — [#32641](https://github.com/sgl-project/sglang/pull/32641), 31 Jul 06:21 UTC | Triton | Triton | fixed |
+
+Our image was built about two hours before the first of those merged.
+
+**Why it has never fired.** `dspark_accept.py::_accept_sampling_core` skips the
+whole renorm path when `not need_top_k_sampling and not need_top_p_sampling`,
+and those come from `any(top_p != 1.0)` / `any(top_k != TOP_K_ALL)` across the
+batch. Nothing we send sets either: `moonshotai/Kimi-K3`'s `generation_config.json`
+carries only `max_length` and `eos_token_id`, so SGLang's own defaults (`top_p=1.0`,
+`top_k=-1`) apply; `bench-kimik3.sh` sets neither; and `toolcheck`'s
+`temperature: 0` becomes `top_k=1`, which takes the *sparse* branch and calls
+nothing.
+
+**What fires it.** One request with `top_p < 1.0` — a single curl, or one client
+that sets it. Two things make it worse than a bad request:
+
+- `need_top_*` is `any()` **over the batch**, so one such request poisons every
+  request running beside it.
+- the traceback bottoms out in `run_scheduler_process` → `event_loop_overlap`,
+  so it kills the **server**, not the request. #32569's reporter saw it "work
+  for about 5 minutes, then crash".
+
+`serve-kimik3.sh` greps the image for the two Triton aliases at launch and warns
+when they are missing, so you cannot enable DSpark and meet this unknowingly.
+Options, cheapest first: keep clients at `top_p: 1`; move to a 20260731+ tag in a
+**second** `SIF_PATH` and re-measure; or leave `SPECULATIVE` unset.
+
+It stays off by default anyway, so that a first launch has one thing to go wrong
+instead of two — turn it on once baseline serving is proven.
 
 ### The draft repo is a moving target — pin it
 
@@ -824,7 +864,7 @@ and `presharded` (which removes the re-quantisation work entirely) is the lever.
 
 ---
 
-## Upstream drift — checked 2 Aug 2026
+## Upstream drift — checked 5 Aug 2026
 
 Everything here moves fast enough that a snapshot goes stale in days, so this
 section records **what was found and how to re-run the check**, not just the
@@ -835,9 +875,10 @@ answer.
 | | |
 |---|---|
 | Pinned here | `lmsysorg/sglang-rocm:rocm720-mi35x-k3-20260727` (29.2 GB, pushed 28 Jul) |
-| Newest K3 tag | `rocm720-mi35x-k3-20260801` (28.6 GB) — rebuilt **daily** since |
+| Newest K3 tag | `rocm720-mi35x-k3-20260803` — rebuilt **daily** since |
 | Upstream recommends | **still `rocm720-mi35x-k3-20260727`** — the dailies are unblessed |
-| Mainline | PR #32541 **still open** (54 commits, last touched 2 Aug). No mainline K3 image |
+| First tag with both sampling fixes | `rocm720-mi35x-k3-20260731` — see [the sampling landmine](#the-sampling-landmine--read-this-before-enabling-dspark) |
+| Mainline | PR #32541 **still open**, last touched 4 Aug. No mainline K3 image |
 | ROCm 7.14 | **no 7.14 + K3 image exists anywhere** |
 
 That last row is the one that matters for bun161. The 7.14 track is a separate
@@ -849,8 +890,12 @@ posture.
 
 Branch commits between the pinned build and 2 Aug worth knowing about:
 
+- **#32621** (28 Jul) and **#32641** (31 Jul) — the two halves of the HIP
+  top_p/top_k renorm binding. Together these are the **strongest** reason to move
+  images: without them, DSpark serves happily until a client sets `top_p`, then
+  takes the server down. See [the sampling landmine](#the-sampling-landmine--read-this-before-enabling-dspark).
 - **#32692** (31 Jul) — lets ReplaySSM coexist with the `extra_buffer` radix
-  strategy. This is the one concrete reason to move images; see
+  strategy. The second concrete reason to move images; see
   [the KDA section](#k3s-kda-state-pool--the-knobs-we-did-not-pass).
 - **#33037** (31 Jul) — disables `--enable-symm-mem` under CUDA graphs on Kimi
   hybrid models.
@@ -863,6 +908,36 @@ Branch commits between the pinned build and 2 Aug worth knowing about:
 Upstream's own MI355X cell is marked `verified: false`,
 `verificationStatus: "in-progress"` — so the numbers in this file are ahead of
 upstream's verification of this hardware, not behind it.
+
+### The biggest lever we cannot pull yet — AITER MLA prefill
+
+PR [#33341](https://github.com/sgl-project/sglang/pull/33341), *"[AMD] Enable
+aiter MLA for 12-head models via 12→16 zero-pad (Kimi-K3)"*, opened 3 Aug by AMD.
+**Open, `mergeable_state: blocked`, and targeting `main` rather than the
+`kimi-k3` branch** — so it is in no image today, and `ATTENTION_BACKEND=triton`
+stays the right setting. Nothing to do but watch it.
+
+K3 at TP8 gives each rank 12 attention heads, and AITER's MLA kernels want 16.
+The `kimi-k3` branch already pads for **decode** (`_mla_decode_fwd_with_head_pad`);
+the gap this PR closes is the absorbed **prefill** path, plus a non-power-of-2
+head mask in `cache_ops` and a NoPE guard for K3's `skip_rope`. That makes it a
+**TTFT lever, not an aggregate-throughput one** — which is exactly the axis
+`bench-kimik3.sh throughput` does not measure.
+
+Its numbers, 8×MI355X TP8, `--attention-backend aiter` vs `triton`:
+
+| | 1024 in / 512 out, c=1 | 10240 in / 2048 out, c=16 |
+|---|---|---|
+| Mean TTFT | 306 → 218 ms (1.4×) | **6633 → 696 ms (9.5×)** |
+| Total throughput | 250 → 294 tok/s (+17.7%) | **2613 → 6455 tok/s (2.47×)** |
+| Mean TPOT | 7.36 → 6.48 ms | 25.9 → 6.97 ms |
+| GSM8K | — | 0.976 |
+
+Note how little it does at short context and how much at long: this matters for
+agentic sessions that resend a large context every turn, and barely at all for
+the 1024/512 shape every table in this README uses. If it merges and reaches a
+K3 image, it is worth a `check` + `parsers` + full re-bench in a second
+`SIF_PATH` — and worth re-benching at 10k input, not just 1024.
 
 ### Weights
 
@@ -884,9 +959,16 @@ for m in moonshotai/Kimi-K3 RadixArk/Kimi-K3-DSpark; do
     | python3 -c "import json,sys;d=json.load(sys.stdin);print('$m', d['lastModified'][:10], d['sha'][:8])"
 done
 
-# has the branch merged yet?
-curl -s https://api.github.com/repos/sgl-project/sglang/pulls/32541 \
-  | python3 -c "import json,sys;d=json.load(sys.stdin);print(d['state'], d['merged_at'], d['commits'],'commits')"
+# has the branch merged yet? and has the AITER prefill PR landed?
+for pr in 32541 33341; do
+  curl -s "https://api.github.com/repos/sgl-project/sglang/pulls/$pr" \
+    | python3 -c "import json,sys;d=json.load(sys.stdin);print(d['number'], d['state'], d['merged_at'], '->', d['base']['ref'])"
+done
+
+# does a candidate image actually carry the HIP renorm kernels?
+# (empty output = it does not; this is the DSpark sampling landmine)
+apptainer exec "$SIF_PATH" grep -o 'top_[kp]_renorm_probs_triton' \
+  /sgl-workspace/sglang/python/sglang/srt/speculative/dflash_utils.py | sort -u
 ```
 
 ---
@@ -1153,9 +1235,13 @@ All knobs live in `kimik3.env` (copied from `kimik3-env.example`). Anything you
   `~/.kimi-code/config.toml` and not `~/.kimi/config.toml` — that is the legacy
   Python CLI, and its provider type is `openai_legacy`, not `openai`. See the
   table in [Step 6b](#step-6b--connect-kimicode-optional).
-- **`TypeError: 'NoneType' object is not callable`** with DSpark: known upstream
-  bug ([#32569](https://github.com/sgl-project/sglang/issues/32569)). Unset
-  `SPECULATIVE`.
+- **`TypeError: 'NoneType' object is not callable`** (or `NameError:
+  top_k_renorm_prob`) with DSpark, *mid-session, killing the server* — the pinned
+  image has no HIP renorm kernels ([#32569](https://github.com/sgl-project/sglang/issues/32569)).
+  Triggered by a request with `top_p < 1.0` or `top_k` set; a healthy server that
+  dies the moment a new client connects is this. Send `"top_p": 1`, or move to a
+  20260731+ tag, or unset `SPECULATIVE`. Full mechanism in
+  [The sampling landmine](#the-sampling-landmine--read-this-before-enabling-dspark).
 - **`ValueError: Unrecognized model in RadixArk/Kimi-K3-DSpark. Should have a
   'model_type' key in its config.json`** — *hit for real on 1 Aug 2026.* The
   cached draft config is truncated, or upstream rewrote the repo (it does — see

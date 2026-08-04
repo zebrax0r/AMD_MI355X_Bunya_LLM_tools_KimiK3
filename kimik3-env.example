@@ -166,9 +166,28 @@ export REASONING_PARSER="${REASONING_PARSER:-kimi_k3}"
 #   concurrency 2:  median TPOT 20.86 ms -> 8.94 ms, 820 -> 1659 tok/s
 #   accept length ~5.3-5.9 tokens per step
 #
-# Default OFF because SGLang issue #32569 reports DSPARK crashing
-# ("TypeError: 'NoneType' object is not callable"). Get baseline serving working
-# first, then turn this on — that way a failure has one cause, not two.
+# Default OFF, and there is a sharper reason than "one failure at a time".
+#
+# THE PINNED IMAGE HAS A LIVE SAMPLING BUG (sglang #32569). DSpark's verify step
+# calls top_k_renorm_prob / top_p_renorm_prob; on ROCm those are bound by an
+# is_hip() branch that landed in TWO halves — #32621 (top_p, 28 Jul 07:37 UTC)
+# and #32641 (top_k, 31 Jul 06:21 UTC). rocm720-mi35x-k3-20260727 was pushed
+# 28 Jul 05:48 UTC, so it has NEITHER: both names are None.
+#
+# It does not fail at startup. The server comes up healthy and serves correctly
+# for as long as every request leaves top_p at 1.0 and top_k unset — which is
+# what bench-kimik3.sh and toolcheck do, and why the README has DSpark numbers
+# at all. The FIRST request with top_p < 1.0 raises inside the scheduler's event
+# loop and KILLS THE SERVER, not just that request, taking every concurrent
+# request with it.
+#
+# serve-kimik3.sh greps the image for the two Triton aliases and warns at launch,
+# so you cannot meet this unknowingly. Cheapest fix: keep clients at top_p 1.
+# Real fix: a 20260731+ tag in a SECOND SIF_PATH, then re-measure. See the
+# README, 'The sampling landmine'.
+#
+# Get baseline serving working first, then turn this on — that way a failure has
+# one cause, not two.
 export SPECULATIVE="${SPECULATIVE:-}"
 export DSPARK_MODEL="${DSPARK_MODEL:-RadixArk/Kimi-K3-DSpark}"
 
