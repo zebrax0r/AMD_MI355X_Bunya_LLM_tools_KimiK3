@@ -477,9 +477,10 @@ if [[ "$MODE" == "pull" ]]; then
     fi
     pull_image \
         || die "apptainer pull failed. Does this node have outbound internet? Check APPTAINER_CACHEDIR space ($APPTAINER_CACHEDIR).
-     Note the default image is built from SGLang's unmerged 'kimi-k3' branch and
-     is pinned to a dated tag — if it has been removed, see the README
-     'When the branch merges' for how to pick a current one."
+     Note the default image comes from SGLang's 'kimi-k3' branch, which merged on
+     4 Aug 2026 and was deleted; that tag stream ended at ...k3-20260803 and is no
+     longer rebuilt. If the pinned tag has been removed, see the README
+     'Moving to a mainline image' for how to pick a current one."
     exit 0
 fi
 

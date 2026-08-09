@@ -208,8 +208,8 @@ df -h $MODEL_CACHE_DIR        # confirm ~1.7 TB free
 
 `check` reads `architectures` from the model's `config.json` and asks the
 image's own SGLang registry whether it knows `KimiK3ForConditionalGeneration`.
-It answers in seconds. **Do not skip it** — an image built from `main` rather
-than the `kimi-k3` branch will fail *after* you've moved 1.5 TB.
+It answers in seconds. **Do not skip it** — a mainline image built before K3
+merged on 4 Aug 2026 will fail *after* you've moved 1.5 TB.
 
 ### Step 4 — Serve
 
@@ -257,8 +257,8 @@ empty `content`, which looks like a broken server and is not. Give it room.
 
 ### Step 5b — Prove tool calling round-trips
 
-opencode's whole agentic loop rests on this, and `kimi_k3` is a new parser on an
-unmerged branch, so verify it rather than assume:
+opencode's whole agentic loop rests on this, and `kimi_k3` is a new parser that
+was still being revised after our pin, so verify it rather than assume:
 
 ```bash
 ./serve-kimik3.sh toolcheck        # exit 0 = pass
@@ -538,16 +538,67 @@ snapshot while the server read another. The preflight also checks the cached
 draft has a parseable `config.json` with a `model_type`, and says what to do
 rather than letting upstream raise the confusing error.
 
-**One caveat, unexplained.** A long-context opencode session (217k tokens) showed
-`accept len: 1.23, accept rate: 0.03` — speculation collapsing to nothing, where
-this 1k-token sweep gets ~5. Whether that is context length, workload content, or
-a warmup artefact of the first decode batch after prefill is not yet established.
-If DSpark seems to hurt in a long agentic session, measure before concluding: one
-decode line is not a benchmark. That mistake was made here once already.
-
 Note the throughput crossover: DSpark *loses* above ~concurrency 16 (3715 vs
 4898 tok/s at c=32). It is a latency optimisation for interactive use, not a
 throughput one.
+
+### DSpark inverts at long context — turn it off for agentic sessions
+
+**Every DSpark number in this README was measured at 1024 tokens of context.**
+By 100k the sign has flipped and DSpark costs several times more than it returns.
+Where between the two it crosses over has not been measured. Two sessions, both
+`#running-req: 1`:
+
+| Session | context | accept len | gen throughput |
+|---|---|---|---|
+| opencode | 217k | 1.23 | — |
+| kimicode, 9 Aug 2026 | 106k | 1.02–1.45 | **8.0–11.4 tok/s** |
+
+Divide throughput by accept length on every decode line of the second one and it
+is the same number to within 2%:
+
+```
+8.88/1.15=7.72   9.27/1.20=7.73   9.83/1.27=7.74   10.22/1.32=7.74
+8.68/1.12=7.75   8.49/1.10=7.72   8.03/1.02=7.87   11.35/1.45=7.83
+```
+
+**7.8 verify steps/s — 128 ms per step, flat.** The token rate is doing nothing
+but tracking accept length. Against this file's own c=2 bench (40.9 ms/step,
+accept 7.29) that is 3.1× the step cost for 6.3× fewer tokens: 19.7× total,
+predicting 9.1 tok/s where 8.0–11.4 was observed. The decomposition is exact,
+which is what makes this a diagnosis rather than a guess.
+
+`(accept_len − 1) / accept_rate` recovers the draft block: `(1.45−1)/0.06 = 7.5`,
+`(1.20−1)/0.03 = 6.7`. **The draft proposes ~7 tokens per step and ~0.15 survive.**
+So each 128 ms buys seven draft forwards plus an eight-token verify through the
+full model, and returns 1.15 tokens. Worse, the draft must attend over the same
+106k context on all seven passes, so **DSpark's cost grows faster with context
+than the target model's does** — that is the 3.1× step inflation, and it is why
+this cannot be tuned away by raising the block size.
+
+It is not memory pressure. Both sessions ran at `full token usage: 0.16` and
+`mamba usage: 0.03` — nothing is thrashing or being evicted.
+
+```bash
+# kimik3.env — for opencode / kimicode / anything that resends a large context
+export SPECULATIVE=""
+```
+
+**Not yet measured: plain decode at 100k.** Removing DSpark drops seven forwards
+per step, so it should be a large win — 20–40 tok/s is the expectation, and this
+file's non-DSpark baseline at 1k was 26.49 ms TPOT — but that is a prediction
+until someone resumes a ~100k session with `SPECULATIVE` unset and reads
+`gen throughput` off the same log line. Do that before quoting a figure.
+
+`/compact` appears to fix it, and does help for two real reasons — a smaller
+attention working set and a reset of whatever collapses the accept rate — but it
+is treating the symptom. At 106k you are using 11% of a 1M window and should not
+be at 8 tok/s.
+
+Why the accept rate collapses at all is still open. The draft's own effective
+context, or KDA state reconstruction on a radix-cache hit (`#cached-token:
+105344` with `#new-token: 18` is the normal shape of an agentic turn), are both
+plausible and neither is established here.
 
 ---
 
@@ -747,7 +798,7 @@ name is a silent regression rather than an error.
 what lets ReplaySSM coexist with the `extra_buffer` radix strategy we run. The
 script probes the image and refuses up front rather than letting you find out
 after a 1.5 TB load. To try it, pull a `20260731`-or-later K3 tag into a *second*
-`SIF_PATH` — see [When the branch merges](#when-the-branch-merges).
+`SIF_PATH` — see [Moving to a mainline image](#moving-to-a-mainline-image).
 
 #### Measured
 
@@ -864,7 +915,7 @@ and `presharded` (which removes the re-quantisation work entirely) is the lever.
 
 ---
 
-## Upstream drift — checked 5 Aug 2026
+## Upstream drift — checked 9 Aug 2026
 
 Everything here moves fast enough that a snapshot goes stale in days, so this
 section records **what was found and how to re-run the check**, not just the
@@ -875,10 +926,10 @@ answer.
 | | |
 |---|---|
 | Pinned here | `lmsysorg/sglang-rocm:rocm720-mi35x-k3-20260727` (29.2 GB, pushed 28 Jul) |
-| Newest K3 tag | `rocm720-mi35x-k3-20260803` — rebuilt **daily** since |
-| Upstream recommends | **still `rocm720-mi35x-k3-20260727`** — the dailies are unblessed |
+| Newest K3 tag | `rocm720-mi35x-k3-20260803` — **the last one. The stream stopped there** |
 | First tag with both sampling fixes | `rocm720-mi35x-k3-20260731` — see [the sampling landmine](#the-sampling-landmine--read-this-before-enabling-dspark) |
-| Mainline | PR #32541 **still open**, last touched 4 Aug. No mainline K3 image |
+| Mainline | **PR #32541 merged 4 Aug.** K3 is in `main`; the `kimi-k3` branch is deleted |
+| Mainline image | `v0.5.17-rocm720-mi35x-20260808` — the successor stream, built daily |
 | ROCm 7.14 | **no 7.14 + K3 image exists anywhere** |
 
 That last row is the one that matters for bun161. The 7.14 track is a separate
@@ -887,6 +938,42 @@ series of `*-rocm7_14-mi35x-test-*` tags, last built **20 Jul** at
 mirrors the same K3 tags, so there is no separate AMD build to try either. **The
 `ROCMINFO_SHIM` workaround stays necessary**, and waiting is still the right
 posture.
+
+### The branch merged, and the K3 image stream ended with it
+
+Checked 9 Aug 2026. **PR #32541 merged to `main` on 4 Aug**, and `kimi-k3` no
+longer exists as a branch — `repos/sgl-project/sglang/branches/kimi-k3` returns
+404, and nothing matching `heads/kimi-k3` remains except a handful of unrelated
+fix branches. `main` now carries `srt/models/kimi_k3.py` (first commit 4 Aug,
+still being worked on 9 Aug), the whole `srt/speculative/` dflash/dspark stack,
+`kernels/ops/sampling/renorm_triton.py`, and `_mla_decode_fwd_with_head_pad` in
+the aiter backend.
+
+The `rocm720-mi35x-k3-*` tags stopped the day before the merge: the last is
+**`20260803`**, and six days later there is no successor. That is not a pause,
+it is the branch stream being retired — mainline `v0.5.1x-rocm720-mi35x-*` tags
+have continued daily throughout, most recently `v0.5.17-rocm720-mi35x-20260808`.
+
+**So the pin is now on a dead stream**, which is exactly the risk
+[Moving to a mainline image](#moving-to-a-mainline-image) was written against.
+Mainline also settles the sampling landmine at the source — `main`'s
+`dflash_utils.py` binds both kernels under `is_hip()`:
+
+```python
+elif is_hip():
+    from sglang.kernels.ops.sampling.renorm_triton import (
+        top_k_renorm_probs_triton as top_k_renorm_prob,
+    )
+    from sglang.kernels.ops.sampling.renorm_triton import (
+        top_p_renorm_probs_triton as top_p_renorm_prob,
+    )
+```
+
+Nothing here has been run against a mainline image yet, so this is a migration to
+plan and measure, not to make in place. Use a second `SIF_PATH` and the procedure
+in [Moving to a mainline image](#moving-to-a-mainline-image) — `check` and `parsers`
+first, then a full re-bench, because **every number in this file was taken on
+`20260727`** and none of them transfer by assumption.
 
 Branch commits between the pinned build and 2 Aug worth knowing about:
 
@@ -913,16 +1000,18 @@ upstream's verification of this hardware, not behind it.
 
 PR [#33341](https://github.com/sgl-project/sglang/pull/33341), *"[AMD] Enable
 aiter MLA for 12-head models via 12→16 zero-pad (Kimi-K3)"*, opened 3 Aug by AMD.
-**Open, `mergeable_state: blocked`, and targeting `main` rather than the
-`kimi-k3` branch** — so it is in no image today, and `ATTENTION_BACKEND=triton`
-stays the right setting. Nothing to do but watch it.
+**Still open at the 9 Aug check, and now `mergeable_state: dirty`** — it has
+conflicts and has not been touched since the day it opened. It targets `main`,
+which is where K3 lives now, so it is no longer aimed at a side branch; it is
+simply stalled. It is in no image today, and `ATTENTION_BACKEND=triton` stays the
+right setting.
 
 K3 at TP8 gives each rank 12 attention heads, and AITER's MLA kernels want 16.
-The `kimi-k3` branch already pads for **decode** (`_mla_decode_fwd_with_head_pad`);
-the gap this PR closes is the absorbed **prefill** path, plus a non-power-of-2
-head mask in `cache_ops` and a NoPE guard for K3's `skip_rope`. That makes it a
-**TTFT lever, not an aggregate-throughput one** — which is exactly the axis
-`bench-kimik3.sh throughput` does not measure.
+Both the old branch and `main` already pad for **decode**
+(`_mla_decode_fwd_with_head_pad`); the gap this PR closes is the absorbed
+**prefill** path, plus a non-power-of-2 head mask in `cache_ops` and a NoPE guard
+for K3's `skip_rope`. That makes it a **TTFT lever, not an aggregate-throughput
+one** — which is exactly the axis `bench-kimik3.sh throughput` does not measure.
 
 Its numbers, 8×MI355X TP8, `--attention-backend aiter` vs `triton`:
 
@@ -935,9 +1024,38 @@ Its numbers, 8×MI355X TP8, `--attention-backend aiter` vs `triton`:
 
 Note how little it does at short context and how much at long: this matters for
 agentic sessions that resend a large context every turn, and barely at all for
-the 1024/512 shape every table in this README uses. If it merges and reaches a
-K3 image, it is worth a `check` + `parsers` + full re-bench in a second
-`SIF_PATH` — and worth re-benching at 10k input, not just 1024.
+the 1024/512 shape every table in this README uses. If it merges and reaches an
+image, it is worth a `check` + `parsers` + full re-bench in a second `SIF_PATH` —
+and worth re-benching at 10k input, not just 1024.
+
+#### The half of it we might already have — aiter for decode only
+
+The decode head-pad is present in the pinned image's own `aiter_backend.py`, so
+the prefill gap need not block the decode path: SGLang takes
+`--prefill-attention-backend` / `--decode-attention-backend`, and they override
+the global `--attention-backend`. That is reachable today with no code change,
+because `EXTRA_ENGINE_ARGS` is passed through verbatim:
+
+```bash
+# kimik3.env — UNTESTED, use a throwaway allocation
+export EXTRA_ENGINE_ARGS="--decode-attention-backend aiter --prefill-attention-backend triton"
+```
+
+Probe first; if either command comes back empty, the image cannot do it:
+
+```bash
+apptainer exec "$SIF_PATH" grep -c _mla_decode_fwd_with_head_pad \
+  /sgl-workspace/sglang/python/sglang/srt/layers/attention/aiter_backend.py
+apptainer exec "$SIF_PATH" python -m sglang.launch_server --help 2>&1 \
+  | grep -- --decode-attention-backend
+```
+
+The 128 ms decode step behind
+[the long-context collapse](#dspark-inverts-at-long-context--turn-it-off-for-agentic-sessions)
+is partly this kernel — #33341 measures triton's mean TPOT at 25.9 ms against
+aiter's 6.97 ms at 10k input. **This has not been run.** A wrong attention kernel
+produces fluent gibberish rather than a crash, so `parsers` and `toolcheck` are
+mandatory before believing any throughput number it produces.
 
 ### Weights
 
@@ -959,11 +1077,15 @@ for m in moonshotai/Kimi-K3 RadixArk/Kimi-K3-DSpark; do
     | python3 -c "import json,sys;d=json.load(sys.stdin);print('$m', d['lastModified'][:10], d['sha'][:8])"
 done
 
-# has the branch merged yet? and has the AITER prefill PR landed?
+# has the AITER prefill PR landed? (#32541 merged 4 Aug; kept for the record)
 for pr in 32541 33341; do
   curl -s "https://api.github.com/repos/sgl-project/sglang/pulls/$pr" \
     | python3 -c "import json,sys;d=json.load(sys.stdin);print(d['number'], d['state'], d['merged_at'], '->', d['base']['ref'])"
 done
+
+# did the k3 image stream ever restart? (404 on the branch = still retired)
+curl -s -o /dev/null -w '%{http_code}\n' \
+  "https://api.github.com/repos/sgl-project/sglang/branches/kimi-k3"
 
 # does a candidate image actually carry the HIP renorm kernels?
 # (empty output = it does not; this is the DSpark sampling landmine)
@@ -973,13 +1095,17 @@ apptainer exec "$SIF_PATH" grep -o 'top_[kp]_renorm_probs_triton' \
 
 ---
 
-## When the branch merges
+## Moving to a mainline image
 
-The default image is built from SGLang's **unmerged `kimi-k3` branch**
-(PR #32541) and pinned to a dated tag. That is fine for now but is not a
-long-term footing: pre-merge tags can be rebuilt or removed.
+The default image is built from SGLang's `kimi-k3` branch (PR #32541) and pinned
+to a dated tag. **That branch merged on 4 Aug 2026 and was deleted, and its image
+stream ended at `rocm720-mi35x-k3-20260803`** — see
+[the drift section](#the-branch-merged-and-the-k3-image-stream-ended-with-it).
+The pin still works, and every measurement in this file was taken on it, but it
+is now a dead tag on a retired stream. Migrating is a matter of when, not
+whether.
 
-Once #32541 merges to `main`, switch to a mainline image and re-verify:
+Never migrate in place. Point at a second `.sif` so the working one survives:
 
 ```bash
 # check what's current:
@@ -992,8 +1118,10 @@ export SIF_PATH="$MODEL_CACHE_DIR/kimik3-mi355x-new.sif"
 ./serve-kimik3.sh pull && ./serve-kimik3.sh check     # must still know KimiK3ForConditionalGeneration
 ```
 
-Revert those two variables if anything regresses. Same procedure for trying any
-newer image.
+Then `parsers`, then `toolcheck`, then a full `bench-kimik3.sh sweep` — a
+mainline image changes the attention, sampling and speculative paths at once, so
+nothing in this file's tables carries over by assumption. Revert those two
+variables if anything regresses. Same procedure for trying any newer image.
 
 ---
 
@@ -1219,7 +1347,7 @@ All knobs live in `kimik3.env` (copied from `kimik3-env.example`). Anything you
   a confusing failure much later.
 - **Server exits with an unknown-architecture error**: the image predates K3
   support. Run `./serve-kimik3.sh check` — it names exactly which architectures
-  the image knows. See [When the branch merges](#when-the-branch-merges).
+  the image knows. See [Moving to a mainline image](#moving-to-a-mainline-image).
 - **Server exits on an argparse error about a parser name**: run
   `./serve-kimik3.sh parsers`. K3 uses `kimi_k3`, **not** `kimi_k2`.
 - **Unknown-flag error on `--cuda-graph-max-bs`**: that flag was removed; the

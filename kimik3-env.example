@@ -43,10 +43,15 @@ export SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-kimi-k3}"
 
 # SGLang's day-0 AMD image for Kimi K3 on gfx950 (issue #32548).
 #
-# NOTE: this is built from the unmerged 'kimi-k3' branch (PR #32541), not from
-# main. It is pinned to a dated tag on purpose. Once that PR merges, move to a
-# mainline lmsysorg/sglang-rocm:*-mi35x-* tag and re-verify with
-# './serve-kimik3.sh check'. See the README "When the branch merges".
+# NOTE: this is built from the 'kimi-k3' branch (PR #32541), not from main. It
+# is pinned to a dated tag on purpose, and every measurement in the README was
+# taken on it. THAT BRANCH MERGED ON 4 AUG 2026 AND WAS DELETED; its image stream
+# ended at rocm720-mi35x-k3-20260803 and has not been rebuilt since. The
+# successor is the mainline lmsysorg/sglang-rocm:v0.5.1x-rocm720-mi35x-* series.
+# Migrate into a SECOND SIF_PATH and re-verify with './serve-kimik3.sh check',
+# then 'parsers', 'toolcheck' and a full bench — a mainline image moves the
+# attention, sampling and speculative paths at once. See the README, "Moving to
+# a mainline image".
 #
 # The image ships its OWN ROCm (7.2 in this tag). It does not have to match the
 # node's, but the further apart they drift the more likely GPU passthrough
@@ -166,7 +171,16 @@ export REASONING_PARSER="${REASONING_PARSER:-kimi_k3}"
 #   concurrency 2:  median TPOT 20.86 ms -> 8.94 ms, 820 -> 1659 tok/s
 #   accept length ~5.3-5.9 tokens per step
 #
-# Default OFF, and there is a sharper reason than "one failure at a time".
+# BUT THOSE ARE 1024-TOKEN NUMBERS, AND THE SIGN FLIPS AT LONG CONTEXT. Measured
+# here on 9 Aug 2026 at 106k context, one request: accept length collapses to
+# 1.02-1.45 against 7.29 in the bench, and throughput sits at 8-11 tok/s. The
+# draft still proposes 7 tokens per step (see DSPARK_BLOCK_SIZE below) and ~0.15
+# survive, and it pays full attention over the whole context on all 7 passes —
+# so DSpark gets MORE expensive as context grows while returning less. Leave this
+# empty for opencode / kimicode / anything that resends a large context each
+# turn. See the README, 'DSpark inverts at long context'.
+#
+# Default OFF, and there is a sharper reason still than "one failure at a time".
 #
 # THE PINNED IMAGE HAS A LIVE SAMPLING BUG (sglang #32569). DSpark's verify step
 # calls top_k_renorm_prob / top_p_renorm_prob; on ROCm those are bound by an
