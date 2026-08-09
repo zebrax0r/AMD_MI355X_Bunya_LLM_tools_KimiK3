@@ -584,13 +584,11 @@ It is not memory pressure. Both sessions ran at `full token usage: 0.16` and
 export SPECULATIVE=""
 ```
 
-**Not yet measured: plain decode at 100k.** Removing DSpark drops seven forwards
-per step, so it should be a large win — 20–40 tok/s is the expectation, and this
-file's non-DSpark baseline at 1k was 26.49 ms TPOT — but that is a prediction,
-and predictions do not belong in tables. `./bench-kimik3.sh longcontext` runs
-exactly this shape; see
-[Long context](#long-context--the-regime-this-repo-has-never-benchmarked) for the
-DSpark-on/off pair and the table to fill in.
+**Measured, bun160, 9 Aug 2026: turning DSpark off is worth 2.93× at 100k** —
+median TPOT 87.38 → 29.83 ms, decode 11.4 → 33.5 tok/s, with TTFT unchanged.
+Full numbers, the ITL distribution, and what they say about where the 121.5 ms
+actually goes are in
+[Long context](#long-context--the-regime-this-repo-has-never-benchmarked).
 
 `/compact` appears to fix it, and does help for two real reasons — a smaller
 attention working set and a reset of whatever collapses the accept rate — but it
@@ -680,8 +678,8 @@ dominates it, so it says more about TTFT than about decode.
 
 | Config | context | median TPOT | decode tok/s | median TTFT | accept len |
 |---|---|---|---|---|---|
-| DSpark on *(the pin's default)* | 100k | **87.38 ms** | 11.4 | 15.5 s | 1.39 |
-| `SPECULATIVE=""` | 100k | | | | |
+| DSpark on *(the pin's default)* | 100k | 87.38 ms | 11.4 | 15.5 s | 1.39 |
+| **`SPECULATIVE=""`** | 100k | **29.83 ms** | **33.5** | 15.4 s | — |
 | `SPECULATIVE=""` + aiter decode backend | 100k | | | | |
 | best of the above | 32k | | | | |
 | best of the above, mainline image | 100k | | | | |
@@ -704,9 +702,50 @@ opencode users experience; quote it as what
 [AITER MLA prefill](#the-biggest-lever-we-cannot-pull-yet--aiter-mla-prefill)
 would attack.
 
+**Turning DSpark off is worth 2.93× at 100k.** TTFT moved 1% (15359 vs 15526 ms)
+— prefill never touches the draft, which is the control that makes the TPOT
+comparison trustworthy.
+
+The inter-token latency distribution confirms the mechanism outright:
+
+| | median ITL | P90 ITL | max ITL |
+|---|---|---|---|
+| DSpark on | 61.19 ms | 121.95 ms | 126.23 ms |
+| `SPECULATIVE=""` | 29.84 ms | 30.05 ms | 31.28 ms |
+
+DSpark's ITL is **bimodal at 121.5 ÷ 1 and 121.5 ÷ 2** — steps that accepted one
+token and steps that accepted two, against the 121.5 ms step time computed
+independently from run A. Turning it off also removes a 2× latency jitter that
+the means do not show, which for interactive use matters on its own.
+
+#### K3's decode is nearly context-independent — the earlier claim was wrong
+
+This file previously attributed the long-context decode step to the triton MLA
+kernel. **That is false.** The 1024-token baseline is 26.49 ms TPOT; at 100× the
+context it is 29.83 ms — 13% slower. That fits the architecture: KDA on every
+layer but the 4th, so only a quarter of the layers carry a growing KV read.
+
+So run A's 121.5 ms step was almost entirely *the draft*: the verify pass is
+~30 ms (a target forward; 8 tokens versus 1 barely matters when decode is
+memory-bound), leaving ~91 ms for seven draft forwards at ~13 ms each. A draft
+model costing 43% of a full K3 forward is the whole story, and no attention
+backend fixes it.
+
+Two consequences:
+
+- **The aiter decode backend has little headroom.** At most ~11% separates 100k
+  decode from 1k decode, so row 3 is now a small experiment, not a lever.
+- **The remaining long-context weakness is prefill, not decode** — the 15.5 s
+  cold TTFT, which is
+  [AITER MLA prefill](#the-biggest-lever-we-cannot-pull-yet--aiter-mla-prefill)
+  territory and unavailable. In normal agentic use the radix cache means you
+  rarely pay it.
+
 `BENCH_REPEATS=1` here, so there are no error bars. That is acceptable only
 because the effect being tested is multiples, not percent — tighten it before
-claiming any difference under ~20%.
+claiming any difference under ~20%. The 2.93× is far outside anything n=4 noise
+could produce; the 13% context penalty above is **not**, and should be re-run
+before it is relied on.
 
 ### Does the node's ROCm version matter? (unresolved)
 
@@ -1121,12 +1160,16 @@ apptainer exec "$SIF_PATH" python -m sglang.launch_server --help 2>&1 \
   | grep -- --decode-attention-backend
 ```
 
-The 128 ms decode step behind
-[the long-context collapse](#dspark-inverts-at-long-context--turn-it-off-for-agentic-sessions)
-is partly this kernel — #33341 measures triton's mean TPOT at 25.9 ms against
-aiter's 6.97 ms at 10k input. **This has not been run.** A wrong attention kernel
-produces fluent gibberish rather than a crash, so `parsers` and `toolcheck` are
-mandatory before believing any throughput number it produces.
+**Expect little from it, on this repo's own measurements.** An earlier version of
+this section attributed the long-context decode step to this kernel. The 9 Aug
+run refuted that: decode TPOT is 26.49 ms at 1k and 29.83 ms at 100k, so at most
+~11% is on the table for decode no matter which kernel serves it. #33341's
+25.9 → 6.97 ms TPOT figure is measured at c=16, where contention with prefill
+dominates — it is not a c=1 decode result and should not be read as one.
+
+Worth running as a cheap experiment, not as a lever. **It has not been run.** A
+wrong attention kernel produces fluent gibberish rather than a crash, so
+`parsers` and `toolcheck` are mandatory before believing any number it produces.
 
 ### Weights
 
