@@ -45,6 +45,16 @@ for arg in "$@"; do
     esac
 done
 
+# Capture the shape the CALLER asked for, before kimik3.env is sourced.
+# kimik3-env.example ships 'export BENCH_INPUT_LEN="${BENCH_INPUT_LEN:-1024}"',
+# so every real config file sets all of these unconditionally. Once it has been
+# sourced, "${BENCH_INPUT_LEN:-100000}" can no longer tell a deliberate 1024
+# from a config-file default — which silently ran 'longcontext' at 1024/512
+# c=2/8/32 on 9 Aug 2026. A named shape mode has to outrank the config file.
+for _v in BENCH_INPUT_LEN BENCH_OUTPUT_LEN BENCH_NUM_PROMPTS BENCH_CONCURRENCY; do
+    declare "CLI_$_v=${!_v:-}"
+done
+
 log()  { printf '\033[1;34m[bench]\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m[bench WARN]\033[0m %s\n' "$*" >&2; }
 die()  { printf '\033[1;31m[bench ERROR]\033[0m %s\n' "$*" >&2; exit 1; }
@@ -78,10 +88,14 @@ if [[ "$MODE" == "longcontext" ]]; then
     # n=4, not 200: at 100k a single prefill is measured in tens of seconds, so
     # 200 prompts is an overnight job that nobody will run twice. Four is enough
     # to see TPOT, and TTFT here is a headline number rather than a warmup cost.
-    BENCH_INPUT_LEN="${BENCH_INPUT_LEN:-100000}"
-    BENCH_OUTPUT_LEN="${BENCH_OUTPUT_LEN:-512}"
-    BENCH_NUM_PROMPTS="${BENCH_NUM_PROMPTS:-4}"
-    BENCH_CONCURRENCY="${BENCH_CONCURRENCY:-1}"
+    #
+    # CLI_* — the pre-source capture — not the post-source values, so that
+    # 'BENCH_INPUT_LEN=32768 ./bench-kimik3.sh longcontext' still works while a
+    # kimik3.env carrying the sweep shape does not silently override the mode.
+    BENCH_INPUT_LEN="${CLI_BENCH_INPUT_LEN:-100000}"
+    BENCH_OUTPUT_LEN="${CLI_BENCH_OUTPUT_LEN:-512}"
+    BENCH_NUM_PROMPTS="${CLI_BENCH_NUM_PROMPTS:-4}"
+    BENCH_CONCURRENCY="${CLI_BENCH_CONCURRENCY:-1}"
 else
     BENCH_INPUT_LEN="${BENCH_INPUT_LEN:-1024}"
     BENCH_OUTPUT_LEN="${BENCH_OUTPUT_LEN:-512}"
@@ -190,21 +204,43 @@ fi
 
 # ── Which bench module does this image have? ────────────────────────────────
 # Upstream moved the implementation to sglang.benchmark.serving and left
-# sglang.bench_serving as a shim whose own FutureWarning says it "will be
-# removed in a future release". The pinned 20260727 image predates the move, a
-# mainline image has both, and a later one will have only the new path — so
-# probe rather than hardcode, or this breaks during the mainline migration with
-# a "No module named" that looks like a broken image.
+# sglang.bench_serving as a shim. PREFER THE OLD PATH WHEREVER IT EXISTS.
 #
-# find_spec, not import: importing it drags in torch and prints banners.
-BENCH_MODULE="sglang.bench_serving"
-if apptainer exec "$SIF_PATH" python3 -c \
-     'import importlib.util,sys; sys.exit(0 if importlib.util.find_spec("sglang.benchmark.serving") else 1)' \
-     2>/dev/null; then
-    BENCH_MODULE="sglang.benchmark.serving"
+# Measured 9 Aug 2026, and it cost a run: the pinned 20260727 image carries
+# BOTH, and the new module imports disaggregation.utils -> quantization ->
+# aiter at module scope, which the old one never touches. This benchmark is a
+# pure HTTP client that needs no GPU and no kernels, so the lighter import
+# chain is not just the safer choice, it is the correct one. Presence is not
+# usability; only switch when there is nothing else to run.
+BENCH_MODULE="${BENCH_MODULE:-}"
+if [[ -z "$BENCH_MODULE" ]]; then
+    BENCH_MODULE="sglang.bench_serving"
+    # find_spec, not import: importing drags in torch and prints banners.
+    if ! apptainer exec "$SIF_PATH" python3 -c \
+         'import importlib.util,sys; sys.exit(0 if importlib.util.find_spec("sglang.bench_serving") else 1)' \
+         2>/dev/null; then
+        BENCH_MODULE="sglang.benchmark.serving"
+        warn "This image has no sglang.bench_serving; falling back to $BENCH_MODULE."
+        warn "  That module imports aiter at module scope. If it dies in aiter's"
+        warn "  jit/core.py, AITER_JIT_DIR is the culprit — see below."
+    fi
 fi
 log "Bench module: $BENCH_MODULE"
 echo "# bench_module=$BENCH_MODULE" >> "$OUT_FILE"
+
+# aiter's get_user_jit_dir() branches on `"AITER_JIT_DIR" in os.environ`, NOT on
+# whether it has a value, then calls os.makedirs("") on an empty one:
+#
+#     FileNotFoundError: [Errno 2] No such file or directory: ''
+#
+# kimik3-env.example ships 'export AITER_JIT_DIR="${AITER_JIT_DIR:-}"', and
+# apptainer passes the host environment straight through, so sourcing the config
+# is enough to poison any import of aiter inside the container. serve-kimik3.sh
+# resolves this to a real path and never sees it; this script did not. Resolve it
+# the same way, and bind it so the container can actually write there.
+AITER_JIT_DIR="${AITER_JIT_DIR:-$MODEL_CACHE_DIR/aiter-jit}"
+bench_binds=()
+[[ -d "$AITER_JIT_DIR" ]] && bench_binds+=(--bind "$AITER_JIT_DIR")
 
 # ── One benchmark run ───────────────────────────────────────────────────────
 # $1 = max concurrency, $2 = request rate ("inf" to saturate)
@@ -217,6 +253,8 @@ run_one() {
     # shellcheck disable=SC2086  # intentional splitting of BENCH_EXTRA_ARGS
     apptainer exec \
         --env "OPENAI_API_KEY=${KIMIK3_API_KEY:-}" \
+        --env "AITER_JIT_DIR=$AITER_JIT_DIR" \
+        ${bench_binds[@]+"${bench_binds[@]}"} \
         "$SIF_PATH" \
         python3 -m "$BENCH_MODULE" \
             --backend sglang-oai \

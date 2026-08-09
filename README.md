@@ -649,8 +649,12 @@ net loss at 106k — see
 Nothing here should be assumed to transfer across that gap in either direction.
 
 `./bench-kimik3.sh longcontext` measures the agentic shape: 100k in / 512 out at
-concurrency 1, `n=4`, `--random-range-ratio 1.0`. It only changes the defaults,
-so `BENCH_INPUT_LEN=32768 ./bench-kimik3.sh longcontext` works for a mid-point.
+concurrency 1, `n=4`, `--random-range-ratio 1.0`. A `BENCH_*` set **in the
+environment** still wins, so `BENCH_INPUT_LEN=32768 ./bench-kimik3.sh longcontext`
+works for a mid-point — but the shape in `kimik3.env` does not, because
+`kimik3-env.example` ships the sweep shape and every real config file therefore
+sets it. A named shape mode outranks the config file; the first version of this
+did not, and silently ran at 1024/512 c=2/8/32.
 It refuses to start if the shape exceeds a set `CONTEXT_LEN`, and warns when
 `SPECULATIVE=dspark`, because the DSpark/no-DSpark **pair** is the measurement —
 one run on its own says nothing.
@@ -1474,6 +1478,23 @@ All knobs live in `kimik3.env` (copied from `kimik3-env.example`). Anything you
   SGLang pins to CPUs from the *full* node topology, which fails under a SLURM
   cgroup owning a subset of cores. The script forces `0` by default. Set
   `SET_CPU_AFFINITY=1` only with `--cpus-per-task=384` / `--exclusive`.
+- **Benchmark dies in `aiter/jit/core.py` with `FileNotFoundError: [Errno 2] No
+  such file or directory: ''`** — *hit for real on 9 Aug 2026.* Nothing is
+  missing; an **empty but set** variable is. aiter's `get_user_jit_dir()`
+  branches on `"AITER_JIT_DIR" in os.environ` rather than on whether it has a
+  value, then calls `os.makedirs("")`. `kimik3-env.example` ships
+  `export AITER_JIT_DIR="${AITER_JIT_DIR:-}"`, and Apptainer passes the host
+  environment straight through, so merely sourcing the config poisons any import
+  of aiter inside the container. `serve-kimik3.sh` resolves it to a real path and
+  never sees this; `bench-kimik3.sh` now does the same and binds it.
+
+  It only surfaces on the code path that imports aiter at all.
+  `sglang.bench_serving` never does; `sglang.benchmark.serving` — the module
+  upstream moved to — imports `disaggregation.utils` → quantization → aiter at
+  module scope. The bench is a pure HTTP client needing no GPU and no kernels, so
+  it **prefers the old path wherever it exists** and only falls back when the
+  image has nothing else. Set `BENCH_MODULE` to force one. The resolved name is
+  recorded in every results file.
 - **Crash at graph capture: `[Errno 30] Read-only file system:
   '.../aiter/jit/flydsl_cache/...'`** — *hit for real on 28 Jul 2026.* The FP4
   MoE JIT-compiles FlyDSL kernels at CUDA-graph capture and writes them into
