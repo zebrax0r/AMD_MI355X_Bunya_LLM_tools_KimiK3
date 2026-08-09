@@ -1192,6 +1192,31 @@ All knobs live in `kimik3.env` (copied from `kimik3-env.example`). Anything you
 ## Notes & troubleshooting
 
 - **"apptainer not found"**: you're on a login node. Start an allocation first.
+- **`apptainer pull` dies in `mksquashfs` with `proot error: ptrace(TRACEME):
+  Operation not permitted`** — nothing to do with the image, the network, or
+  disk space. Apptainer **1.5.0** (6 May 2026) started wrapping `mksquashfs` in a
+  bundled `proot` so an unprivileged build preserves file ownership out of the
+  OCI registry; proot works by `ptrace`, so it fails outright on a host that
+  refuses `ptrace(PTRACE_TRACEME)` (yama `ptrace_scope=3`, a seccomp filter, some
+  SELinux policies). Apptainer **1.5.3** (21 Jul 2026) downgraded this to an INFO
+  message and carries on, so only the 1.5.0–1.5.2 window is affected — check with
+  `apptainer --version`.
+
+  `serve-kimik3.sh` now detects it and retries as
+  `apptainer build --ignore-proot`, so a plain `./serve-kimik3.sh pull` should
+  just work. `--ignore-proot` is a hidden flag that restores the pre-1.5.0
+  behaviour: ownership inside the SIF is not preserved, which costs nothing here
+  because the image is mounted read-only and the processes run as you. To do it
+  by hand:
+
+  ```bash
+  apptainer build --ignore-proot "$SIF_PATH" "$SGLANG_IMAGE"
+  ```
+
+  A failed pull can leave a **truncated `.sif`** behind, and the "is the image
+  present?" test is only `[[ -f ]]` — so if you hit this before updating, delete
+  `$SIF_PATH` before retrying or you will get "Image already present" followed by
+  a confusing failure much later.
 - **Server exits with an unknown-architecture error**: the image predates K3
   support. Run `./serve-kimik3.sh check` — it names exactly which architectures
   the image knows. See [When the branch merges](#when-the-branch-merges).

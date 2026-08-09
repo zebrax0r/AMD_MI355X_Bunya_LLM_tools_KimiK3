@@ -399,6 +399,75 @@ export APPTAINER_CACHEDIR APPTAINER_TMPDIR
 export SINGULARITY_CACHEDIR="$APPTAINER_CACHEDIR"
 export SINGULARITY_TMPDIR="$APPTAINER_TMPDIR"
 
+# ── Building the .sif ───────────────────────────────────────────────────────
+
+# Apptainer 1.5.0 (6 May 2026) started wrapping mksquashfs in a bundled `proot`
+# so that an unprivileged build preserves the original owners and groups of files
+# coming out of an OCI registry. proot works by ptrace, so on a host that refuses
+# ptrace(PTRACE_TRACEME) — yama ptrace_scope=3, a seccomp filter, some SELinux
+# policies — the pull dies with:
+#
+#   proot error: ptrace(TRACEME): Operation not permitted
+#   ... mksquashfs command failed: exit status 1
+#
+# Apptainer 1.5.3 (21 Jul 2026) turned that into an INFO message and carries on,
+# so this only bites the 1.5.0–1.5.2 window. The escape hatch is the hidden
+# `--ignore-proot` build flag, which drops back to exactly the pre-1.5.0
+# behaviour: ownership inside the SIF is not preserved. That costs us nothing —
+# we mount the image read-only and run as ourselves — and it is how every
+# unprivileged Apptainer build worked before May 2026.
+#
+# Note --ignore-proot is registered on `build`, NOT on `pull`, so the retry has
+# to switch subcommand. `build <sif> docker://…` is otherwise equivalent.
+pull_image() {
+    local logf rc
+    logf="$(mktemp "${APPTAINER_TMPDIR:-/tmp}/kimik3-pull.XXXXXX.log")"
+    log "Pulling $SGLANG_IMAGE -> $SIF_PATH (multi-GB; one-time) ..."
+
+    # tee, not command substitution: this downloads ~29 GB and the progress bar
+    # has to stay on screen. PIPESTATUS[0] to get apptainer's status rather than
+    # tee's — and read via if/else, because a trailing `|| true` would run a new
+    # command and reset PIPESTATUS to 0, i.e. silently swallow every failure.
+    if apptainer pull "$SIF_PATH" "$SGLANG_IMAGE" 2>&1 | tee "$logf"; then rc=0; else rc=${PIPESTATUS[0]}; fi
+    if (( rc == 0 )); then
+        rm -f "$logf"
+        log "Image ready: $SIF_PATH"
+        return 0
+    fi
+
+    # A failed pull can leave a truncated .sif behind, and every later check in
+    # this script is just [[ -f ]]. Clear it on any failure so the next run
+    # retries instead of reporting "already present" and dying hours later.
+    rm -f "$SIF_PATH"
+
+    if ! grep -qi 'proot\|ptrace' "$logf"; then
+        rm -f "$logf"
+        return "$rc"
+    fi
+
+    warn "Apptainer could not use proot on this host (ptrace is not permitted here)."
+    warn "Retrying with --ignore-proot; the image is identical apart from file"
+    warn "ownership inside it, which we do not rely on."
+    if PROOT_NO_SECCOMP=1 apptainer build --ignore-proot "$SIF_PATH" "$SGLANG_IMAGE" 2>&1 | tee "$logf"
+    then rc=0; else rc=${PIPESTATUS[0]}; fi
+    if (( rc == 0 )); then
+        rm -f "$logf"
+        log "Image ready: $SIF_PATH (built with --ignore-proot)."
+        return 0
+    fi
+    rm -f "$SIF_PATH"
+
+    if grep -qi 'unknown flag' "$logf"; then
+        rm -f "$logf"
+        die "This Apptainer predates --ignore-proot (added in 1.5.0) yet failed inside
+  proot, which should not happen. Report it with the output above.
+  Workaround: build the .sif on a host that allows ptrace, then copy it to
+  $SIF_PATH and re-run."
+    fi
+    rm -f "$logf"
+    return "$rc"
+}
+
 # ── Pull mode: build the .sif from the container image ──────────────────────
 
 if [[ "$MODE" == "pull" ]]; then
@@ -406,22 +475,19 @@ if [[ "$MODE" == "pull" ]]; then
         log "Image already present: $SIF_PATH (delete it to re-pull)."
         exit 0
     fi
-    log "Pulling $SGLANG_IMAGE -> $SIF_PATH (multi-GB; one-time) ..."
-    apptainer pull "$SIF_PATH" "$SGLANG_IMAGE" \
+    pull_image \
         || die "apptainer pull failed. Does this node have outbound internet? Check APPTAINER_CACHEDIR space ($APPTAINER_CACHEDIR).
      Note the default image is built from SGLang's unmerged 'kimi-k3' branch and
      is pinned to a dated tag — if it has been removed, see the README
      'When the branch merges' for how to pick a current one."
-    log "Image ready: $SIF_PATH"
     exit 0
 fi
 
 # For every remaining mode we need the .sif. Auto-build it if missing.
 if [[ ! -f "$SIF_PATH" ]]; then
     log "No .sif at $SIF_PATH yet — pulling it now (one-time)."
-    apptainer pull "$SIF_PATH" "$SGLANG_IMAGE" \
+    pull_image \
         || die "apptainer pull failed. Run './serve-kimik3.sh pull' explicitly to debug."
-    log "Image ready: $SIF_PATH"
 fi
 
 # Resolve HF token: env var, then token file.
