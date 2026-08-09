@@ -161,6 +161,10 @@ STAMP="$(date +%Y%m%d-%H%M%S)"
 OUT_FILE="$BENCH_DIR/${STAMP}-${MODE}.txt"
 {
     echo "# kimik3 benchmark  $(date)"
+    # Record the node. Measured 29 Jul 2026, bun161 vs bun159 differed by 5-10%
+    # on the same image and config, so a result without a hostname cannot be
+    # compared against one taken somewhere else.
+    echo "# host=$(hostname -s 2>/dev/null || echo '?')  rocm=$(cat /opt/rocm/.info/version 2>/dev/null || echo '?')"
     echo "# mode=$MODE model=$SERVED_MODEL_NAME port=$PORT"
     echo "# MODEL_ID=${MODEL_ID:-?}  IMAGE=${SGLANG_IMAGE:-?}"
     echo "# in=$BENCH_INPUT_LEN out=$BENCH_OUTPUT_LEN num_prompts=$BENCH_NUM_PROMPTS"
@@ -184,6 +188,24 @@ if [[ "$MODE" == "longcontext" ]]; then
     fi
 fi
 
+# ── Which bench module does this image have? ────────────────────────────────
+# Upstream moved the implementation to sglang.benchmark.serving and left
+# sglang.bench_serving as a shim whose own FutureWarning says it "will be
+# removed in a future release". The pinned 20260727 image predates the move, a
+# mainline image has both, and a later one will have only the new path — so
+# probe rather than hardcode, or this breaks during the mainline migration with
+# a "No module named" that looks like a broken image.
+#
+# find_spec, not import: importing it drags in torch and prints banners.
+BENCH_MODULE="sglang.bench_serving"
+if apptainer exec "$SIF_PATH" python3 -c \
+     'import importlib.util,sys; sys.exit(0 if importlib.util.find_spec("sglang.benchmark.serving") else 1)' \
+     2>/dev/null; then
+    BENCH_MODULE="sglang.benchmark.serving"
+fi
+log "Bench module: $BENCH_MODULE"
+echo "# bench_module=$BENCH_MODULE" >> "$OUT_FILE"
+
 # ── One benchmark run ───────────────────────────────────────────────────────
 # $1 = max concurrency, $2 = request rate ("inf" to saturate)
 
@@ -196,7 +218,7 @@ run_one() {
     apptainer exec \
         --env "OPENAI_API_KEY=${KIMIK3_API_KEY:-}" \
         "$SIF_PATH" \
-        python3 -m sglang.bench_serving \
+        python3 -m "$BENCH_MODULE" \
             --backend sglang-oai \
             --base-url "http://127.0.0.1:${PORT}" \
             --model "$SERVED_MODEL_NAME" \
