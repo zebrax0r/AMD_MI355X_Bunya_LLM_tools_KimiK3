@@ -9,10 +9,19 @@
 #   ./bench-kimik3.sh                 sweep concurrency 2/8/32 (default)
 #   ./bench-kimik3.sh latency         single-stream latency only (concurrency 1)
 #   ./bench-kimik3.sh throughput      saturate at BENCH_MAX_CONCURRENCY
+#   ./bench-kimik3.sh longcontext     100k in / 512 out, concurrency 1
 #
 # Tunables (env or kimik3.env): BENCH_INPUT_LEN, BENCH_OUTPUT_LEN, BENCH_NUM_PROMPTS,
 #   BENCH_CONCURRENCY (space-separated list for sweep), BENCH_MAX_CONCURRENCY,
 #   BENCH_EXTRA_ARGS (appended verbatim to sglang.bench_serving).
+#
+# 'longcontext' exists because every other shape here is 1024/512, and the
+# agentic clients this repo is built for resend 100k+ every turn. Those are
+# different regimes, not the same regime scaled: measured 9 Aug 2026, DSpark
+# turns from a 3.1x win at 1024 into a ~4x loss at 106k, because the draft pays
+# full attention over the whole context on each of its 7 proposals per step.
+# It only changes DEFAULTS — an explicit BENCH_* still wins. See the README
+# "DSpark inverts at long context".
 #
 # Upstream MI355 TP8 reference (sgl-project/sglang issue #32548):
 #   baseline  c=2: 820 tok/s, TPOT 20.86 ms | c=8: 2356 | c=32: 4898
@@ -31,8 +40,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MODE="sweep"
 for arg in "$@"; do
     case "$arg" in
-        latency|throughput|sweep) MODE="$arg" ;;
-        *) printf 'Unknown argument: %s (use latency | throughput | sweep)\n' "$arg" >&2; exit 1 ;;
+        latency|throughput|sweep|longcontext) MODE="$arg" ;;
+        *) printf 'Unknown argument: %s (use latency | throughput | sweep | longcontext)\n' "$arg" >&2; exit 1 ;;
     esac
 done
 
@@ -62,13 +71,40 @@ fi
 command -v apptainer >/dev/null 2>&1 \
     || die "apptainer not found — run this on the serving compute node, not the login node."
 
-# Benchmark parameters (overridable).
-BENCH_INPUT_LEN="${BENCH_INPUT_LEN:-1024}"
-BENCH_OUTPUT_LEN="${BENCH_OUTPUT_LEN:-512}"
-BENCH_NUM_PROMPTS="${BENCH_NUM_PROMPTS:-200}"
-BENCH_CONCURRENCY="${BENCH_CONCURRENCY:-2 8 32}"
+# Benchmark parameters (overridable). Defaults are mode-dependent; anything
+# already set in the environment or kimik3.env wins in either branch, so
+# 'BENCH_INPUT_LEN=32768 ./bench-kimik3.sh longcontext' does what it looks like.
+if [[ "$MODE" == "longcontext" ]]; then
+    # n=4, not 200: at 100k a single prefill is measured in tens of seconds, so
+    # 200 prompts is an overnight job that nobody will run twice. Four is enough
+    # to see TPOT, and TTFT here is a headline number rather than a warmup cost.
+    BENCH_INPUT_LEN="${BENCH_INPUT_LEN:-100000}"
+    BENCH_OUTPUT_LEN="${BENCH_OUTPUT_LEN:-512}"
+    BENCH_NUM_PROMPTS="${BENCH_NUM_PROMPTS:-4}"
+    BENCH_CONCURRENCY="${BENCH_CONCURRENCY:-1}"
+else
+    BENCH_INPUT_LEN="${BENCH_INPUT_LEN:-1024}"
+    BENCH_OUTPUT_LEN="${BENCH_OUTPUT_LEN:-512}"
+    BENCH_NUM_PROMPTS="${BENCH_NUM_PROMPTS:-200}"
+    BENCH_CONCURRENCY="${BENCH_CONCURRENCY:-2 8 32}"
+fi
 BENCH_MAX_CONCURRENCY="${BENCH_MAX_CONCURRENCY:-32}"
 BENCH_EXTRA_ARGS="${BENCH_EXTRA_ARGS:-}"
+
+for v in BENCH_INPUT_LEN BENCH_OUTPUT_LEN BENCH_NUM_PROMPTS; do
+    [[ "${!v}" =~ ^[0-9]+$ ]] || die "$v must be a positive integer, got '${!v}'."
+done
+
+# A request longer than the server's context window is refused, and at 100k that
+# is an easy way to waste an allocation: CONTEXT_LEN=262144 is this repo's own
+# documented fix for KV allocation failures, and it silently caps what can be
+# measured here. Catch it before the first prefill rather than after.
+if [[ "${CONTEXT_LEN:-}" =~ ^[0-9]+$ ]] \
+   && (( BENCH_INPUT_LEN + BENCH_OUTPUT_LEN > CONTEXT_LEN )); then
+    die "This shape needs $((BENCH_INPUT_LEN + BENCH_OUTPUT_LEN)) tokens of context but the
+     server was started with CONTEXT_LEN=$CONTEXT_LEN. Either lower BENCH_INPUT_LEN,
+     or raise CONTEXT_LEN in kimik3.env and restart the server."
+fi
 
 # sglang's random dataset samples each length uniformly from
 # [BENCH_*_LEN * ratio, BENCH_*_LEN]. Its own default is 0.0, which means every
@@ -135,6 +171,19 @@ OUT_FILE="$BENCH_DIR/${STAMP}-${MODE}.txt"
 } > "$OUT_FILE"
 log "Saving results to $OUT_FILE"
 
+if [[ "$MODE" == "longcontext" ]]; then
+    log "Long-context mode: $BENCH_INPUT_LEN in / $BENCH_OUTPUT_LEN out, concurrency $BENCH_CONCURRENCY, n=$BENCH_NUM_PROMPTS."
+    log "  Expect a long wait before the first token. Prefill at this size is the"
+    log "  slow path on ATTENTION_BACKEND=triton, and that TTFT is itself a result."
+    if [[ "${SPECULATIVE:-}" == "dspark" ]]; then
+        warn "  SPECULATIVE=dspark. At this context length DSpark measured a NET LOSS"
+        warn "  here — accept length 1.0-1.5 against 7.29 at 1024, so the draft's 7"
+        warn "  proposals per step are paid for and thrown away. Run this mode again"
+        warn "  with SPECULATIVE=\"\" and compare; that pair is the point of the mode."
+        warn "  Watch 'accept len' in $LOG_FILE while it runs."
+    fi
+fi
+
 # ── One benchmark run ───────────────────────────────────────────────────────
 # $1 = max concurrency, $2 = request rate ("inf" to saturate)
 
@@ -169,7 +218,8 @@ run_one() {
 case "$MODE" in
     latency)    run_one 1 inf ;;
     throughput) run_one "$BENCH_MAX_CONCURRENCY" inf ;;
-    sweep)      for c in $BENCH_CONCURRENCY; do
+    sweep|longcontext)
+                for c in $BENCH_CONCURRENCY; do
                     for rep in $(seq 1 "$BENCH_REPEATS"); do run_one "$c" inf; done
                 done ;;
 esac

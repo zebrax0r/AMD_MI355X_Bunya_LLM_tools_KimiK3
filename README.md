@@ -161,7 +161,7 @@ scontrol show node bun161 | grep -iE 'Gres|Partitions|State'
 | `opencode.kimik3.json` | The provider template `opencode-setup.sh` fills in |
 | `kimicode-setup.sh` | Writes/merges the kimicode provider config on any machine |
 | `kimicode.kimik3.toml` | The provider template `kimicode-setup.sh` fills in |
-| `bench-kimik3.sh` | Benchmark tok/s / TTFT / ITL against upstream's numbers |
+| `bench-kimik3.sh` | Benchmark tok/s / TTFT / ITL at 1024/512, or `longcontext` at 100k |
 
 Secrets never live in the repo: `kimik3.env` (your HF token), the generated API
 key and the `.sif` are gitignored / stored under `$MODEL_CACHE_DIR` on scratch.
@@ -586,9 +586,11 @@ export SPECULATIVE=""
 
 **Not yet measured: plain decode at 100k.** Removing DSpark drops seven forwards
 per step, so it should be a large win — 20–40 tok/s is the expectation, and this
-file's non-DSpark baseline at 1k was 26.49 ms TPOT — but that is a prediction
-until someone resumes a ~100k session with `SPECULATIVE` unset and reads
-`gen throughput` off the same log line. Do that before quoting a figure.
+file's non-DSpark baseline at 1k was 26.49 ms TPOT — but that is a prediction,
+and predictions do not belong in tables. `./bench-kimik3.sh longcontext` runs
+exactly this shape; see
+[Long context](#long-context--the-regime-this-repo-has-never-benchmarked) for the
+DSpark-on/off pair and the table to fill in.
 
 `/compact` appears to fix it, and does help for two real reasons — a smaller
 attention working set and a reset of whatever collapses the accept rate — but it
@@ -608,7 +610,8 @@ Measurement-driven only — change one thing, re-run `./bench-kimik3.sh`, keep i
 if the numbers improve. Run from a shell on the serving node:
 
 ```bash
-./bench-kimik3.sh sweep     # c=2/8/32 -> $MODEL_CACHE_DIR/bench/
+./bench-kimik3.sh sweep          # 1024/512 at c=2/8/32 -> $MODEL_CACHE_DIR/bench/
+./bench-kimik3.sh longcontext    # 100k/512 at c=1 — the agentic shape
 ```
 
 ### Measured on bun161, 29 Jul 2026 (DSpark, 1024/512, TP8)
@@ -636,6 +639,50 @@ Compare on metrics that are immune to request sizing instead:
 
 Use the table above as the local baseline for tuning: change one thing, re-run,
 keep it if the numbers improve.
+
+### Long context — the regime this repo has never benchmarked
+
+Every table above is **1024 tokens in**. opencode and kimicode resend 100k+ every
+turn. Those are not the same regime scaled up: DSpark is a 3.1× win at 1024 and a
+net loss at 106k — see
+[DSpark inverts at long context](#dspark-inverts-at-long-context--turn-it-off-for-agentic-sessions).
+Nothing here should be assumed to transfer across that gap in either direction.
+
+`./bench-kimik3.sh longcontext` measures the agentic shape: 100k in / 512 out at
+concurrency 1, `n=4`, `--random-range-ratio 1.0`. It only changes the defaults,
+so `BENCH_INPUT_LEN=32768 ./bench-kimik3.sh longcontext` works for a mid-point.
+It refuses to start if the shape exceeds a set `CONTEXT_LEN`, and warns when
+`SPECULATIVE=dspark`, because the DSpark/no-DSpark **pair** is the measurement —
+one run on its own says nothing.
+
+```bash
+./bench-kimik3.sh longcontext                    # A: as configured
+# then set SPECULATIVE="" in kimik3.env
+./serve-kimik3.sh stop && ./serve-kimik3.sh serve --detach
+./bench-kimik3.sh longcontext                    # B: same shape, DSpark off
+```
+
+Expect a long wait before the first token — prefill at 100k is the slow path on
+`ATTENTION_BACKEND=triton`, and that TTFT is a headline result, not a warmup
+cost. It is also the number
+[AITER MLA prefill](#the-biggest-lever-we-cannot-pull-yet--aiter-mla-prefill)
+would move most.
+
+#### Measured
+
+Nothing yet. Every row is one variable against the previous one, `n=4`, c=1:
+
+| Config | context | total tok/s | median TPOT | median TTFT | accept len |
+|---|---|---|---|---|---|
+| DSpark on *(current default of the pin)* | 100k | | | | |
+| `SPECULATIVE=""` | 100k | | | | |
+| `SPECULATIVE=""` + aiter decode backend | 100k | | | | |
+| best of the above | 32k | | | | |
+| best of the above, mainline image | 100k | | | | |
+
+The only figure in hand is anecdotal and belongs in the first row: a kimicode
+session at 106k with DSpark on ran at **8–11 tok/s**, which is TPOT ~110 ms.
+Replace it with a real run rather than quoting it.
 
 ### Does the node's ROCm version matter? (unresolved)
 
@@ -1246,9 +1293,10 @@ which is out of scope for this repo. `serve-kimik3.sh` detects gfx942 and warns.
 ./kimicode-setup.sh [--host H] [--port P] [--model M] [--context N]
                     [--api-key K] [--no-key] [--config PATH]
 
-./bench-kimik3.sh [sweep]        tok/s at concurrency 2/8/32
+./bench-kimik3.sh [sweep]        1024/512 tok/s at concurrency 2/8/32
 ./bench-kimik3.sh latency        single-stream latency only
 ./bench-kimik3.sh throughput     saturate at BENCH_MAX_CONCURRENCY
+./bench-kimik3.sh longcontext    100k/512 at c=1 — the agentic shape
 ```
 
 Handy extras:
