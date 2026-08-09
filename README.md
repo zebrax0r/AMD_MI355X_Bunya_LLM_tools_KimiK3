@@ -672,21 +672,41 @@ cost. It is also the number
 [AITER MLA prefill](#the-biggest-lever-we-cannot-pull-yet--aiter-mla-prefill)
 would move most.
 
-#### Measured
+#### Measured on bun160, 9 Aug 2026 (100k/512, c=1, n=4, TP8)
 
-Nothing yet. Every row is one variable against the previous one, `n=4`, c=1:
+Every row is one variable against the previous one. **Read TPOT, not output
+tok/s** — at this shape output throughput is end-to-end and a 15 s prefill
+dominates it, so it says more about TTFT than about decode.
 
-| Config | context | total tok/s | median TPOT | median TTFT | accept len |
+| Config | context | median TPOT | decode tok/s | median TTFT | accept len |
 |---|---|---|---|---|---|
-| DSpark on *(current default of the pin)* | 100k | | | | |
+| DSpark on *(the pin's default)* | 100k | **87.38 ms** | 11.4 | 15.5 s | 1.39 |
 | `SPECULATIVE=""` | 100k | | | | |
 | `SPECULATIVE=""` + aiter decode backend | 100k | | | | |
 | best of the above | 32k | | | | |
 | best of the above, mainline image | 100k | | | | |
 
-The only figure in hand is anecdotal and belongs in the first row: a kimicode
-session at 106k with DSpark on ran at **8–11 tok/s**, which is TPOT ~110 ms.
-Replace it with a real run rather than quoting it.
+**The step-rate model survives contact with a controlled run.**
+`87.38 ms × 1.39 = 121.5 ms` per verify step, against the **128 ms** derived from
+a kimicode session's decode lines — 5% apart, different session, different
+content.
+
+**And it isolates the cause.** This run used *random-token* prompts and still
+landed at accept 1.39, inside the 1.02–1.45 a real kimicode session showed at
+106k. The same random generator at 1024 tokens gives 7.25–7.29. Same dataset,
+same config, only context length differs: **the collapse tracks context length,
+not workload content.** That closes the question this section was opened with.
+
+TTFT of 15.5 s is a *cold* 100k prefill — four unrelated random prompts share no
+prefix. A real agentic turn hits the radix cache (`#cached-token: 105344` against
+`#new-token: 18`) and pays almost none of it. Do not quote this number as what
+opencode users experience; quote it as what
+[AITER MLA prefill](#the-biggest-lever-we-cannot-pull-yet--aiter-mla-prefill)
+would attack.
+
+`BENCH_REPEATS=1` here, so there are no error bars. That is acceptable only
+because the effect being tested is multiples, not percent — tighten it before
+claiming any difference under ~20%.
 
 ### Does the node's ROCm version matter? (unresolved)
 
