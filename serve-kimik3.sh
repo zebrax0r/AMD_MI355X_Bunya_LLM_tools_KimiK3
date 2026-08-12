@@ -114,6 +114,27 @@ CHUNKED_PREFILL_SIZE="${CHUNKED_PREFILL_SIZE:-}"
 MAX_RUNNING_REQUESTS="${MAX_RUNNING_REQUESTS:-}"
 SCHEDULE_POLICY="${SCHEDULE_POLICY:-}"
 EXTRA_ENGINE_ARGS="${EXTRA_ENGINE_ARGS:-}"
+
+# aiter's get_user_jit_dir() branches on `"AITER_JIT_DIR" in os.environ` rather
+# than on the variable having a VALUE, then calls os.makedirs("") and raises
+# `FileNotFoundError: [Errno 2] No such file or directory: ''`. kimik3-env.example
+# ships AITER_JIT_DIR empty and Apptainer passes the host environment straight
+# through, so every probe that imports sglang inherits the trap. 'serve' escapes
+# it only because it resolves the variable to a real path further down — long
+# after 'check' and 'parsers' have run.
+#
+# HIT FOR REAL ON 12 AUG 2026, migrating to a mainline image. The pinned build
+# imported nothing that touched aiter at module scope; mainline's model registry
+# does, for EVERY model. So all ~200 modules failed to import, 'check' reported
+# "0 architectures registered", and the diagnosis it printed — "this image CANNOT
+# serve this model" — was completely wrong. A probe that cannot import is not a
+# probe that answered no.
+#
+# Probes need a writable path, not the real JIT cache. /tmp is writable inside an
+# Apptainer container with no bind, so this works regardless of what a given exec
+# mounts. 'serve' keeps using the seeded, bound AITER_JIT_DIR resolved below.
+PROBE_ENV=(--env AITER_JIT_DIR=/tmp/aiter-jit)
+
 MODEL_CACHE_DIR="${MODEL_CACHE_DIR:-}"
 SIF_PATH="${SIF_PATH:-}"
 WEIGHT_LOAD_THREADS="${WEIGHT_LOAD_THREADS:-8}"
@@ -853,7 +874,7 @@ if [[ "$MODE" == "loadstat" ]]; then
 
     echo
     log "Load formats this image supports:"
-    apptainer exec "$SIF_PATH" \
+    apptainer exec "${PROBE_ENV[@]}" "$SIF_PATH" \
         bash -c "sglang serve --help 2>&1 || python3 -m sglang.launch_server --help 2>&1" 2>/dev/null \
         | grep -A 12 -- '--load-format' | head -20 | sed 's/^/    /' \
         || warn "Could not read --load-format choices from the image."
@@ -866,7 +887,7 @@ fi
 
 if [[ "$MODE" == "parsers" ]]; then
     log "Parsers available in $SIF_PATH:"
-    apptainer exec "$SIF_PATH" \
+    apptainer exec "${PROBE_ENV[@]}" "$SIF_PATH" \
         bash -c "sglang serve --help 2>&1 || python3 -m sglang.launch_server --help 2>&1" \
         | grep -A 6 -iE '\-\-(tool-call|reasoning)-parser' || \
         warn "Could not read parser choices from --help."
@@ -891,6 +912,7 @@ if [[ "$MODE" == "check" ]]; then
         --env HF_HOME="$MODEL_CACHE_DIR" \
         --env HF_TOKEN="${HF_TOKEN:-}" \
         --env MODEL_ID="$MODEL_ID" \
+        "${PROBE_ENV[@]}" \
         "$SIF_PATH" python3 - <<'PY' || rc=$?
 import os, sys
 
@@ -932,6 +954,20 @@ print(f"\n  ({len(known)} architectures registered in this image)")
 kimi = sorted(a for a in known if "kimi" in a.lower())
 print(f"  Kimi-family architectures present: {kimi or '<none>'}")
 
+# An empty registry is a BROKEN PROBE, not a negative answer, and the two look
+# identical from here if you only test `arch in known`. Every model module failing
+# to import — the aiter empty-AITER_JIT_DIR trap does exactly this — leaves
+# len(known) == 0 and reports every architecture as unsupported. Hit for real on
+# 12 Aug 2026: 'check' told a mainline image that carries kimi_k3.py that it could
+# not serve K3. Say "could not tell" instead, and name the thing to look for.
+if not known:
+    print("\n  => INCONCLUSIVE: SGLang's registry came back EMPTY, so nothing was")
+    print("     tested. Every model module failed to import — look for repeated")
+    print("     'Ignore import error when loading sglang.srt.models.*' above.")
+    print("     A trailing \": ''\" on those lines is the aiter AITER_JIT_DIR trap;")
+    print("     see the README troubleshooting entry for FileNotFoundError: ''.")
+    sys.exit(3)
+
 if missing:
     print("\n  => This image CANNOT serve this model. K3 merged to main on "
           "4 Aug 2026\n     (sglang #32541), so any mainline image from 0.5.17 on "
@@ -943,6 +979,8 @@ PY
         0) log "check passed." ;;
         1) warn "check FAILED: this image cannot serve $MODEL_ID." ;;
         2) warn "check INCONCLUSIVE: could not read the model config." ;;
+        3) warn "check INCONCLUSIVE: the image's model registry would not import,
+  so this says nothing about whether it can serve $MODEL_ID." ;;
         *) warn "check exited with status $rc." ;;
     esac
     exit "$rc"
@@ -1296,7 +1334,7 @@ IMAGE_HELP_PROBED=0
 image_help() {
     if (( ! IMAGE_HELP_PROBED )); then
         IMAGE_HELP_PROBED=1
-        IMAGE_HELP="$(apptainer exec "$SIF_PATH" \
+        IMAGE_HELP="$(apptainer exec "${PROBE_ENV[@]}" "$SIF_PATH" \
             bash -c "sglang serve --help 2>&1 || python3 -m sglang.launch_server --help 2>&1" 2>/dev/null || true)"
     fi
     printf '%s' "$IMAGE_HELP"

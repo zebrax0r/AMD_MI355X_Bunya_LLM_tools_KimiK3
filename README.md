@@ -1838,6 +1838,19 @@ All knobs live in `kimik3.env` (copied from `kimik3-env.example`). Anything you
   the write-side fix (#32477) is in `main` and in no K3 image.
   `SGLANG_SANITIZE_NAN_LOGITS=1` is the reported mitigation. Reported on NVIDIA —
   if you see it here, that is worth telling upstream.
+- **`check` says "0 architectures registered" / "This image CANNOT serve this
+  model", with a wall of `Ignore import error when loading sglang.srt.models.*:
+  [Errno 2] No such file or directory: ''`** — the probe never ran; it is not a
+  negative answer. That trailing `: ''` is the aiter `AITER_JIT_DIR` trap below.
+  `serve` escapes it by resolving the variable to a real path, but it does that
+  *after* `check` and `parsers` have already run. Fixed 12 Aug 2026 by passing a
+  writable `/tmp` path to every probe, and `check` now exits 3 (inconclusive)
+  rather than 1 (unsupported) when the registry comes back empty. Workaround on
+  an older copy: `AITER_JIT_DIR=/tmp/aiter-jit ./serve-kimik3.sh check`.
+  **Hit for real** migrating to a mainline image: the pinned build imported
+  nothing that touched aiter at module scope, mainline's registry does it for
+  every model, so all ~200 modules failed and the image was wrongly declared
+  incapable of serving K3.
 - **DSpark accept length collapses at long context** (`accept len` ≈ 1.0–1.5 on
   the decode lines) — the draft is past its trained window. The 27 Jul draft was
   trained at 4,096 tokens. `./serve-kimik3.sh download` with the current default
