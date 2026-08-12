@@ -487,9 +487,30 @@ that sets it. Two things make it worse than a bad request:
   so it kills the **server**, not the request. #32569's reporter saw it "work
   for about 5 minutes, then crash".
 
-`serve-kimik3.sh` greps the image for the two Triton aliases at launch and warns
-when they are missing, so you cannot enable DSpark and meet this unknowingly.
-Options, cheapest first: keep clients at `top_p: 1`; move to a 20260731+ tag in a
+#### The second one, and it fires on `temperature > 0`
+
+Found in the 12 Aug upstream review:
+[#33694](https://github.com/sgl-project/sglang/pull/33694), merged 6 Aug. #32541's
+`elif is_hip():` branch set `_DFLASH_SAMPLING_VERIFY_AVAILABLE = True` but never
+bound `tree_speculative_sampling_target_only` — and that kernel **does not exist
+on ROCm at all**: `speculative_sampling.cu` is listed only in the CUDA
+`CMakeLists.txt`, and `common_extension_rocm.cc` registers just
+`verify_tree_greedy`. With the flag unconditionally true, any request with
+`temperature > 0` took the non-greedy verify path and died on the unbound name,
+in the scheduler. Upstream's own CI shows the shape exactly: the `temperature=0`
+tests passed, and the one test using `temperature=0.1` turned every later request
+into `Connection refused`.
+
+**`top_p` is optional; `temperature` is not**, so this is the likelier of the two
+to find a real client. Whether the pinned image carries the offending branch
+cannot be settled from the tag — it needs the probe.
+
+`serve-kimik3.sh` greps the image at launch for both the two Triton aliases *and*
+that binding, and warns when either is missing, so you cannot enable DSpark and
+meet these unknowingly. It reads the `elif is_hip():` block specifically, because
+the call site for the unbound symbol is present either way and a whole-file grep
+proves nothing. Options, cheapest first: keep clients at `top_p: 1` and
+`temperature: 0`; move to a mainline `v0.5.17-rocm720-mi35x-*` image in a
 **second** `SIF_PATH` and re-measure; or leave `SPECULATIVE` unset.
 
 It stays off by default anyway, so that a first launch has one thing to go wrong
@@ -502,13 +523,16 @@ measured against commit `eb03982e` (27 Jul 2026). Since then:
 
 | Commit | Date | What |
 |---|---|---|
-| `eb03982e` | 27 Jul 2026 | **the revision these numbers were measured on** |
-| `9c4b2577` | 31 Jul 2026 | *"Sync Kimi-K3-DSpark-0731 snapshot"* — the model itself replaced |
-| `56ce616a` | 1 Aug 2026 | current `main` — healthy (`model_type: qwen3`, `block_size: 7`), never benchmarked here |
+| `eb03982e` | 27 Jul 2026 | **the revision every DSpark number above was measured on.** Trained context 4,096, unscaled RoPE — see [why that matters](#the-cause-the-pinned-draft-was-trained-at-4096-tokens) |
+| `9c4b2577` | 31 Jul 2026 | *"Sync Kimi-K3-DSpark-0731 snapshot"* — weights replaced, YaRN ×16 added, trained context 65,536 |
+| `56ce616a` | 1 Aug 2026 | **the default since 12 Aug 2026.** Same weights and `config.json` as `9c4b2577`, fuller card |
 
-Three rewrites in four days, two of which broke the launch. So as of 2 Aug 2026
-**`DSPARK_REVISION` defaults to `eb03982e…`** — the script pins rather than
-tracks, and following `main` is the thing you now opt into.
+Three rewrites in four days, two of which broke the launch outright. So the
+script pins a sha rather than tracking `main`, and following the branch is
+something you opt into. **The pin moved on 12 Aug 2026** from `eb03982e` to
+`56ce616a` — not drift-chasing, but because `eb03982e` is a 4k draft and this
+deployment serves a 1M window. Set `eb03982e` explicitly to reproduce the tables
+above; anything else, take the default.
 
 *Hit for real on 1 Aug 2026*: a re-download picked up a newer revision and the
 server then died during **argument parsing**, before loading anything, with
@@ -542,12 +566,13 @@ Note the throughput crossover: DSpark *loses* above ~concurrency 16 (3715 vs
 4898 tok/s at c=32). It is a latency optimisation for interactive use, not a
 throughput one.
 
-### DSpark inverts at long context — turn it off for agentic sessions
+### DSpark collapsed at long context — because the draft was a 4k model
 
 **Every DSpark number in this README was measured at 1024 tokens of context.**
-By 100k the sign has flipped and DSpark costs several times more than it returns.
-Where between the two it crosses over has not been measured. Two sessions, both
-`#running-req: 1`:
+By 100k the sign had flipped and DSpark cost several times more than it returned.
+The cause was found on 12 Aug 2026 and it is **the draft checkpoint, not DSpark**
+— [skip to it](#the-cause-the-pinned-draft-was-trained-at-4096-tokens) if you want
+the answer before the evidence. Two sessions, both `#running-req: 1`:
 
 | Session | context | accept len | gen throughput |
 |---|---|---|---|
@@ -571,10 +596,10 @@ which is what makes this a diagnosis rather than a guess.
 `(accept_len − 1) / accept_rate` recovers the draft block: `(1.45−1)/0.06 = 7.5`,
 `(1.20−1)/0.03 = 6.7`. **The draft proposes ~7 tokens per step and ~0.15 survive.**
 So each 128 ms buys seven draft forwards plus an eight-token verify through the
-full model, and returns 1.15 tokens. Worse, the draft must attend over the same
-106k context on all seven passes, so **DSpark's cost grows faster with context
-than the target model's does** — that is the 3.1× step inflation, and it is why
-this cannot be tuned away by raising the block size.
+full model, and returns 1.15 tokens. The draft also attends over the whole 106k
+context on all seven of those passes, so its cost grows with context where the
+target's barely does — that is the 3.1× step inflation (40.9 → 128 ms), and it
+is the half of the problem that **survives any fix to the accept rate**.
 
 It is not memory pressure. Both sessions ran at `full token usage: 0.16` and
 `mamba usage: 0.03` — nothing is thrashing or being evicted.
@@ -591,14 +616,65 @@ actually goes are in
 [Long context](#long-context--the-regime-this-repo-has-never-benchmarked).
 
 `/compact` appears to fix it, and does help for two real reasons — a smaller
-attention working set and a reset of whatever collapses the accept rate — but it
-is treating the symptom. At 106k you are using 11% of a 1M window and should not
-be at 8 tok/s.
+attention working set, and putting the draft back inside the context window it
+was trained on — but it is treating the symptom. At 106k you are using 11% of a
+1M window and should not be at 8 tok/s.
 
-Why the accept rate collapses at all is still open. The draft's own effective
-context, or KDA state reconstruction on a radix-cache hit (`#cached-token:
-105344` with `#new-token: 18` is the normal shape of an agentic turn), are both
-plausible and neither is established here.
+#### The cause: the pinned draft was trained at 4096 tokens
+
+Checked 12 Aug 2026. The revision this repo pinned until then, `eb03982e`
+(27 Jul), **says so on its own model card**:
+
+> **Trained context:** sequence length 4096.
+>
+> This DSpark checkpoint was trained with a maximum context length of 4,096
+> tokens, which **may lead to reduced acceptance lengths in extreme long-context
+> and agentic use cases**. Training for these scenarios is ongoing.
+
+Its `config.json` matches — `"rope_type": "default"`, no extension of any kind,
+under a `max_position_embeddings` of 1,048,576 that the weights cannot honour.
+**Our 1024-token bench ran inside that window. 106k is 25× outside it.** Accept
+7.25 at 1k and 1.39 at 100k is not a mystery, it is a draft being asked for
+positions it never saw.
+
+Upstream replaced the checkpoint four days later. `9c4b2577` (31 Jul, *"Sync
+Kimi-K3-DSpark-0731 snapshot"*) swapped the weights — same 4.50 GB, different LFS
+oid `29df0e8e…` → `ecd74645…` — and rewrote the rope block:
+
+| | `eb03982e` (27 Jul) | `56ce616a` (1 Aug, **the default now**) |
+|---|---|---|
+| `rope_type` | `default` | **`yarn`** |
+| `factor` | — | **16.0** |
+| `original_max_position_embeddings` | — | **65536** |
+| card | "A DSpark speculator for Kimi K3" | **"A long-context DSpark speculator… up to 1 million tokens"** |
+| stated trained context | 4,096 | 65,536 (×16 → 1M) |
+
+The new card's own numbers: **RULER V2 at 1M input — actual prompts 1,000,432 to
+1,047,925 tokens — acc_len 4.2553**, SWE-Rebench 4.66, and a 32K+ output bucket
+at 4.92. Corroborated in the field: sglang
+[#32855](https://github.com/sgl-project/sglang/issues/32855) (3 Aug) — *"re-pull
+the draft model, which has been re-trained for long contexts… stable 110–400 tps
+single request within 200k, acc len almost firmly 1.5×–3.8×."*
+
+**`DSPARK_REVISION` now defaults to `56ce616a…`**, and `serve-kimik3.sh` warns if
+the draft you resolved has unscaled RoPE. It probes the checkpoint's *rope type*,
+not its sha, so it keeps working the next time upstream rewrites the repo.
+
+#### …but do not turn DSpark back on yet
+
+The step-rate decomposition above is a prediction, and it is not a flattering one.
+A DSpark step at 106k cost **~128 ms** against ~30 ms for a plain decode step.
+Even at the new draft's RULER acc_len of 4.3, that is `4.3 × 7.8 ≈ 33.5` tok/s —
+**the DSpark-off baseline to three significant figures.** Recovering the accept
+length buys back the loss and roughly nothing more.
+
+The other half is the step cost, and that needs a newer image: sglang
+[#33981](https://github.com/sgl-project/sglang/pull/33981) rewrote the DSpark
+verify attention for exactly this reason. See
+[The DSpark verify kernel](#the-lever-that-did-land--33981-rewrote-the-dspark-verify-attention).
+Until both halves are measured together on this hardware, `SPECULATIVE=""`
+remains the measured-correct setting for agentic sessions — but it is now a
+pending experiment rather than a conclusion.
 
 ---
 
@@ -643,7 +719,7 @@ keep it if the numbers improve.
 Every table above is **1024 tokens in**. opencode and kimicode resend 100k+ every
 turn. Those are not the same regime scaled up: DSpark is a 3.1× win at 1024 and a
 net loss at 106k — see
-[DSpark inverts at long context](#dspark-inverts-at-long-context--turn-it-off-for-agentic-sessions).
+[DSpark collapsed at long context](#dspark-collapsed-at-long-context--because-the-draft-was-a-4k-model).
 Nothing here should be assumed to transfer across that gap in either direction.
 
 `./bench-kimik3.sh longcontext` measures the agentic shape: 100k in / 512 out at
@@ -667,7 +743,7 @@ one run on its own says nothing.
 Expect a long wait before the first token — prefill at 100k is the slow path on
 `ATTENTION_BACKEND=triton`, and that TTFT is a headline result, not a warmup
 cost. It is also the number
-[AITER MLA prefill](#the-biggest-lever-we-cannot-pull-yet--aiter-mla-prefill)
+[AITER MLA prefill](#the-biggest-lever-we-still-cannot-pull--aiter-mla-prefill)
 would move most.
 
 #### Measured on bun160, 9 Aug 2026 (100k/512, c=1, n=4, TP8)
@@ -678,11 +754,17 @@ dominates it, so it says more about TTFT than about decode.
 
 | Config | context | median TPOT | decode tok/s | median TTFT | accept len |
 |---|---|---|---|---|---|
-| DSpark on *(the pin's default)* | 100k | 87.38 ms | 11.4 | 15.5 s | 1.39 |
+| DSpark on, `eb03982e` draft *(4k, unscaled RoPE)* | 100k | 87.38 ms | 11.4 | 15.5 s | 1.39 |
 | **`SPECULATIVE=""`** | 100k | **29.83 ms** | **33.5** | 15.4 s | — |
-| `SPECULATIVE=""` + aiter decode backend | 100k | | | | |
-| best of the above | 32k | | | | |
-| best of the above, mainline image | 100k | | | | |
+| DSpark on, `56ce616a` draft *(the long-context retrain)* | 100k | | | | |
+| mainline image, `SPECULATIVE=""` | 100k | | | | |
+| mainline image + `56ce616a` draft *([#33981](#the-lever-that-did-land--33981-rewrote-the-dspark-verify-attention))* | 100k | | | | |
+| mainline image + `56ce616a` draft | 1024 | | | | |
+
+Rows 3–6 are the runbook the 12 Aug upstream review produced, in order. Row 3
+isolates the draft on the pinned image and is **predicted to land near row 2** —
+about 33 tok/s — because the 128 ms step cost is untouched by a better draft. Row
+5 is the one with headroom.
 
 **The step-rate model survives contact with a controlled run.**
 `87.38 ms × 1.39 = 121.5 ms` per verify step, against the **128 ms** derived from
@@ -699,7 +781,7 @@ TTFT of 15.5 s is a *cold* 100k prefill — four unrelated random prompts share 
 prefix. A real agentic turn hits the radix cache (`#cached-token: 105344` against
 `#new-token: 18`) and pays almost none of it. Do not quote this number as what
 opencode users experience; quote it as what
-[AITER MLA prefill](#the-biggest-lever-we-cannot-pull-yet--aiter-mla-prefill)
+[AITER MLA prefill](#the-biggest-lever-we-still-cannot-pull--aiter-mla-prefill)
 would attack.
 
 **Turning DSpark off is worth 2.93× at 100k.** TTFT moved 1% (15359 vs 15526 ms)
@@ -737,7 +819,7 @@ Two consequences:
   decode from 1k decode, so row 3 is now a small experiment, not a lever.
 - **The remaining long-context weakness is prefill, not decode** — the 15.5 s
   cold TTFT, which is
-  [AITER MLA prefill](#the-biggest-lever-we-cannot-pull-yet--aiter-mla-prefill)
+  [AITER MLA prefill](#the-biggest-lever-we-still-cannot-pull--aiter-mla-prefill)
   territory and unavailable. In normal agentic use the radix cache means you
   rarely pay it.
 
@@ -1025,7 +1107,7 @@ and `presharded` (which removes the re-quantisation work entirely) is the lever.
 
 ---
 
-## Upstream drift — checked 9 Aug 2026
+## Upstream drift — checked 12 Aug 2026
 
 Everything here moves fast enough that a snapshot goes stale in days, so this
 section records **what was found and how to re-run the check**, not just the
@@ -1039,15 +1121,36 @@ answer.
 | Newest K3 tag | `rocm720-mi35x-k3-20260803` — **the last one. The stream stopped there** |
 | First tag with both sampling fixes | `rocm720-mi35x-k3-20260731` — see [the sampling landmine](#the-sampling-landmine--read-this-before-enabling-dspark) |
 | Mainline | **PR #32541 merged 4 Aug.** K3 is in `main`; the `kimi-k3` branch is deleted |
-| Mainline image | `v0.5.17-rocm720-mi35x-20260808` — the successor stream, built daily |
-| ROCm 7.14 | **no 7.14 + K3 image exists anywhere** |
+| Mainline image | `v0.5.17-rocm720-mi35x-20260811` — the successor stream, built nightly from `main` |
+| Suggested migration target | **`v0.5.17-rocm720-mi35x-20260810`** — see the layer-drop note below |
+| aiter inside those images | `AITER_COMMIT=d9e5ef7c` (**29 Jul**); ours is `dcd204ea` (23 Jul) |
+| ROCm 7.14 | **still no 7.14 + K3 image anywhere** |
 
-That last row is the one that matters for bun161. The 7.14 track is a separate
-series of `*-rocm7_14-mi35x-test-*` tags, last built **20 Jul** at
-`v0.5.15.post1` — before K3 support existed, and not rebuilt since. `rocm/sgl-dev`
-mirrors the same K3 tags, so there is no separate AMD build to try either. **The
+That last row is the one that matters for bun161, and it has not moved in two
+weeks. The 7.14 track is a separate series of `*-rocm7_14-mi35x-test-*` tags,
+last built **20 Jul** at `v0.5.15.post1` — before K3 support existed, and not
+rebuilt since. Two *newer* ROCm streams have appeared and neither helps:
+`rocm724` (7.2.4, mi30x/mi35x, last built 7 Aug at v0.5.16) closes none of the
+7.2 → 7.14 gap, and `rocm7.15-mi45x` is for different silicon. `rocm/sgl-dev`
+mirrors the same tags, so there is no separate AMD build to try either. **The
 `ROCMINFO_SHIM` workaround stays necessary**, and waiting is still the right
 posture.
+
+**Take `20260810`, not `20260811`, unless you check first.** The 11 Aug
+`rocm720-mi35x` build went from 40 layers / 29.60 GB to 39 layers / 23.65 GB — a
+5.38 GB layer that had been in every `rocm720` build since our pin is simply
+gone. This repo's aiter procedure depends on the image shipping prebuilt
+`module_*.so` to seed `AITER_JIT_DIR` from, and binding an empty dir hides them,
+so that is not a difference to discover after a 1.5 TB weight load. `check`
+answers it in a minute.
+
+**The images' aiter is a fortnight behind aiter's own K3 work.** Every published
+image pins `AITER_COMMIT=d9e5ef7c`, dated 29 Jul. Since then `ROCm/aiter` `main`
+landed `ca68b4f3` *tune Kimi-K3 prefill GEMMs for gfx950* (10 Aug), `05ec7fd9`
+*runtime-keyed Kimi-K3 A8W4 fmoe config* (10 Aug), `868ac1f7` *correct + faster
+a16w4 SiTUv2* (8 Aug), `50811372` *MLA 96-head 128-dim reduction*, and FlyDSL GDN
+decode work. None of it ships yet. So a second wave is coming that no image
+carries: **check the image's `AITER_COMMIT`, not just its tag date.**
 
 ### The branch merged, and the K3 image stream ended with it
 
@@ -1062,7 +1165,13 @@ the aiter backend.
 The `rocm720-mi35x-k3-*` tags stopped the day before the merge: the last is
 **`20260803`**, and six days later there is no successor. That is not a pause,
 it is the branch stream being retired — mainline `v0.5.1x-rocm720-mi35x-*` tags
-have continued daily throughout, most recently `v0.5.17-rocm720-mi35x-20260808`.
+have continued daily throughout, most recently `v0.5.17-rocm720-mi35x-20260811`.
+
+Those nightlies are **`main` itself**, not a release branch:
+`.github/workflows/release-docker-amd-rocm720-nightly.yml` builds `gfx950-rocm720`
+from a plain default-branch checkout on a 12:00 UTC cron, which is why the tags
+land at ~14:30 UTC. So `…-20260811` is `main` as of 11 Aug, and anything merged
+before then is in it.
 
 **So the pin is now on a dead stream**, which is exactly the risk
 [Moving to a mainline image](#moving-to-a-mainline-image) was written against.
@@ -1103,15 +1212,90 @@ Branch commits between the pinned build and 2 Aug worth knowing about:
   not K3. Tempting, and not ours.
 
 Upstream's own MI355X cell is marked `verified: false`,
-`verificationStatus: "in-progress"` — so the numbers in this file are ahead of
-upstream's verification of this hardware, not behind it.
+`verificationStatus: "in-progress"` — and as of 12 Aug the cookbook **still
+prescribes `rocm720-mi35x-k3-20260727`**, the exact image pinned here, for both
+mi350x and mi355x. Moving to mainline puts this deployment ahead of the
+documented recipe, not behind it. (The same cell sets `--kv-cache-dtype fp8_e4m3`
+where this repo leaves it empty. Do not adopt it on faith: sglang
+[#32938](https://github.com/sgl-project/sglang/issues/32938) reports fp8 KV
+*slowing* DSpark. It is one bench run, not a default.)
 
-### The biggest lever we cannot pull yet — AITER MLA prefill
+**Merged into `main` since, i.e. present in a `20260810` image:**
+
+- **#33981** (8 Aug) — the DSpark verify kernel. Its own section below.
+- **#33599** (5 Aug) — fuses K3's attn-residual aggregation on ROCm: `_score_kernel`,
+  `_combine_kernel`, the out_norm RMSNorm, the pending residual add and the bank
+  snapshot into one Triton kernel, **7 launches down to 2 per layer**. Also
+  cherry-picked to `release/v0.5.17`.
+- **#33764** (8 Aug) — fixes router GEMM inaccuracy when K3 uses `_front_w`. A
+  correctness fix, not a perf one.
+- **#33694** (6 Aug) — binds `tree_speculative_sampling_target_only` on HIP. See
+  [the sampling landmine](#the-sampling-landmine--read-this-before-enabling-dspark);
+  this is the `temperature > 0` half of it.
+- **#33447** (4 Aug) — K3's SiTU kernels could not JIT-compile on ROCm at all
+  (`situ_and_mul.cuh` included `<cuda_fp8.h>` unconditionally). Relevant because
+  this repo sets `AITER_SITUV2_A8W4=1`.
+- **#34234** (10 Aug) — sizes the DFLASH draft KV pool from the draft's own
+  attention geometry instead of scaling the target's by the layer ratio.
+
+**Open, and worth watching — the MI355X decode headroom is queued, not landed:**
+
+- **#33303** — a FlyDSL fused KDA decode kernel for gfx950. K3's KDA path launches
+  `causal_conv1d_update → kda_packed_decode → rms_norm_gated` per layer across 69
+  layers: **138 kernel launches per decode step**, fused into one dispatch.
+- **#34198** — fuses the ROCm KDA decode boundary, deferring `f_b` into the same
+  FlyDSL kernel.
+- **#33735** — a hand-written gfx950 AMDGCN AttnResidual score kernel (DPP
+  lane-shuffle + `ds_read_b128`), **+84% on the kernel and 8% end-to-end decode**;
+  `_score_kernel` runs ~110× per decode step.
+- **#33916 / #33838 / #33746** — AMD MoE and attn-res work.
+
+That list is the independent corroboration of
+[this repo's own correction](#k3s-decode-is-nearly-context-independent--the-earlier-claim-was-wrong):
+the people optimising K3 decode on this hardware are removing **kernel launches**,
+not attention work.
+
+### The lever that did land — #33981 rewrote the DSpark verify attention
+
+PR [#33981](https://github.com/sgl-project/sglang/pull/33981), *"[AMD] Add K3
+verified mla kernel for DSpark on triton backend"*, **merged 8 Aug 2026** to
+`main`. Its opening line is this repo's own finding, arrived at independently:
+
+> Kimi-K3 DSpark throughput is slow, at high conc it is even slower than
+> non-DSpark setting.
+
+The cause is not the draft. Target-verify attention ran through
+`verify_splitkv`, a kernel written for standard MHA: it parallelises **one program
+per query head**. K3's MLA has `h_kv = 1`, so the single shared latent was
+re-read once per head — **~12× redundant at TP8, on ~24 MLA layers per step**.
+The PR adds `kernels/ops/attention/verify_mla.py` (one program per `BLOCK_H`
+heads, so the latent tile is loaded once and reused; the 576-wide QK dot split
+into nope/pe halves that are both powers of two) and wires it into
+`triton_backend.py`.
+
+Measured by AMD, 8×MI355X TP8, 8k in / 1k out, `--attention-backend triton` with
+**the same four aiter env vars this repo sets**:
+
+| concurrency | 2 | 8 | 32 |
+|---|---|---|---|
+| total tok/s vs baseline | 1.37× | 1.56× | **1.77×** |
+| median ITL vs baseline | 1.46× | 1.84× | **2.42×** |
+| accept len | 7.21 | 7.11 | 7.02 |
+
+GSM8K 0.951. Note their accept length holds above 7 at 8k — consistent with the
+long-context draft, and with the collapse here being the 4k checkpoint.
+
+**This is the missing half of the long-context story.** The retrained draft fixes
+the accept rate; #33981 attacks the 128 ms step. Neither alone is expected to
+beat `SPECULATIVE=""` at 100k — together they might, and that pair is
+[the runbook](#measured-on-bun160-9-aug-2026-100k512-c1-n4-tp8) rows 3 and 5.
+
+### The biggest lever we still cannot pull — AITER MLA prefill
 
 PR [#33341](https://github.com/sgl-project/sglang/pull/33341), *"[AMD] Enable
 aiter MLA for 12-head models via 12→16 zero-pad (Kimi-K3)"*, opened 3 Aug by AMD.
-**Still open at the 9 Aug check, and now `mergeable_state: dirty`** — it has
-conflicts and has not been touched since the day it opened. It targets `main`,
+**Still open at the 12 Aug check, still `dirty`, and still untouched since the day
+it opened** — nine days of conflicts nobody has resolved. It targets `main`,
 which is where K3 lives now, so it is no longer aimed at a side branch; it is
 simply stalled. It is in no image today, and `ATTENTION_BACKEND=triton` stays the
 right setting.
@@ -1236,6 +1420,61 @@ Then `parsers`, then `toolcheck`, then a full `bench-kimik3.sh sweep` — a
 mainline image changes the attention, sampling and speculative paths at once, so
 nothing in this file's tables carries over by assumption. Revert those two
 variables if anything regresses. Same procedure for trying any newer image.
+
+### The runbook, in order — as of 12 Aug 2026
+
+Ordered by value per minute of allocation, from the upstream review. Every bench
+row is `longcontext` (100k/512, c=1, n=4) unless stated, and fills a row of the
+[long-context table](#measured-on-bun160-9-aug-2026-100k512-c1-n4-tp8).
+
+**0 — fetch the new draft.** Login node, ~4.5 GB, no GPU:
+
+```bash
+./serve-kimik3.sh download        # DSPARK_REVISION now defaults to 56ce616a…
+```
+
+**1 — the draft, isolated.** Pinned image, `SPECULATIVE=dspark`, new default
+revision. One variable against run A of 9 Aug.
+
+*Predicted:* accept 1.39 → **3–4.5**, and decode landing **near the 33.5 tok/s
+DSpark-off baseline** — because `4.3 × 7.8 steps/s ≈ 33.5`. That is not a
+disappointing result, it is the test of the step-cost model. Well above 33.5 and
+the 128 ms step was not what we measured; well below and the draft is not being
+read the way its card implies. Either way, say which.
+
+*If accept does not recover at all*, stop before spending a second allocation:
+the YaRN config may not be reaching the draft on an image this old. `dspark.py`'s
+fused KV-write fast path bails to a per-layer fallback when the rotary is not a
+plain `RotaryEmbedding`, which is safe but is a sign the config is being read
+differently than upstream's own runs.
+
+**2 — mainline image, gated.** Second `SIF_PATH`, never in place:
+
+```bash
+SGLANG_IMAGE=docker://lmsysorg/sglang-rocm:v0.5.17-rocm720-mi35x-20260810 \
+SIF_PATH=$MODEL_CACHE_DIR/sglang-mainline-20260810.sif \
+  ./serve-kimik3.sh pull && ./serve-kimik3.sh check
+```
+
+Stop at the first failure, in this order: `check` (and confirm the image still
+ships prebuilt aiter `module_*.so` — the 0811 build lost a 5.4 GB layer),
+`--help` against the pinned image's (`--enable-linear-replayssm-spec` **exists**
+in mainline where it was a phantom on the pin, so `REPLAYSSM_SPEC=1` becomes
+reachable), `parsers`, `toolcheck`.
+
+**3 — mainline baselines.** `SPECULATIVE=""` at 100k *and* 1024. Not a
+formality: #33599 and #33764 both touch the non-speculative path.
+
+**4 — the one the plan is for.** Mainline + long-context draft + DSpark, at 100k
+and 1024. Retrained draft × #33981's verify kernel. Upstream's 1.45–2.42× ITL
+figure is at 8k/1k, so treat it as a direction, not a target.
+
+**5 — optional.** `KV_CACHE_DTYPE=fp8_e4m3` at 100k with DSpark off. Upstream's
+MI355X cell sets it and #32938 says it hurts DSpark; one run settles it for this
+shape.
+
+Then re-read the `SPECULATIVE` guidance in `kimik3-env.example` against run 4
+rather than assuming it still holds.
 
 ---
 
@@ -1419,7 +1658,7 @@ All knobs live in `kimik3.env` (copied from `kimik3-env.example`). Anything you
 | `ROCMINFO_SHIM` | `auto` | Replay the host's `rocminfo` output inside the container when the image's own fails |
 | `SET_CPU_AFFINITY` | `0` | Keep `0` under a SLURM cgroup (see troubleshooting) |
 | `READY_TIMEOUT` | `14400` | Seconds to wait for health (cold load is ~1.5 TB) |
-| `DSPARK_REVISION` | `eb03982e…` | **Pinned by default.** A 40-hex value is a snapshot, anything else a ref — `main` tracks the branch. Upstream rewrites it; see [Speculative decoding](#the-draft-repo-is-a-moving-target--pin-it) |
+| `DSPARK_REVISION` | `56ce616a…` | **Pinned by default**, moved 12 Aug 2026 to the long-context retrain. A 40-hex value is a snapshot, anything else a ref — `main` tracks the branch. `eb03982e…` is the 4k draft the pre-12-Aug tables were measured on; see [Speculative decoding](#the-draft-repo-is-a-moving-target--pin-it) |
 | `WEIGHT_LOAD_THREADS` | `8` | Loader threads. Naming it is what stops SGLang silently going single-threaded (see [Weight loading](#weight-loading--why-a-cold-start-sawtooths)). `0` = image default |
 | `LOAD_FORMAT` | *(empty)* | `--load-format`. `presharded` dumps a per-rank checkpoint so later starts skip re-quantisation |
 | `PRESHARDED_PATH` | *(empty)* | Where `presharded` writes. Needs up to another 1561 GB |
@@ -1508,8 +1747,26 @@ All knobs live in `kimik3.env` (copied from `kimik3-env.example`). Anything you
   image has no HIP renorm kernels ([#32569](https://github.com/sgl-project/sglang/issues/32569)).
   Triggered by a request with `top_p < 1.0` or `top_k` set; a healthy server that
   dies the moment a new client connects is this. Send `"top_p": 1`, or move to a
-  20260731+ tag, or unset `SPECULATIVE`. Full mechanism in
+  mainline image, or unset `SPECULATIVE`. Full mechanism in
   [The sampling landmine](#the-sampling-landmine--read-this-before-enabling-dspark).
+- **`NameError: tree_speculative_sampling_target_only`** with DSpark, *killing the
+  server*, on a request with `temperature > 0` — the non-greedy verify kernel does
+  not exist on ROCm and an `is_hip()` branch claimed it did
+  ([#33694](https://github.com/sgl-project/sglang/pull/33694), fixed 6 Aug 2026).
+  Same family as the bullet above and a commoner trigger. `serve-kimik3.sh` warns
+  at launch if the image has this shape.
+- **Mid-response `[PAD]` storms** — the model emits literal `[PAD]` (id 163839)
+  forever until `max_tokens`, usually inside the think channel, in bursts, at
+  90k–237k context ([#32968](https://github.com/sgl-project/sglang/issues/32968);
+  worst captured stream was 17,256 of them). Traced to NaN-contaminated logits;
+  the write-side fix (#32477) is in `main` and in no K3 image.
+  `SGLANG_SANITIZE_NAN_LOGITS=1` is the reported mitigation. Reported on NVIDIA —
+  if you see it here, that is worth telling upstream.
+- **DSpark accept length collapses at long context** (`accept len` ≈ 1.0–1.5 on
+  the decode lines) — the draft is past its trained window. The 27 Jul draft was
+  trained at 4,096 tokens. `./serve-kimik3.sh download` with the current default
+  `DSPARK_REVISION`; see
+  [the cause](#the-cause-the-pinned-draft-was-trained-at-4096-tokens).
 - **`ValueError: Unrecognized model in RadixArk/Kimi-K3-DSpark. Should have a
   'model_type' key in its config.json`** — *hit for real on 1 Aug 2026.* The
   cached draft config is truncated, or upstream rewrote the repo (it does — see
@@ -1520,7 +1777,9 @@ All knobs live in `kimik3.env` (copied from `kimik3-env.example`). Anything you
   set it to `main`.
 - **`DSPARK_REVISION=… is not in the cache`** — the pin names a revision you have
   never fetched. `./serve-kimik3.sh download` gets it, or set `DSPARK_REVISION=main`
-  to use whatever you already have.
+  to use whatever you already have. **Expected once, after 12 Aug 2026**: the
+  default moved to the long-context draft `56ce616a…`, which is a different 4.5 GB
+  checkpoint, so the first `git pull` needs one `download`.
 - **`This image has no --enable-gdn-replayssm-spec`** — `REPLAYSSM_SPEC=1` against
   an image older than 20260731. Expected on the pinned image; see
   [KDA state pool](#k3s-kda-state-pool--the-knobs-we-did-not-pass). Pull a newer
@@ -1602,7 +1861,9 @@ All knobs live in `kimik3.env` (copied from `kimik3-env.example`). Anything you
 
 - [sglang#32541 — day-0 Kimi K3 support](https://github.com/sgl-project/sglang/pull/32541) — branch, NVIDIA and AMD image tags
 - [sglang#32548 — [Kimi-K3][AMD] Day 0 and Performance Tracking](https://github.com/sgl-project/sglang/issues/32548) — **the MI355X recipe and every perf number in this README**
-- [sglang#32569](https://github.com/sgl-project/sglang/issues/32569) — the open DSPARK crash
+- [sglang#32569](https://github.com/sgl-project/sglang/issues/32569) — the open DSPARK crash · [#33694](https://github.com/sgl-project/sglang/pull/33694) — its `temperature > 0` sibling
+- [sglang#33981](https://github.com/sgl-project/sglang/pull/33981) — **the DSpark verify MLA kernel**, merged 8 Aug 2026, mainline images only
+- [sglang#32968](https://github.com/sgl-project/sglang/issues/32968) — long-context `[PAD]` storms and NaN logits · [#32855](https://github.com/sgl-project/sglang/issues/32855) — where upstream says to re-pull the retrained draft
 - [SGLang Kimi-K3 cookbook](https://docs.sglang.io/cookbook/autoregressive/Moonshotai/Kimi-K3) — the MI35x cell, the KDA knob surface and the `--mamba-full-memory-ratio` calculator. **Its `--enable-linear-replayssm-spec` does not exist** — see [KDA state pool](#k3s-kda-state-pool--the-knobs-we-did-not-pass)
 - [sglang#32692](https://github.com/sgl-project/sglang/pull/32692) — ReplaySSM with `extra_buffer`, landed 31 Jul 2026, after the pinned image
 - [moonshotai/Kimi-K3](https://huggingface.co/moonshotai/Kimi-K3) · [RadixArk/Kimi-K3-DSpark](https://huggingface.co/RadixArk/Kimi-K3-DSpark)

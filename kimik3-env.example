@@ -47,7 +47,15 @@ export SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-kimi-k3}"
 # is pinned to a dated tag on purpose, and every measurement in the README was
 # taken on it. THAT BRANCH MERGED ON 4 AUG 2026 AND WAS DELETED; its image stream
 # ended at rocm720-mi35x-k3-20260803 and has not been rebuilt since. The
-# successor is the mainline lmsysorg/sglang-rocm:v0.5.1x-rocm720-mi35x-* series.
+# successor is the mainline lmsysorg/sglang-rocm:v0.5.1x-rocm720-mi35x-* series,
+# built nightly from main. As of 12 Aug 2026 there is a concrete reason to move:
+# sglang #33981 (merged 8 Aug) replaced the DSpark target-verify attention, which
+# had been running an MHA kernel over K3's MLA and re-reading the shared latent
+# once per head — 12x redundant at TP8, ~24 calls per step. AMD measured ITL
+# 1.45-2.42x on 8xMI355X with the same four aiter env vars this file sets.
+# v0.5.17-rocm720-mi35x-20260810 is the suggested target (the 0811 build dropped
+# a 5.4 GB layer, so verify the prebuilt aiter modules are still there first).
+#
 # Migrate into a SECOND SIF_PATH and re-verify with './serve-kimik3.sh check',
 # then 'parsers', 'toolcheck' and a full bench — a mainline image moves the
 # attention, sampling and speculative paths at once. See the README, "Moving to
@@ -171,14 +179,26 @@ export REASONING_PARSER="${REASONING_PARSER:-kimi_k3}"
 #   concurrency 2:  median TPOT 20.86 ms -> 8.94 ms, 820 -> 1659 tok/s
 #   accept length ~5.3-5.9 tokens per step
 #
-# BUT THOSE ARE 1024-TOKEN NUMBERS, AND THE SIGN FLIPS AT LONG CONTEXT. Measured
-# here on 9 Aug 2026 at 106k context, one request: accept length collapses to
-# 1.02-1.45 against 7.29 in the bench, and throughput sits at 8-11 tok/s. The
-# draft still proposes 7 tokens per step (see DSPARK_BLOCK_SIZE below) and ~0.15
-# survive, and it pays full attention over the whole context on all 7 passes —
-# so DSpark gets MORE expensive as context grows while returning less. Leave this
-# empty for opencode / kimicode / anything that resends a large context each
-# turn. See the README, 'DSpark inverts at long context'.
+# BUT THOSE ARE 1024-TOKEN NUMBERS, AND THE SIGN FLIPPED AT LONG CONTEXT ON THE
+# DRAFT WE USED TO PIN. Measured here on 9 Aug 2026 at 106k context, one request:
+# accept length collapsed to 1.02-1.45 against 7.29 in the bench, and throughput
+# sat at 8-11 tok/s — a 2.93x net loss.
+#
+# THE CAUSE WAS THE DRAFT CHECKPOINT, NOT DSPARK (established 12 Aug 2026). The
+# revision this repo pinned until then, eb03982e (27 Jul), says on its own model
+# card: "Trained context: sequence length 4096", with unscaled RoPE to match. Our
+# 1024-token bench ran INSIDE that window; 106k is 25x outside it. Upstream
+# replaced the checkpoint on 31 Jul with a long-context retrain (65,536 trained,
+# YaRN x16 to 1M, RULER V2 acc_len 4.26 at 1M input), and that retrain is what
+# DSPARK_REVISION now defaults to.
+#
+# What that does NOT yet mean is "turn DSpark on for agentic work". A DSpark step
+# at 106k measured ~128 ms against ~30 ms for a plain decode step, so even a
+# recovered accept length of ~4.3 only lands back at the DSpark-off rate. The step
+# cost is the other half, and it needs a mainline image (sglang #33981). Until
+# that pair is measured on this hardware, leaving this empty for opencode /
+# kimicode remains the measured-safe choice. See the README, 'DSpark collapsed at
+# long context'.
 #
 # Default OFF, and there is a sharper reason still than "one failure at a time".
 #
@@ -195,9 +215,17 @@ export REASONING_PARSER="${REASONING_PARSER:-kimi_k3}"
 # loop and KILLS THE SERVER, not just that request, taking every concurrent
 # request with it.
 #
-# serve-kimik3.sh greps the image for the two Triton aliases and warns at launch,
-# so you cannot meet this unknowingly. Cheapest fix: keep clients at top_p 1.
-# Real fix: a 20260731+ tag in a SECOND SIF_PATH, then re-measure. See the
+# There is a SECOND one, with a commoner trigger: sglang #33694 (fixed 6 Aug).
+# #32541's is_hip() branch declared non-greedy verify available without binding
+# tree_speculative_sampling_target_only, a kernel that does not exist on ROCm at
+# all — so any request with temperature > 0 raised NameError and killed the
+# scheduler. top_p is optional; temperature is not, so this one is likelier to
+# find you.
+#
+# serve-kimik3.sh greps the image for the Triton aliases AND for that binding, and
+# warns at launch, so you cannot meet either unknowingly. Cheapest fix: keep
+# clients at top_p 1 and temperature 0. Real fix: a mainline
+# v0.5.17-rocm720-mi35x-* image in a SECOND SIF_PATH, then re-measure. See the
 # README, 'The sampling landmine'.
 #
 # Get baseline serving working first, then turn this on — that way a failure has
@@ -386,15 +414,26 @@ export PREFETCH_BLOCK_SIZE_MB="${PREFETCH_BLOCK_SIZE_MB:-}"
 # twice breaking the launch outright. A changed draft either changes what you
 # serve or stops it starting, and neither announces itself.
 #
-# The default below is the revision every DSpark number in the README was
-# measured on. A 40-hex value names a snapshot directly; anything else is treated
-# as a branch or tag, so:
+# THE PIN MOVED ON 12 AUG 2026. The two revisions that matter:
+#
+#   eb03982e58d4fb79bcfc099e902158f562e2e27b   27 Jul   trained context 4,096,
+#       "rope_type": "default" (no extension). Every DSpark number measured in
+#       this repo before 12 Aug is on this one — set it explicitly to reproduce
+#       them. Do NOT serve it to an agentic client: past ~4k the accept rate
+#       collapses, which is the whole of the "DSpark inverts at long context"
+#       finding. serve-kimik3.sh warns if you do.
+#
+#   56ce616ad7486f0e96cbb51ef23ed5a1bce1d92d   1 Aug    THE DEFAULT. A
+#       long-context retrain: weights replaced 31 Jul, 65,536 trained, YaRN
+#       factor 16 to 1M. Upstream's card reports RULER V2 acc_len 4.26 on
+#       1M-token inputs. Never benchmarked here yet — that is the next run.
+#
+# A 40-hex value names a snapshot directly; anything else is treated as a branch
+# or tag, so:
 #   export DSPARK_REVISION="main"    # follow the branch, accept the drift
-# Upstream 'main' was 56ce616ad7486f0e96cbb51ef23ed5a1bce1d92d as of 1 Aug 2026 —
-# healthy, but never benchmarked here.
 #
 # Whatever you set, ./serve-kimik3.sh download must have fetched that revision.
-export DSPARK_REVISION="${DSPARK_REVISION:-eb03982e58d4fb79bcfc099e902158f562e2e27b}"
+export DSPARK_REVISION="${DSPARK_REVISION:-56ce616ad7486f0e96cbb51ef23ed5a1bce1d92d}"
 
 # ── Escape hatches ──────────────────────────────────────────────────────────
 

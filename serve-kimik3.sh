@@ -80,11 +80,22 @@ TOOL_PARSER="${TOOL_PARSER:-kimi_k3}"
 REASONING_PARSER="${REASONING_PARSER:-kimi_k3}"
 SPECULATIVE="${SPECULATIVE:-}"
 DSPARK_MODEL="${DSPARK_MODEL:-RadixArk/Kimi-K3-DSpark}"
-# Pinned, not tracking main: the draft repo was rewritten three times in the four
-# days to 1 Aug 2026, twice breaking the launch outright. This is the revision
-# every DSpark number in the README was measured on. Set to "main" to follow the
-# branch and accept the drift.
-DSPARK_REVISION="${DSPARK_REVISION:-eb03982e58d4fb79bcfc099e902158f562e2e27b}"
+# Pinned, not tracking main: the draft repo is rewritten under you — three times
+# in the four days to 1 Aug 2026, twice breaking the launch outright.
+#
+# THE PIN MOVED ON 12 AUG 2026, from eb03982e (27 Jul) to this one. eb03982e's own
+# model card says "Trained context: sequence length 4096", with unscaled RoPE
+# ("rope_type": "default") to match. Serving it at 100k runs it 25x past its
+# trained window: accept length 1.39, against 7.25 at 1024 — which is INSIDE it.
+# That is what made DSpark a 2.93x NET LOSS at 100k on 9 Aug. It was the draft,
+# not DSpark. 9c4b2577 (31 Jul) replaced the weights with a long-context retrain —
+# 65,536 trained, YaRN factor 16 to 1M, RULER V2 acc_len 4.26 at 1M input — and
+# 56ce616a is that same checkpoint with a fuller card. See the README,
+# 'DSpark collapsed at long context'.
+#
+# eb03982e stays the ANCHOR for every DSpark number measured before 12 Aug 2026 —
+# set it explicitly to reproduce those. "main" follows the branch and its drift.
+DSPARK_REVISION="${DSPARK_REVISION:-56ce616ad7486f0e96cbb51ef23ed5a1bce1d92d}"
 DSPARK_BLOCK_SIZE="${DSPARK_BLOCK_SIZE:-}"
 REPLAYSSM_SPEC="${REPLAYSSM_SPEC:-0}"
 MAMBA_FULL_MEMORY_RATIO="${MAMBA_FULL_MEMORY_RATIO:-}"
@@ -922,9 +933,9 @@ kimi = sorted(a for a in known if "kimi" in a.lower())
 print(f"  Kimi-family architectures present: {kimi or '<none>'}")
 
 if missing:
-    print("\n  => This image CANNOT serve this model. It is probably built from "
-          "main rather\n     than the 'kimi-k3' branch — see the README "
-          "'When the branch merges'.")
+    print("\n  => This image CANNOT serve this model. K3 merged to main on "
+          "4 Aug 2026\n     (sglang #32541), so any mainline image from 0.5.17 on "
+          "should carry it —\n     see the README, 'Moving to a mainline image'.")
     sys.exit(1)
 print("\n  => This image can load this model. Safe to download the weights.")
 PY
@@ -1021,15 +1032,32 @@ if [[ "$SPECULATIVE" == "dspark" && "$MODE" == "serve" ]]; then
   The download is incomplete. Re-fetch:   rm -rf $draft_dir && ./serve-kimik3.sh download
   Or serve without speculative decoding:  unset SPECULATIVE"
     fi
-    if ! python3 -c "import json,sys; sys.exit(0 if json.load(open(sys.argv[1])).get('model_type') else 1)" \
-            "$draft_snapshot/config.json" 2>/dev/null; then
+    # Three fields out of one parse: model_type is the thing SGLang dies without,
+    # and the rope type plus the draft's own trained context are what decide
+    # whether this checkpoint can be trusted at the CONTEXT_LEN being served.
+    # Read rope_parameters (transformers 5.x) or rope_scaling (4.x) — the draft
+    # repo uses the former, and it is the field that changed on 31 Jul 2026.
+    draft_cfg="$(python3 -c "
+import json, sys
+c = json.load(open(sys.argv[1]))
+rp = c.get('rope_parameters') or c.get('rope_scaling') or {}
+print(c.get('model_type') or '')
+print(rp.get('rope_type') or rp.get('type') or '')
+print(rp.get('original_max_position_embeddings') or '')
+" "$draft_snapshot/config.json" 2>/dev/null || true)"
+    { read -r draft_model_type
+      read -r DRAFT_ROPE_TYPE
+      read -r DRAFT_TRAINED_CTX
+    } <<<"$draft_cfg"
+
+    if [[ -z "${draft_model_type:-}" ]]; then
         die "The draft config at $draft_snapshot/config.json is unparseable or has no 'model_type',
   so SGLang cannot resolve the speculative algorithm and dies during argument parsing.
   Either the download is truncated, or upstream changed the repo under you — it has
   been rewritten as recently as 31 Jul 2026 ('Sync Kimi-K3-DSpark-0731 snapshot').
 
   Re-fetch it:                 rm -rf $draft_dir && ./serve-kimik3.sh download
-  Pin the measured-good rev:   DSPARK_REVISION=eb03982e58d4fb79bcfc099e902158f562e2e27b ./serve-kimik3.sh download
+  Pin the current default:     DSPARK_REVISION=56ce616ad7486f0e96cbb51ef23ed5a1bce1d92d ./serve-kimik3.sh download
   Or serve without it:         unset SPECULATIVE"
     fi
 
@@ -1291,6 +1319,10 @@ image_help() {
 # not an import — importing sglang.srt.speculative drags in torch, which is slow
 # and unhappy on a login node. Empty output means "could not tell", which is not
 # the same as "absent"; the caller distinguishes them.
+#
+# The same probe answers a second, worse question — see the `v`/`t` markers below
+# and sglang #33694. Markers: k, p (renorm kernels), v (the HIP branch claims
+# non-greedy verify), t (#33694 applied), probed (the file was read at all).
 RENORM_BINDINGS=""
 RENORM_PROBED=0
 renorm_bindings() {
@@ -1305,6 +1337,21 @@ renorm_bindings() {
             [[ -n "$f" && -r "$f" ]] || exit 0
             grep -q top_k_renorm_probs_triton "$f" && echo k
             grep -q top_p_renorm_probs_triton "$f" && echo p
+            # The SECOND landmine, and a much commoner trigger — sglang #33694.
+            # #32541 opened an `elif is_hip():` branch that set
+            # _DFLASH_SAMPLING_VERIFY_AVAILABLE = True without ever binding
+            # tree_speculative_sampling_target_only, and that kernel does not
+            # exist on ROCm at all. Any request with temperature > 0 then took
+            # the non-greedy verify path and died on the unbound name.
+            # Grep the BRANCH, not the file: the call site is present either
+            # way, so a bare grep for the symbol proves nothing. #33694 fixed it
+            # by binding the name to None inside the same branch.
+            hip_branch=$(awk "/^elif is_hip\(\):/ {h=1; next} h && /^[^ \t]/ {h=0} h" "$f")
+            if [[ -n "$hip_branch" ]]; then
+                grep -q "_DFLASH_SAMPLING_VERIFY_AVAILABLE[[:space:]]*=[[:space:]]*True" \
+                    <<<"$hip_branch" && echo v
+                grep -q "tree_speculative_sampling_target_only" <<<"$hip_branch" && echo t
+            fi
             echo probed
         ' 2>/dev/null || true)"
     fi
@@ -1372,8 +1419,8 @@ if [[ "$SPECULATIVE" == "dspark" ]]; then
             die "This image has no --enable-gdn-replayssm-spec.
   Coexistence with the extra_buffer radix strategy landed upstream on 31 Jul 2026
   (sglang #32692), AFTER the pinned rocm720-mi35x-k3-20260727 build. Pull a
-  20260731-or-later K3 tag into a SECOND SIF_PATH and test it there — see the
-  README, 'When the branch merges' — or set REPLAYSSM_SPEC=0."
+  mainline v0.5.17-rocm720-mi35x-* image into a SECOND SIF_PATH and test it there
+  — see the README, 'Moving to a mainline image' — or set REPLAYSSM_SPEC=0."
         fi
     fi
 
@@ -1402,8 +1449,38 @@ if [[ "$SPECULATIVE" == "dspark" ]]; then
             warn "  not just that request. One such request poisons its whole batch."
             warn "  Safe only while every client leaves top_p at 1.0 and top_k unset."
         fi
-        warn "  Real fix: a 20260731-or-later K3 tag (sglang #32621 + #32641), tested"
-        warn "  in a SECOND SIF_PATH first. Zero-risk fix: unset SPECULATIVE."
+        warn "  Real fix: a mainline v0.5.17-rocm720-mi35x-* image (sglang #32621 +"
+        warn "  #32641), tested in a SECOND SIF_PATH first. Zero-risk: unset SPECULATIVE."
+    fi
+
+    # The second landmine, and the one a real client is far likelier to step on:
+    # top_p/top_k are optional, temperature > 0 is what every chat client sends.
+    if renorm_has v && ! renorm_has t; then
+        warn "  This image's is_hip() branch claims non-greedy verify is available but"
+        warn "  never binds tree_speculative_sampling_target_only — the kernel does not"
+        warn "  exist on ROCm at all. A request with TEMPERATURE > 0 then raises"
+        warn "  \"NameError: tree_speculative_sampling_target_only\" and KILLS THE SERVER"
+        warn "  (sglang #33694, fixed 6 Aug 2026 — mainline images only). Safe only"
+        warn "  while every client sends temperature 0, which toolcheck and the bench do."
+    fi
+
+    # A draft has its own trained context, and past it the accept rate does not
+    # degrade — it collapses. Measured on bun160, 9 Aug 2026: the 27 Jul draft
+    # (trained at 4096, unscaled RoPE) accepted 1.39 tokens per step at 100k
+    # against 7.25 at 1024, making DSpark a 2.93x net LOSS. Its own model card
+    # said so from day one. That was the checkpoint, not DSpark.
+    #
+    # The condition is the ROPE TYPE, not the revision sha: it is the property
+    # that actually decides this, and it keeps holding when upstream rewrites the
+    # repo again. "default" means no context extension of any kind.
+    if [[ "${DRAFT_ROPE_TYPE:-}" == "default" ]]; then
+        warn "  This draft has UNSCALED RoPE (\"rope_type\": \"default\") — no context"
+        warn "  extension at all${DRAFT_TRAINED_CTX:+, trained at $DRAFT_TRAINED_CTX tokens} — while you are serving ctx=${CONTEXT_LEN:-model max (1M)}."
+        warn "  Past the draft's trained window the accept rate does not degrade, it"
+        warn "  COLLAPSES, and DSpark turns into a net loss: 2.93x slower at 100k,"
+        warn "  measured 9 Aug 2026. Fine for short prompts, wrong for agentic sessions."
+        warn "  The long-context retrain is the default revision now:"
+        warn "    DSPARK_REVISION=56ce616ad7486f0e96cbb51ef23ed5a1bce1d92d ./serve-kimik3.sh download"
     fi
 fi
 

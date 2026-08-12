@@ -18,10 +18,12 @@
 # 'longcontext' exists because every other shape here is 1024/512, and the
 # agentic clients this repo is built for resend 100k+ every turn. Those are
 # different regimes, not the same regime scaled: measured 9 Aug 2026, DSpark
-# turns from a 3.1x win at 1024 into a ~4x loss at 106k, because the draft pays
-# full attention over the whole context on each of its 7 proposals per step.
+# turned from a 3.1x win at 1024 into a ~3x loss at 106k. Cause established
+# 12 Aug 2026 — the draft checkpoint pinned at the time was trained at 4,096
+# tokens, so 106k was 25x outside its window. The draft default has moved; the
+# pairing this mode measures has not been re-run yet.
 # It only changes DEFAULTS — an explicit BENCH_* still wins. See the README
-# "DSpark inverts at long context".
+# "DSpark collapsed at long context".
 #
 # Upstream MI355 TP8 reference (sgl-project/sglang issue #32548):
 #   baseline  c=2: 820 tok/s, TPOT 20.86 ms | c=8: 2356 | c=32: 4898
@@ -195,10 +197,13 @@ if [[ "$MODE" == "longcontext" ]]; then
     log "  slow path on ATTENTION_BACKEND=triton, and that TTFT is itself a result."
     if [[ "${SPECULATIVE:-}" == "dspark" ]]; then
         warn "  SPECULATIVE=dspark. At this context length DSpark measured a NET LOSS"
-        warn "  here — accept length 1.0-1.5 against 7.29 at 1024, so the draft's 7"
-        warn "  proposals per step are paid for and thrown away. Run this mode again"
-        warn "  with SPECULATIVE=\"\" and compare; that pair is the point of the mode."
-        warn "  Watch 'accept len' in $LOG_FILE while it runs."
+        warn "  here on 9 Aug 2026 — accept length 1.0-1.5 against 7.29 at 1024 — but"
+        warn "  that was a draft trained at 4,096 tokens. If DSPARK_REVISION is the"
+        warn "  current default (56ce616a, the long-context retrain), this run is the"
+        warn "  open experiment, not a repeat. Watch 'accept len' in $LOG_FILE: below"
+        warn "  ~2 the draft is out of its depth, near 4+ it is working as advertised."
+        warn "  Either way run this mode again with SPECULATIVE=\"\" and compare — that"
+        warn "  pair is the point of the mode."
     fi
 fi
 
