@@ -266,8 +266,8 @@ export DSPARK_BLOCK_SIZE="${DSPARK_BLOCK_SIZE:-}"
 # Off by default because the pinned rocm720-mi35x-k3-20260727 image PREDATES
 # sglang #32692 (31 Jul), which is what lets this coexist with the extra_buffer
 # radix strategy we run. serve-kimik3.sh probes the image and refuses rather than
-# letting you discover that after a 1.5 TB load. To try it, pull a 20260731+ K3
-# tag into a SECOND SIF_PATH so the working image stays intact.
+# letting you discover that after a 1.5 TB load. Mainline carries the flag, so a
+# v0.5.17-rocm720-mi35x-* image in a SECOND SIF_PATH is what unlocks it.
 export REPLAYSSM_SPEC="${REPLAYSSM_SPEC:-0}"
 
 # ── KDA state pool (K3 hybrid attention) ────────────────────────────────────

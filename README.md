@@ -12,7 +12,7 @@ from which all the Bunya-specific knowledge here is inherited.
 
 ---
 
-## What works today — verified 28 Jul 2026
+## What works today — verified 28 Jul, measured through 12 Aug 2026
 
 K3 open weights landed on 27 Jul, and **SGLang shipped day-0 AMD support with a
 validated 8× MI355X recipe**. This repo reproduces that recipe.
@@ -23,7 +23,7 @@ validated 8× MI355X recipe**. This repo reproduces that recipe.
 | Shape | 93 layers, 896 experts (16 active), 1,048,576 context, `hidden_size` 7168, vision tower. KDA on every layer except every 4th, which is full MLA (`kv_lora_rank` 512). |
 | Engine | SGLang, image **`lmsysorg/sglang-rocm:rocm720-mi35x-k3-20260727`** |
 | Parallelism | **TP8** — the whole node |
-| Throughput | 820 / 2356 / 4898 tok/s at concurrency 2 / 8 / 32 (upstream, MI355 TP8) |
+| Throughput | **918 / 2074 / 3793 tok/s** at concurrency 2 / 8 / 32, measured here at 1024/512 with DSpark. Upstream's `820 / 2356 / 4898` is a different, unpublished workload — [why](#measured-on-bun161-29-jul-2026-dspark-1024512-tp8) |
 | Tool calling / thinking | `--tool-call-parser kimi_k3 --reasoning-parser kimi_k3` |
 | Auth | Bearer API key, auto-generated into `$MODEL_CACHE_DIR/kimik3-api-key` |
 
@@ -613,7 +613,7 @@ export SPECULATIVE=""
 median TPOT 87.38 → 29.83 ms, decode 11.4 → 33.5 tok/s, with TTFT unchanged.
 Full numbers, the ITL distribution, and what they say about where the 121.5 ms
 actually goes are in
-[Long context](#long-context--the-regime-this-repo-has-never-benchmarked).
+[Long context](#long-context--the-agentic-shape-measured).
 
 `/compact` appears to fix it, and does help for two real reasons — a smaller
 attention working set, and putting the draft back inside the context window it
@@ -726,24 +726,22 @@ Compare on metrics that are immune to request sizing instead:
 Use the table above as the local baseline for tuning: change one thing, re-run,
 keep it if the numbers improve.
 
-### Long context — the regime this repo has never benchmarked
+### Long context — the agentic shape, measured
 
 Every table above is **1024 tokens in**. opencode and kimicode resend 100k+ every
-turn. Those are not the same regime scaled up: DSpark is a 3.1× win at 1024 and a
-net loss at 106k — see
-[DSpark collapsed at long context](#dspark-collapsed-at-long-context--because-the-draft-was-a-4k-model).
-Nothing here should be assumed to transfer across that gap in either direction.
+turn, and those are not the same regime scaled up — DSpark is a 4.7× win at 1024
+and a 1.7× loss at 100k. This section is where that was measured.
 
 `./bench-kimik3.sh longcontext` measures the agentic shape: 100k in / 512 out at
-concurrency 1, `n=4`, `--random-range-ratio 1.0`. A `BENCH_*` set **in the
-environment** still wins, so `BENCH_INPUT_LEN=32768 ./bench-kimik3.sh longcontext`
-works for a mid-point — but the shape in `kimik3.env` does not, because
-`kimik3-env.example` ships the sweep shape and every real config file therefore
-sets it. A named shape mode outranks the config file; the first version of this
-did not, and silently ran at 1024/512 c=2/8/32.
-It refuses to start if the shape exceeds a set `CONTEXT_LEN`, and warns when
-`SPECULATIVE=dspark`, because the DSpark/no-DSpark **pair** is the measurement —
-one run on its own says nothing.
+concurrency 1, `n=4`, `--random-range-ratio 1.0`. It refuses to start if the shape
+exceeds a set `CONTEXT_LEN`, and warns when `SPECULATIVE=dspark`, because the
+DSpark/no-DSpark **pair** is the measurement — one run alone says nothing.
+
+`BENCH_INPUT_LEN=32768 ./bench-kimik3.sh longcontext` moves the shape for a
+mid-point. A `kimik3.env` carrying the sweep shape does not, **even if you have
+sourced it into your own shell** — the mode compares what is in the environment
+against what the config file sets and ignores an exact match. Both halves of that
+were learned by silently running `longcontext` at 1024/512 c=2/8/32, twice.
 
 ```bash
 ./bench-kimik3.sh longcontext                    # A: as configured
@@ -905,58 +903,31 @@ claiming any difference under ~20%. The 2.93× is far outside anything n=4 noise
 could produce; the 13% context penalty above is **not**, and should be re-run
 before it is relied on.
 
-### Does the node's ROCm version matter? (unresolved)
+### Nodes are all ROCm 7.14 now — what that settled, and what it did not
 
-bun161 runs ROCm **7.14** on bare metal; bun159 runs **7.2** — the same version
-the container ships. Same image, same config (DSpark + radix), one sweep each:
+Until Aug 2026 the MI355X nodes ran a mix: bun161 on 7.14, bun159 on the same
+7.2 the container ships. A sweep on each showed bun161 4.6–9.7% ahead on total
+throughput, and **that did not establish anything.** n=1 per node, so no variance
+estimate; driver version confounded with which physical machine you got; and the
+signs disagreed — TPOT +11.4% at one concurrency and −1.7% at another, which is
+what noise looks like. Within a single run, TPOT P90 sits 15–23% above the
+median, so a 5% gap between two single runs is not a result.
 
-| | c=2 | c=8 | c=32 |
-|---|---|---|---|
-| bun161 (host 7.14) | 964 | 2299 | 4608 tok/s |
-| bun159 (host 7.2) | 915 | 2077 | 4396 tok/s |
-| Δ total tok/s | −5.0% | −9.7% | −4.6% |
-| Δ median TPOT | +2.1% | +11.4% | **−1.7%** |
-| Δ accept length | −0.12 | −0.10 | −0.09 |
-
-**This does not establish a difference, and the experiment cannot.** Three
-reasons, in order:
-
-1. **n=1 per node.** No variance estimate, so no comparison is possible. Two
-   points are not a distribution.
-2. **Driver version is confounded with which machine you ran on.** The MI355X
-   nodes are identical in specification, but identical spec is not identical
-   measured performance: die binning within a SKU, cooling position and ambient
-   airflow, firmware drift, and above all what else was resident and how warm
-   the node was at the time. These two runs were 90 minutes apart on different
-   machines. Nothing in the design separates "ROCm 7.14 vs 7.2" from "bun161 vs
-   bun159 on the morning of 29 Jul".
-3. **The signs disagree.** TPOT is +11.4% at one concurrency and −1.7% at
-   another. A real driver-level effect pushes consistently; mixed directions
-   across conditions is what noise looks like.
-
-For scale: within a single run, TPOT P90 sits 15–23% above the median. A 5% gap
-between two single runs is not a result.
-
-What *is* worth noting is the **null**: accept length differs by ~1.4% between
-the two stacks. If the older ROCm were changing numerics, draft/target agreement
-would be the sensitive detector, and it is not moving. Both stacks appear to be
+The one thing worth keeping from it is the **null**: accept length differed by
+~1.4% across the two stacks. If the older ROCm were perturbing numerics,
+draft/target agreement is the sensitive detector, and it did not move. Both were
 computing the same thing.
 
-Note what repeats would and would not fix. They give you the error bar that is
-missing, so you could say whether **bun159 differs from bun161**. They cannot
-un-confound the driver: for that you need the *same* node measured before and
-after an upgrade. If RCC ever brings bun159 to 7.14, that is the run worth
-catching.
+The question is now moot — every node is 7.14 — and it can no longer be answered,
+because separating the driver from the machine needed the *same* node measured
+before and after its upgrade, and that upgrade has already happened. Recorded
+here as the shape of a comparison worth not repeating.
 
-To get the error bar, the sweep supports repeats, interleaved per concurrency so
-drift hits each alike:
+For anything you *do* want to compare, get the error bar first:
 
 ```bash
-BENCH_REPEATS=5 ./bench-kimik3.sh sweep     # on each node, then compare spreads
+BENCH_REPEATS=5 ./bench-kimik3.sh sweep
 ```
-
-Practically: both nodes clear upstream's DSpark c=32 figure, so pick whichever
-is free.
 
 ### Radix cache — measured, and now the default
 
@@ -1065,8 +1036,9 @@ name is a silent regression rather than an error.
 `rocm720-mi35x-k3-20260727` image **predates** sglang #32692 (31 Jul), which is
 what lets ReplaySSM coexist with the `extra_buffer` radix strategy we run. The
 script probes the image and refuses up front rather than letting you find out
-after a 1.5 TB load. To try it, pull a `20260731`-or-later K3 tag into a *second*
-`SIF_PATH` — see [Moving to a mainline image](#moving-to-a-mainline-image).
+after a 1.5 TB load. Mainline has it — the flag exists in `main` today — so this
+is one more thing the migration unlocks. See
+[Moving to a mainline image](#moving-to-a-mainline-image).
 
 #### Measured
 
@@ -1228,73 +1200,44 @@ a16w4 SiTUv2* (8 Aug), `50811372` *MLA 96-head 128-dim reduction*, and FlyDSL GD
 decode work. None of it ships yet. So a second wave is coming that no image
 carries: **check the image's `AITER_COMMIT`, not just its tag date.**
 
-### The branch merged, and the K3 image stream ended with it
+### The branch merged; mainline is the only live stream
 
-Checked 9 Aug 2026. **PR #32541 merged to `main` on 4 Aug**, and `kimi-k3` no
-longer exists as a branch — `repos/sgl-project/sglang/branches/kimi-k3` returns
-404, and nothing matching `heads/kimi-k3` remains except a handful of unrelated
-fix branches. `main` now carries `srt/models/kimi_k3.py` (first commit 4 Aug,
-still being worked on 9 Aug), the whole `srt/speculative/` dflash/dspark stack,
-`kernels/ops/sampling/renorm_triton.py`, and `_mla_decode_fwd_with_head_pad` in
-the aiter backend.
+**PR #32541 merged to `main` on 4 Aug 2026 and the `kimi-k3` branch was deleted**
+(404). `main` carries `srt/models/kimi_k3.py`, the whole `srt/speculative/`
+dflash/dspark stack, `kernels/ops/sampling/renorm_triton.py`, and
+`_mla_decode_fwd_with_head_pad`. The `rocm720-mi35x-k3-*` tags stopped the day
+before, at **`20260803`**, and have no successor — that stream is retired, not
+paused.
 
-The `rocm720-mi35x-k3-*` tags stopped the day before the merge: the last is
-**`20260803`**, and six days later there is no successor. That is not a pause,
-it is the branch stream being retired — mainline `v0.5.1x-rocm720-mi35x-*` tags
-have continued daily throughout, most recently `v0.5.17-rocm720-mi35x-20260811`.
-
-Those nightlies are **`main` itself**, not a release branch:
+The mainline nightlies are **`main` itself**, not a release branch:
 `.github/workflows/release-docker-amd-rocm720-nightly.yml` builds `gfx950-rocm720`
-from a plain default-branch checkout on a 12:00 UTC cron, which is why the tags
-land at ~14:30 UTC. So `…-20260811` is `main` as of 11 Aug, and anything merged
-before then is in it.
+from a plain default-branch checkout on a 12:00 UTC cron, which is why tags land
+at ~14:30 UTC. So `…-20260810` is `main` as of 10 Aug, and anything merged before
+then is in it.
 
-**So the pin is now on a dead stream**, which is exactly the risk
-[Moving to a mainline image](#moving-to-a-mainline-image) was written against.
 Mainline also settles the sampling landmine at the source — `main`'s
-`dflash_utils.py` binds both kernels under `is_hip()`:
+`dflash_utils.py` binds both kernels under `is_hip()`, and #33694 binds the
+non-greedy verify symbol alongside them. On this repo's own measurements
+([the crossover](#the-crossover-is-around-5560k--and-that-is-the-operating-policy))
+that is what turns DSpark from bench-only into something a real client can use,
+which makes it the strongest single reason to migrate — ahead of any performance
+PR. Procedure in [Moving to a mainline image](#moving-to-a-mainline-image), always
+into a second `SIF_PATH`.
 
-```python
-elif is_hip():
-    from sglang.kernels.ops.sampling.renorm_triton import (
-        top_k_renorm_probs_triton as top_k_renorm_prob,
-    )
-    from sglang.kernels.ops.sampling.renorm_triton import (
-        top_p_renorm_probs_triton as top_p_renorm_prob,
-    )
-```
-
-Nothing here has been run against a mainline image yet, so this is a migration to
-plan and measure, not to make in place. Use a second `SIF_PATH` and the procedure
-in [Moving to a mainline image](#moving-to-a-mainline-image) — `check` and `parsers`
-first, then a full re-bench, because **every number in this file was taken on
-`20260727`** and none of them transfer by assumption.
-
-Branch commits between the pinned build and 2 Aug worth knowing about:
-
-- **#32621** (28 Jul) and **#32641** (31 Jul) — the two halves of the HIP
-  top_p/top_k renorm binding. Together these are the **strongest** reason to move
-  images: without them, DSpark serves happily until a client sets `top_p`, then
-  takes the server down. See [the sampling landmine](#the-sampling-landmine--read-this-before-enabling-dspark).
-- **#32692** (31 Jul) — lets ReplaySSM coexist with the `extra_buffer` radix
-  strategy. The second concrete reason to move images; see
-  [the KDA section](#k3s-kda-state-pool--the-knobs-we-did-not-pass).
-- **#33037** (31 Jul) — disables `--enable-symm-mem` under CUDA graphs on Kimi
-  hybrid models.
-- *"[Kimi K3] Add reasoning, tool-call, and OpenAI serving"* (1 Aug) — re-run
-  `./serve-kimik3.sh parsers` against any newer image before trusting `kimi_k3`.
-- The AMD/gfx950 commits in that window (FP4 MoE expert memory bloat, fused-RMS
-  FP8 scale metadata, MoE weight loading from mmap views) are all **DeepSeek-V4**,
-  not K3. Tempting, and not ours.
-
-Upstream's own MI355X cell is marked `verified: false`,
-`verificationStatus: "in-progress"` — and as of 12 Aug the cookbook **still
-prescribes `rocm720-mi35x-k3-20260727`**, the exact image pinned here, for both
-mi350x and mi355x. Moving to mainline puts this deployment ahead of the
-documented recipe, not behind it. (The same cell sets `--kv-cache-dtype fp8_e4m3`
-where this repo leaves it empty. Do not adopt it on faith: sglang
+Upstream's own MI355X cookbook cell is still marked `verified: false` and **still
+prescribes `rocm720-mi35x-k3-20260727`** — the exact image pinned here — for both
+mi350x and mi355x. Migrating puts this deployment ahead of the documented recipe,
+not behind it. (That cell also sets `--kv-cache-dtype fp8_e4m3` where this repo
+leaves it empty. Do not adopt it on faith: sglang
 [#32938](https://github.com/sgl-project/sglang/issues/32938) reports fp8 KV
-*slowing* DSpark. It is one bench run, not a default.)
+*slowing* DSpark.)
+
+Branch commits between the pinned build and the merge that still matter:
+**#32621** (28 Jul) and **#32641** (31 Jul), the two halves of the HIP renorm
+binding; **#32692** (31 Jul), letting ReplaySSM coexist with the `extra_buffer`
+radix strategy ([the KDA section](#k3s-kda-state-pool--the-knobs-we-did-not-pass));
+and *"[Kimi K3] Add reasoning, tool-call, and OpenAI serving"* (1 Aug), which is
+why `./serve-kimik3.sh parsers` is worth re-running against any newer image.
 
 **Merged into `main` since, i.e. present in a `20260810` image:**
 
@@ -1474,7 +1417,7 @@ apptainer exec "$SIF_PATH" grep -o 'top_[kp]_renorm_probs_triton' \
 The default image is built from SGLang's `kimi-k3` branch (PR #32541) and pinned
 to a dated tag. **That branch merged on 4 Aug 2026 and was deleted, and its image
 stream ended at `rocm720-mi35x-k3-20260803`** — see
-[the drift section](#the-branch-merged-and-the-k3-image-stream-ended-with-it).
+[the drift section](#the-branch-merged-mainline-is-the-only-live-stream).
 The pin still works, and every measurement in this file was taken on it, but it
 is now a dead tag on a retired stream. Migrating is a matter of when, not
 whether.
@@ -1554,94 +1497,74 @@ rather than assuming it still holds.
 
 ---
 
-## When the node's ROCm changes
+## The node is ROCm 7.14, the image is 7.2 — and that is fine
 
-The image ships its own ROCm (7.2 in the pinned tag) and the node has its own.
-They do not have to match — but on **28 Jul 2026** RCC moved a test node to
-**ROCm 7.14** and the unchanged toolkit died on import:
+Every MI355X node runs **ROCm 7.14** on bare metal; the pinned image ships
+**7.2**. They do not have to match, and since **28 Jul 2026** this repo has
+handled the mismatch automatically. What follows is why it works, because the
+failure it prevents looks fatal and is not.
+
+The symptom, on an unpatched setup:
 
 ```
 RuntimeError: Get GPU arch from rocminfo failed:
   Command '['/opt/rocm-7.2.0/bin/rocminfo']' returned non-zero exit status 1.
 ```
 
-Note the path: that is the **container's own** 7.2 `rocminfo`, not the node's.
-The image did not change, so the node reached in through one of exactly three
-channels:
+Note the path — that is the **container's own** 7.2 `rocminfo`, not the node's.
+And it is cosmetic. `torch.cuda.device_count()` returns **8** throughout: PyTorch's
+ROCm wheel carries its own HIP runtime, so HIP keeps working while the image's
+standalone ROCm *tools* do not. What the container's `rocminfo` actually prints:
 
-1. **`--rocm` library injection.** Apptainer binds the *node's* ROCm libraries
-   into `/.singularity.d/libs` and prepends that to `LD_LIBRARY_PATH`, so the
-   container's binaries run against them. Apptainer's own docs require the two
-   ROCm versions to be compatible. Fixable: `ROCM_MODE=devices`.
-2. **The kernel driver, via `/dev/kfd`.** A KFD ioctl ABI break is *not*
-   fixable by any bind — it needs an image built for the node's ROCm.
-3. **Inherited `*_VISIBLE_DEVICES`.** A UUID-form list the container's older
-   ROCr cannot parse stops it enumerating any GPU at all, which looks exactly
-   like a dead driver. The script now refuses to forward non-index-form values.
+```
+ROCk module version 6.19.14.31400000 is loaded
+hsa api call failure at: .../rocminfo.cc:357
+Call returned HSA_STATUS_ERROR_INVALID_ARGUMENT
+```
 
-…and a fourth possibility, which is what bun161 turned out to be:
+It loads, reads the driver version, then fails an HSA call against the newer KFD.
+aiter shells out to `rocminfo` purely to *name the architecture* and reports only
+its exit status, which is how a cosmetic failure becomes a fatal one.
 
-4. **Nothing is wrong with the passthrough at all.** `torch.cuda.device_count()`
-   returned **8** in *both* modes — the GPUs were reachable the whole time. Only
-   the `rocminfo` *binary* was failing. PyTorch's ROCm wheel carries its own HIP
-   runtime, so HIP kept working while the image's standalone ROCm 7.2 tools did
-   not. aiter shells out to `rocminfo` purely to name the architecture, and
-   reports only its exit status — which makes a cosmetic failure look fatal.
+**`ROCMINFO_SHIM` (default `auto`) fixes it**, and will keep being necessary for
+as long as the image ships 7.2. The script snapshots the *host's* working
+`rocminfo` output and binds a one-line script replaying it over the container's
+binary — real output for this node, nothing links against it, no host libraries
+involved. `AITER_GPU_ARCHS=gfx950` looks like the obvious fix instead and **does
+not work**: this build of aiter ignores `GPU_ARCHS` at runtime (tested on bun161,
+28 Jul 2026).
 
-   What the image's `rocminfo` actually prints on such a node:
+The node reaches into the container through exactly three channels, worth knowing
+if a future upgrade breaks something the shim does not cover:
 
-   ```
-   ROCk module version 6.19.14.31400000 is loaded
-   hsa api call failure at: .../rocminfo.cc:357
-   Call returned HSA_STATUS_ERROR_INVALID_ARGUMENT
-   ```
+1. **`--rocm` library injection** — Apptainer binds the node's ROCm libraries into
+   `/.singularity.d/libs` and prepends them to `LD_LIBRARY_PATH`. Fixable with
+   `ROCM_MODE=devices`.
+2. **The kernel driver, via `/dev/kfd`** — a KFD ioctl ABI break is not fixable by
+   any bind; it needs an image built for the node's ROCm.
+3. **Inherited `*_VISIBLE_DEVICES`** — a UUID-form list that the container's older
+   ROCr cannot parse stops it enumerating any GPU, which looks exactly like a dead
+   driver. The script refuses to forward non-index-form values.
 
-   It loads, reads the driver version, then fails an HSA call against the newer
-   KFD. **Fix: `ROCMINFO_SHIM` (default `auto`, so this is automatic.)** The
-   script snapshots the *host's* working `rocminfo` output and binds a one-line
-   script replaying it over the container's binary. That is real output for
-   this node, so whatever aiter's parser expects it gets, and nothing links
-   against it — no host libraries are involved.
-
-   `AITER_GPU_ARCHS=gfx950` looks like the obvious fix and **does not work**:
-   the `rocm720-mi35x-k3-20260727` build of aiter ignores `GPU_ARCHS` at
-   runtime (tested on bun161, 28 Jul 2026).
-
-`gpucheck` tells you which one you have, in about a minute:
+`gpucheck` tells you which case you are in, in about a minute:
 
 ```bash
 ./serve-kimik3.sh gpucheck
 ```
 
-It prints both ROCm versions, dumps what the image's `rocminfo` actually says,
-tries every passthrough mode, and gives a verdict — and it distinguishes case 4
-from case 2, because "torch saw 8 GPUs but aiter could not name the arch" and
-"the container cannot reach the GPUs" need completely different responses. Set
-`AITER_GPU_ARCHS` and re-run it to confirm the workaround before committing to
-a long startup.
+It prints both ROCm versions, dumps what the image's `rocminfo` says, tries every
+passthrough mode, and separates "torch saw 8 GPUs but aiter could not name the
+arch" from "the container cannot reach the GPUs" — those need opposite responses.
+`ROCM_MODE=auto` does the same probing at launch and caches the answer per
+node+image, so a working node pays for it once.
 
-`ROCM_MODE=auto` (the default) does the same probing automatically at launch and
-caches the answer per node+image, so a working node pays for it once.
-
-If **torch sees zero devices in every mode**, you are in case 2 and need a
-different image. In order of cost:
-
-```bash
-# 1. Has K3 support landed in a mainline image on a newer ROCm?
-export SGLANG_IMAGE="docker://rocm/sgl-dev:v0.5.13.post1-ubuntu24.04-py3.14-rocm7.14"
-export SIF_PATH="$MODEL_CACHE_DIR/kimik3-rocm714.sif"
-./serve-kimik3.sh pull && ./serve-kimik3.sh check   # needs KimiK3ForConditionalGeneration
-
-# 2. Has upstream rebuilt the K3 image on a newer ROCm? (see the tag query above,
-#    and also check rocm/sgl-dev)
-```
-
-Only if both fail is building one worth it: `sglang/docker/rocm.Dockerfile`
-takes `SGL_BRANCH`, `GPU_ARCH=gfx950` and a `BASE_IMAGE_950_*` override, and
-prebuilds aiter's kernels — 45–90 minutes. The Dockerfile is the easy part;
-**Bunya has no Docker**, so it needs an Apptainer def file with fakeroot (check
-with RCC first) or a machine that does. Serving on the ROCm 7.2 nodes while
-waiting for an upstream 7.14 K3 image is a legitimate answer, not a failure.
+**If torch sees zero devices in every mode**, you need an image built on a newer
+ROCm, and as of 12 Aug 2026 there is not one: the `rocm7_14-mi35x-test` stream
+stopped on **20 Jul**, before K3 existed, and the newer `rocm724` and
+`rocm7.15-mi45x` streams do not help. Building one is `sglang/docker/rocm.Dockerfile`
+with `SGL_BRANCH`, `GPU_ARCH=gfx950` and a `BASE_IMAGE_950_*` override, 45–90
+minutes — and **Bunya has no Docker**, so it needs an Apptainer def with fakeroot
+(check with RCC first) or a machine that does.
 
 ---
 
@@ -1723,7 +1646,7 @@ All knobs live in `kimik3.env` (copied from `kimik3-env.example`). Anything you
 | `SPECULATIVE` | *(empty)* | `dspark` enables DSpark speculative decoding |
 | `DSPARK_MODEL` | `RadixArk/Kimi-K3-DSpark` | Draft model for DSpark |
 | `DSPARK_BLOCK_SIZE` | *(empty)* | `--speculative-dspark-block-size`. Empty infers gamma from the draft (7 today); setting it anchors against draft drift |
-| `REPLAYSSM_SPEC` | `0` | `--enable-gdn-replayssm-spec` — **not** the cookbook's non-existent `--enable-linear-replayssm-spec`. Needs a 20260731+ image ([why](#k3s-kda-state-pool--the-knobs-we-did-not-pass)) |
+| `REPLAYSSM_SPEC` | `0` | `--enable-gdn-replayssm-spec` — **not** the cookbook's non-existent `--enable-linear-replayssm-spec`. Absent from the pinned image, present in mainline ([why](#k3s-kda-state-pool--the-knobs-we-did-not-pass)) |
 | `MAMBA_FULL_MEMORY_RATIO` | *(empty → 0.9)* | KDA state pool vs MLA KV pool. Follows mean request length, not a universal default |
 | `MAMBA_SSM_DTYPE` | *(empty → fp32)* | `bfloat16` halves KDA state memory. Watch accept length |
 | `MAMBA_RADIX_STRATEGY` | *(empty → `extra_buffer`)* | State slots per request: 5 / `extra_buffer_lazy` 4 / `no_buffer` 3 |
@@ -1786,13 +1709,12 @@ All knobs live in `kimik3.env` (copied from `kimik3-env.example`). Anything you
 - **Fluent gibberish**: see Step 5. Try `ENABLE_AITER=0` to rule out the fused
   FP4 kernels, and try a different image tag. Do not ship a config that produces
   incoherent output because the throughput looked good.
-- **`RuntimeError: Get GPU arch from rocminfo failed`** at startup — *hit for
-  real on 28 Jul 2026 when a node moved to ROCm 7.14.* The container cannot
-  reach the GPUs. Run `./serve-kimik3.sh gpucheck`; see
-  [When the node's ROCm changes](#when-the-nodes-rocm-changes) for the three
-  causes and which are fixable. Short version: if `gpucheck` shows torch seeing
-  the GPUs, only `rocminfo` is broken and `ROCMINFO_SHIM=auto` (the default)
-  handles it. `AITER_GPU_ARCHS=gfx950` looks right but is ignored at runtime.
+- **`RuntimeError: Get GPU arch from rocminfo failed`** at startup — the image's
+  7.2 `rocminfo` failing against the node's 7.14 KFD. Usually cosmetic: if
+  `./serve-kimik3.sh gpucheck` shows torch seeing 8 GPUs, only `rocminfo` is
+  broken and `ROCMINFO_SHIM=auto` (the default) handles it. `AITER_GPU_ARCHS=gfx950`
+  looks right and is ignored at runtime. See
+  [The node is ROCm 7.14, the image is 7.2](#the-node-is-rocm-714-the-image-is-72--and-that-is-fine).
 - **KV cache OOM at startup**: set `CONTEXT_LEN=262144` first, and only then
   consider `MEM_FRACTION`. One knob at a time.
 - **Cold start crawls, with bursts and dips**: SGLang went single-threaded. Run
@@ -1870,9 +1792,9 @@ All knobs live in `kimik3.env` (copied from `kimik3-env.example`). Anything you
   default moved to the long-context draft `56ce616a…`, which is a different 4.5 GB
   checkpoint, so the first `git pull` needs one `download`.
 - **`This image has no --enable-gdn-replayssm-spec`** — `REPLAYSSM_SPEC=1` against
-  an image older than 20260731. Expected on the pinned image; see
-  [KDA state pool](#k3s-kda-state-pool--the-knobs-we-did-not-pass). Pull a newer
-  tag into a *second* `SIF_PATH`, or set `REPLAYSSM_SPEC=0`.
+  the pinned image, which predates sglang #32692. Expected there; see
+  [KDA state pool](#k3s-kda-state-pool--the-knobs-we-did-not-pass). Mainline has
+  the flag — migrate into a *second* `SIF_PATH`, or set `REPLAYSSM_SPEC=0`.
 - **The server rejects `--enable-linear-replayssm-spec`** — because it does not
   exist, anywhere. It is an error in upstream's cookbook. Use `REPLAYSSM_SPEC=1`,
   which passes `--enable-gdn-replayssm-spec`. Do **not** substitute
