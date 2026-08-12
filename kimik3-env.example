@@ -192,13 +192,24 @@ export REASONING_PARSER="${REASONING_PARSER:-kimi_k3}"
 # YaRN x16 to 1M, RULER V2 acc_len 4.26 at 1M input), and that retrain is what
 # DSPARK_REVISION now defaults to.
 #
-# What that does NOT yet mean is "turn DSpark on for agentic work". A DSpark step
-# at 106k measured ~128 ms against ~30 ms for a plain decode step, so even a
-# recovered accept length of ~4.3 only lands back at the DSpark-off rate. The step
-# cost is the other half, and it needs a mainline image (sglang #33981). Until
-# that pair is measured on this hardware, leaving this empty for opencode /
-# kimicode remains the measured-safe choice. See the README, 'DSpark collapsed at
-# long context'.
+# MEASURED WITH THE NEW DRAFT, bun161, 12 Aug 2026 — and it is a CROSSOVER, not a
+# yes or a no:
+#
+#     1024   TPOT  5.61 ms  vs 26.49 ms off   -> DSpark 4.7x WIN
+#      32k   TPOT 17.20 ms  vs ~28 ms off     -> DSpark 1.6x WIN
+#     100k   TPOT 51.13 ms  vs 29.83 ms off   -> DSpark 1.7x LOSS
+#
+# The sign flips around 55-60k. Accept length is no longer the problem (6.90 at
+# 100k, against 1.39 on the old draft) — the STEP COST is, and gamma does not
+# move it: block size 3 and 7 land within 2% of each other at 100k.
+#
+# So: "dspark" if your sessions stay under ~50k, empty if they run to 100k+. The
+# practical answer for agentic clients is to compact at 40-50k and leave it on —
+# ~58 tok/s and 1.9 s TTFT, against 33.5 tok/s and 15.5 s at 100k with it off.
+#
+# ON THE PINNED IMAGE, "dspark" IS UNSAFE WITH A REAL CLIENT REGARDLESS — see the
+# sampling bug below. That is the strongest single reason to move to a mainline
+# image. See the README, 'DSpark collapsed at long context'.
 #
 # Default OFF, and there is a sharper reason still than "one failure at a time".
 #
@@ -423,10 +434,15 @@ export PREFETCH_BLOCK_SIZE_MB="${PREFETCH_BLOCK_SIZE_MB:-}"
 #       collapses, which is the whole of the "DSpark inverts at long context"
 #       finding. serve-kimik3.sh warns if you do.
 #
+#       Benchmarked here 12 Aug 2026: at 1024 tokens it is IDENTICAL to the
+#       retrain (309-327 gen tok/s at c=2, accept 6.1-7.7), so nothing is lost
+#       by moving off it except reproducibility of the older tables.
+#
 #   56ce616ad7486f0e96cbb51ef23ed5a1bce1d92d   1 Aug    THE DEFAULT. A
 #       long-context retrain: weights replaced 31 Jul, 65,536 trained, YaRN
 #       factor 16 to 1M. Upstream's card reports RULER V2 acc_len 4.26 on
-#       1M-token inputs. Never benchmarked here yet — that is the next run.
+#       1M-token inputs; measured here it does better than that — accept 6.90
+#       at 100k, against 1.39 for the 4k draft on the same shape.
 #
 # A 40-hex value names a snapshot directly; anything else is treated as a branch
 # or tag, so:

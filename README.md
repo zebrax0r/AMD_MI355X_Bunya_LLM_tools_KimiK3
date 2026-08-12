@@ -660,21 +660,33 @@ single request within 200k, acc len almost firmly 1.5×–3.8×."*
 the draft you resolved has unscaled RoPE. It probes the checkpoint's *rope type*,
 not its sha, so it keeps working the next time upstream rewrites the repo.
 
-#### …but do not turn DSpark back on yet
+#### The fix works, and it moves the problem rather than removing it
 
-The step-rate decomposition above is a prediction, and it is not a flattering one.
-A DSpark step at 106k cost **~128 ms** against ~30 ms for a plain decode step.
-Even at the new draft's RULER acc_len of 4.3, that is `4.3 × 7.8 ≈ 33.5` tok/s —
-**the DSpark-off baseline to three significant figures.** Recovering the accept
-length buys back the loss and roughly nothing more.
+Measured the same day, bun161. Accept length at 100k went **1.39 → 6.90** — past
+the 3–4.5 forecast, and level with what the draft achieves at 1024 tokens. But
+TPOT only improved 87.38 → 52.04 ms, still **1.7× worse than turning DSpark off**,
+because the step cost tripled to 359 ms. Gamma does not help: γ3 gives 51.13 ms,
+1.8% away. Full numbers, and one figure that does not reconcile, in
+[the long-context table](#measured-at-100k--bun160-9-aug-and-bun161-12-aug-2026).
 
-The other half is the step cost, and that needs a newer image: sglang
-[#33981](https://github.com/sgl-project/sglang/pull/33981) rewrote the DSpark
-verify attention for exactly this reason. See
-[The DSpark verify kernel](#the-lever-that-did-land--33981-rewrote-the-dspark-verify-attention).
-Until both halves are measured together on this hardware, `SPECULATIVE=""`
-remains the measured-correct setting for agentic sessions — but it is now a
-pending experiment rather than a conclusion.
+What changed is *where* the line falls. DSpark at **32k** is 17.20 ms TPOT against
+an interpolated ~28 ms baseline — a 1.6× win — so the sign flips somewhere around
+**55–60k**, not below 1024. See
+[the crossover](#the-crossover-is-around-5560k--and-that-is-the-operating-policy).
+
+```bash
+# kimik3.env — sessions that stay under ~50k
+export SPECULATIVE="dspark"      # 4.7x at 1k, ~1.6x at 32k
+# kimik3.env — sessions that run to 100k+
+export SPECULATIVE=""            # 1.7x better there, at any gamma
+```
+
+**On this image the first line is unsafe with a real client**, because DSpark's
+verify reaches renorm kernels the 27 Jul build does not bind — one `top_p < 1.0`
+request kills the server. That is the single strongest reason to move to a
+mainline image, ahead of any of the performance PRs. See
+[The sampling landmine](#the-sampling-landmine--read-this-before-enabling-dspark)
+and [Moving to a mainline image](#moving-to-a-mainline-image).
 
 ---
 
@@ -746,7 +758,7 @@ cost. It is also the number
 [AITER MLA prefill](#the-biggest-lever-we-still-cannot-pull--aiter-mla-prefill)
 would move most.
 
-#### Measured on bun160, 9 Aug 2026 (100k/512, c=1, n=4, TP8)
+#### Measured at 100k — bun160 9 Aug and bun161 12 Aug 2026
 
 Every row is one variable against the previous one. **Read TPOT, not output
 tok/s** — at this shape output throughput is end-to-end and a 15 s prefill
@@ -754,17 +766,81 @@ dominates it, so it says more about TTFT than about decode.
 
 | Config | context | median TPOT | decode tok/s | median TTFT | accept len |
 |---|---|---|---|---|---|
-| DSpark on, `eb03982e` draft *(4k, unscaled RoPE)* | 100k | 87.38 ms | 11.4 | 15.5 s | 1.39 |
+| DSpark γ7, `eb03982e` draft *(4k, unscaled RoPE)* | 100k | 87.38 ms | 11.4 | 15.5 s | 1.39 |
 | **`SPECULATIVE=""`** | 100k | **29.83 ms** | **33.5** | 15.4 s | — |
-| DSpark on, `56ce616a` draft *(the long-context retrain)* | 100k | | | | |
-| mainline image, `SPECULATIVE=""` | 100k | | | | |
-| mainline image + `56ce616a` draft *([#33981](#the-lever-that-did-land--33981-rewrote-the-dspark-verify-attention))* | 100k | | | | |
-| mainline image + `56ce616a` draft | 1024 | | | | |
+| DSpark γ7, `56ce616a` draft *(long-context retrain)* | 100k | 52.04 ms | 19.2 | 15.4 s | **6.90** |
+| DSpark γ3, `56ce616a` | 100k | 51.13 ms | 19.6 | 15.5 s | 2.42 |
+| **DSpark γ3, `56ce616a`** | **32k** | **17.20 ms** | **58.1** | **1.86 s** | 2.86 |
+| DSpark γ7, `56ce616a`, c=2 sweep shape | 1024 | — | 309–327 *(gen)* | — | 6.1–7.7 |
 
-Rows 3–6 are the runbook the 12 Aug upstream review produced, in order. Row 3
-isolates the draft on the pinned image and is **predicted to land near row 2** —
-about 33 tok/s — because the 128 ms step cost is untouched by a better draft. Row
-5 is the one with headroom.
+Rows 1–2 are bun160, 9 Aug 2026. Rows 3–6 are bun161, 12 Aug 2026, after the draft
+pin moved. Row 6 was an accidental run — a sourced `kimik3.env` leaked the sweep
+shape past a named mode — and turned out to be the control that matters: at 1024
+tokens the retrained draft matches the old one exactly (29 Jul gave 306 gen tok/s
+at c=2, accept 7.25–7.29), so **nothing the retrain changed costs anything at
+short context.**
+
+**The prediction failed, in the useful direction.** Row 3 was predicted to land
+near row 2 at ~33 tok/s, on the reasoning that a better draft cannot change the
+128 ms step cost. Accept recovered far past the forecast — 1.39 → **6.90**, where
+the card's 1M RULER figure of 4.26 suggested 3–4.5 — and TPOT still only reached
+52.04 ms, because the step cost *tripled* to `52.04 × 6.90` = 359 ms. The draft
+was the whole of the accept-length problem and none of the throughput problem.
+
+**Gamma is not a lever at 100k.** Rows 3 and 4 differ by 1.8% on TPOT while accept
+length differs by 2.85×; step time and accept fell together and the token rate did
+not move. Gamma was confirmed live from the log — `(accept_len − 1) / accept_rate`
+returned 3.00, 3.00, 2.98, 3.00, 3.01 on five consecutive decode lines — and the
+step rate was flat at 8.56 steps/s (117 ms), matching `51.13 × 2.42` = 124 ms.
+
+*One thing does not reconcile.* Row 4 is internally consistent: a 124 ms step
+against a max ITL of 118.73 ms and P90 of 115.63 — the ITL tail **is** one step.
+Row 3 is not: a 359 ms step should put ~74 gaps of ~359 ms into a 512-token
+stream, and its max ITL is 124.12 ms. Either the reported accept length is not
+tokens-per-verify-step in the sense used here, or ITL is not recording the burst
+boundary. Both rows behave as though the real step is ~120 ms yielding ~2.4
+tokens, which is what γ3 reports and not what γ7 does. **Unresolved** — the test
+is to count `#full token` deltas across decode lines in the server log, which is
+independent of both figures. (It works for γ3: 379 tokens in 19 s = 19.9 tok/s,
+matching its TPOT.)
+
+#### The crossover is around 55–60k — and that is the operating policy
+
+DSpark is a 4.7× win at 1024 and a 1.7× loss at 100k. Interpolating the *step*
+cost — 49 ms at 32k, 124 ms at 100k — against a decode baseline that is nearly
+flat with context puts the sign change at roughly **55–60k**.
+
+| context | DSpark | `SPECULATIVE=""` | |
+|---|---|---|---|
+| 1k | **5.61 ms** (γ7) | 26.49 ms | DSpark **4.7× win** |
+| 32k | **17.20 ms** (γ3) | ~28 ms *(interpolated)* | DSpark **~1.6× win** |
+| 100k | 51.13 ms (γ3) | **29.83 ms** | DSpark **1.7× loss** |
+
+The `~28 ms` is not measured. It is the safest interpolation in this file:
+[decode is nearly context-independent](#k3s-decode-is-nearly-context-independent--the-earlier-claim-was-wrong),
+26.49 ms at 1k against 29.83 ms at 100k. Confirming it costs a full reload and the
+conclusion does not hinge on it.
+
+TTFT matters as much as TPOT here: **1.86 s at 32k against 15.5 s at 100k**, 8.3×
+for 3× the context. Prefill is superlinear where decode is flat — that is the
+[AITER MLA prefill](#the-biggest-lever-we-still-cannot-pull--aiter-mla-prefill)
+lever, still stalled upstream.
+
+So, for agentic sessions, in one line:
+
+> **Compact at 40–50k and leave DSpark on: ~58 tok/s and 1.9 s to first token.
+> Let it drift to 100k and the best available is DSpark off at 33.5 tok/s and
+> 15.5 s.** Roughly 3× the throughput and 8× the latency, decided by session
+> hygiene rather than by any setting.
+
+That closes the question this repo opened with on 9 Aug — *"is the answer to
+compact aggressively, or is something wrong?"* Both. A 4,096-token draft was
+serving a 1M window, **and** compaction is genuinely correct, at a threshold that
+is now measured rather than guessed.
+
+**Untested and worth one reload:** γ7 at 32k. γ3 gave accept 2.86 there; at 1024
+γ7 gives 7.29. If γ7 holds a higher accept at 32k against a similar step, 17.20 ms
+improves further.
 
 **The step-rate model survives contact with a controlled run.**
 `87.38 ms × 1.39 = 121.5 ms` per verify step, against the **128 ms** derived from
@@ -1288,7 +1364,7 @@ long-context draft, and with the collapse here being the 4k checkpoint.
 **This is the missing half of the long-context story.** The retrained draft fixes
 the accept rate; #33981 attacks the 128 ms step. Neither alone is expected to
 beat `SPECULATIVE=""` at 100k — together they might, and that pair is
-[the runbook](#measured-on-bun160-9-aug-2026-100k512-c1-n4-tp8) rows 3 and 5.
+[the runbook](#measured-at-100k--bun160-9-aug-and-bun161-12-aug-2026) rows 3 and 5.
 
 ### The biggest lever we still cannot pull — AITER MLA prefill
 
@@ -1425,7 +1501,7 @@ variables if anything regresses. Same procedure for trying any newer image.
 
 Ordered by value per minute of allocation, from the upstream review. Every bench
 row is `longcontext` (100k/512, c=1, n=4) unless stated, and fills a row of the
-[long-context table](#measured-on-bun160-9-aug-2026-100k512-c1-n4-tp8).
+[long-context table](#measured-at-100k--bun160-9-aug-and-bun161-12-aug-2026).
 
 **0 — fetch the new draft.** Login node, ~4.5 GB, no GPU:
 

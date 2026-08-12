@@ -69,6 +69,35 @@ if [[ -f "$ENV_FILE" ]]; then
     source "$ENV_FILE"
 fi
 
+# The pre-source capture above is necessary but NOT sufficient, and that gap cost
+# a 100k run on 12 Aug 2026. This README tells you to 'source kimik3.env' for
+# MODEL_CACHE_DIR and friends — and once you have, the whole config file is in the
+# environment, so the capture records the sweep shape as though the caller had
+# typed it. All four values arrived together, which is the signature.
+#
+# By value alone the two cases are indistinguishable. So ask the config file what
+# IT sets, in a subshell with these four unset, and treat an exact match as "this
+# came from the config file". A caller passing precisely the configured value
+# while also naming a shape mode is contradicting themselves; any other value
+# still wins, so 'BENCH_INPUT_LEN=32768 ./bench-kimik3.sh longcontext' is intact.
+if [[ -f "$ENV_FILE" ]]; then
+    cfg_shape="$(env -u BENCH_INPUT_LEN -u BENCH_OUTPUT_LEN \
+                     -u BENCH_NUM_PROMPTS -u BENCH_CONCURRENCY \
+        bash -c 'source "$1" >/dev/null 2>&1
+                 printf "%s\n%s\n%s\n%s\n" "${BENCH_INPUT_LEN:-}" \
+                     "${BENCH_OUTPUT_LEN:-}" "${BENCH_NUM_PROMPTS:-}" \
+                     "${BENCH_CONCURRENCY:-}"' _ "$ENV_FILE" 2>/dev/null || true)"
+    { read -r CFG_BENCH_INPUT_LEN
+      read -r CFG_BENCH_OUTPUT_LEN
+      read -r CFG_BENCH_NUM_PROMPTS
+      read -r CFG_BENCH_CONCURRENCY
+    } <<<"$cfg_shape"
+    for _v in BENCH_INPUT_LEN BENCH_OUTPUT_LEN BENCH_NUM_PROMPTS BENCH_CONCURRENCY; do
+        _cli="CLI_$_v"; _cfg="CFG_$_v"
+        [[ -n "${!_cli:-}" && "${!_cli}" == "${!_cfg:-}" ]] && declare "$_cli="
+    done
+fi
+
 PORT="${PORT:-30000}"
 SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-kimi-k3}"
 MODEL_CACHE_DIR="${MODEL_CACHE_DIR:-}"
@@ -196,14 +225,14 @@ if [[ "$MODE" == "longcontext" ]]; then
     log "  Expect a long wait before the first token. Prefill at this size is the"
     log "  slow path on ATTENTION_BACKEND=triton, and that TTFT is itself a result."
     if [[ "${SPECULATIVE:-}" == "dspark" ]]; then
-        warn "  SPECULATIVE=dspark. At this context length DSpark measured a NET LOSS"
-        warn "  here on 9 Aug 2026 — accept length 1.0-1.5 against 7.29 at 1024 — but"
-        warn "  that was a draft trained at 4,096 tokens. If DSPARK_REVISION is the"
-        warn "  current default (56ce616a, the long-context retrain), this run is the"
-        warn "  open experiment, not a repeat. Watch 'accept len' in $LOG_FILE: below"
-        warn "  ~2 the draft is out of its depth, near 4+ it is working as advertised."
-        warn "  Either way run this mode again with SPECULATIVE=\"\" and compare — that"
-        warn "  pair is the point of the mode."
+        warn "  SPECULATIVE=dspark. Measured 12 Aug 2026 with the long-context draft:"
+        warn "  DSpark WINS below ~55k (17.20 ms TPOT at 32k vs ~28 ms off) and LOSES"
+        warn "  above it (51.13 ms at 100k vs 29.83 ms off). Gamma is not a lever at"
+        warn "  100k — block size 3 and 7 land within 2% of each other. Run this mode"
+        warn "  again with SPECULATIVE=\"\" and compare; that pair is the point of the"
+        warn "  mode. Watch 'accept len' in $LOG_FILE — below ~2 at any"
+        warn "  context means the draft is out of its depth, which is a DIFFERENT"
+        warn "  failure from the step simply costing too much."
     fi
 fi
 
