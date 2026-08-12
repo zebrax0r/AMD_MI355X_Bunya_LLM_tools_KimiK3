@@ -26,6 +26,7 @@ validated 8× MI355X recipe**. This repo reproduces that recipe.
 | Throughput | **918 / 2074 / 3793 tok/s** at concurrency 2 / 8 / 32, measured here at 1024/512 with DSpark. Upstream's `820 / 2356 / 4898` is a different, unpublished workload — [why](#measured-on-bun161-29-jul-2026-dspark-1024512-tp8) |
 | Tool calling / thinking | `--tool-call-parser kimi_k3 --reasoning-parser kimi_k3` |
 | Auth | Bearer API key, auto-generated into `$MODEL_CACHE_DIR/kimik3-api-key` |
+| Clients | **opencode and kimicode both verified end to end** — tool calls, edits, long sessions |
 
 **Why SGLang and not vLLM.** vLLM has K3 support in flight (PR #50000), but its
 day-0 image is `vllm/vllm-openai:kimi-k3` — **NVIDIA only, no ROCm build** — and
@@ -326,10 +327,9 @@ drive this server too — Kimi's coding agent on a self-hosted Kimi model. Nothi
 changes on the server side: `--host 0.0.0.0`, `--api-key` and the `kimi_k3`
 parsers already do everything it needs.
 
-> **Not yet verified on Bunya — written 1 Aug 2026 from Moonshot's published
-> config schema, not from a run.** The setup script itself is tested; the
-> end-to-end agentic loop is not. Verify before trusting it, and see the checklist
-> at the end of this section.
+**Verified on Bunya, 12 Aug 2026** — end-to-end agentic loop, against a live
+server on bun161. Written 1 Aug from Moonshot's published config schema and
+confirmed by use since.
 
 **First, get the right `kimi`.** Moonshot ships two products whose binary is both
 called `kimi`, and following a stale blog post lands you in the wrong config file
@@ -390,7 +390,8 @@ export KIMI_MODEL_MAX_CONTEXT_SIZE=1048576
 kimi
 ```
 
-Verify in this order, cheapest first:
+If you are setting it up fresh, or after an image change, verify in this order —
+cheapest first:
 
 ```bash
 ./serve-kimik3.sh toolcheck                       # 1. server-side tool loop
