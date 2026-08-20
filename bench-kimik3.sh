@@ -233,6 +233,10 @@ if [[ "$MODE" == "longcontext" ]]; then
         warn "  mode. Watch 'accept len' in $LOG_FILE — below ~2 at any"
         warn "  context means the draft is out of its depth, which is a DIFFERENT"
         warn "  failure from the step simply costing too much."
+        warn "  NOTE those numbers were taken on the retired day-0 image. The 20 Aug"
+        warn "  default moves BOTH sides — sglang #33981 rewrote the DSpark verify"
+        warn "  attention, and MLA_DECODE_TUNE=1 (#34580) speeds decode either way —"
+        warn "  so treat the ~55-60k crossover as provisional until you re-measure it."
     fi
 fi
 
@@ -240,7 +244,7 @@ fi
 # Upstream moved the implementation to sglang.benchmark.serving and left
 # sglang.bench_serving as a shim. PREFER THE OLD PATH WHEREVER IT EXISTS.
 #
-# Measured 9 Aug 2026, and it cost a run: the pinned 20260727 image carries
+# Measured 9 Aug 2026, and it cost a run: the day-0 20260727 image carries
 # BOTH, and the new module imports disaggregation.utils -> quantization ->
 # aiter at module scope, which the old one never touches. This benchmark is a
 # pure HTTP client that needs no GPU and no kernels, so the lighter import

@@ -64,14 +64,69 @@ else
 fi
 
 MODEL_ID="${MODEL_ID:-moonshotai/Kimi-K3}"
+# The WEIGHTS have not changed since 27 Jul 2026, but the REPO is live: on 20 Aug
+# it took its first commit in three weeks (a590ce09, "Update encoding_k3.py").
+# That file is Moonshot's reference chat encoder — it is NOT in
+# tokenizer_config.json's auto_map (which names tokenization_kimi), so SGLang
+# never loads it, and SGLang reimplements the same logic in kimik3_detector.py.
+# Harmless in itself. The point is that an UNPINNED MODEL_ID means the next
+# `download` silently takes whatever is on main, into a 1.5 TB cache.
+#
+# 9f62e4e9 is the 27 Jul tip — the state every number in the README was measured
+# against. Empty, or "main", tracks the branch instead. Moving the pin is cheap:
+# the HF cache is content-addressed per blob, so a new revision re-fetches only
+# the files that actually differ, not the whole checkpoint.
+MODEL_REVISION="${MODEL_REVISION:-9f62e4e9fffbd0a83ddd60e1c209d828994b3569}"
 SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-kimi-k3}"
-SGLANG_IMAGE="${SGLANG_IMAGE:-docker://lmsysorg/sglang-rocm:rocm720-mi35x-k3-20260727}"
+# THE DEFAULT MOVED ON 20 AUG 2026. rocm720-mi35x-k3-20260727 was a day-0 branch
+# build; that stream ended at ...k3-20260803 and the branch itself was deleted on
+# 4 Aug. This is mainline, and it carries four things the old tag cannot:
+#   #33981 (8 Aug)  DSpark's verify step ran an MHA kernel over K3's MLA, re-reading
+#                   the shared latent once per query head — ~12x redundant at TP8.
+#   #34580 (18 Aug) gfx950 MLA decode stage-1 geometry. AMD measured 46-73% ITL at
+#                   long context. Opt-in: see MLA_DECODE_TUNE below.
+#   #34881 (18 Aug) four Kimi-K3 tool-call defects, two of them silent. Carries one
+#                   BEHAVIOUR CHANGE: tool_choice=required together with
+#                   response_format/regex/ebnf is now a 400, not a warning.
+#   #33694 (6 Aug)  temperature > 0 took the scheduler down on ROCm — plus both HIP
+#                   renorm bindings (#32621, #32641), retiring the top_p/top_k
+#                   landmine this script has warned about since July.
+# Why rocm724 and not rocm720: upstream made ROCm 7.2.4 its primary AMD PR gate on
+# 20 Aug (#35602) and runs both flavours nightly (#35603), so 7.2.4 is what their
+# CI tests first now. It brings Ubuntu 24.04 and Python 3.12 with it. torch 2.11
+# and triton 3.7 (#30984) land only in tags dated 20260822 and later.
+#
+# HOW TO READ A TAG DATE: the nightly cron starts at 12:00 UTC and the date is
+# stamped at PUSH time, roughly 22 h later — v0.5.17-*-20260820 was pushed at
+# 09:51 UTC on 20 Aug, so it is main as of 12:00 UTC on the 19th. A tag contains a
+# PR only if it is dated at least two days after that PR merged.
+#
+# rocm720-mi35x-k3-20260727 stays the ANCHOR for every number measured before
+# 20 Aug 2026. Set it explicitly, with the old SIF_PATH, to reproduce them — or to
+# roll back, which costs nothing: no weight in the cache changes.
+SGLANG_IMAGE="${SGLANG_IMAGE:-docker://lmsysorg/sglang-rocm:v0.5.17-rocm724-mi35x-20260820}"
 PORT="${PORT:-30000}"
 TP_SIZE="${TP_SIZE:-8}"
 DP_SIZE="${DP_SIZE:-1}"
 CONTEXT_LEN="${CONTEXT_LEN:-}"
 MEM_FRACTION="${MEM_FRACTION:-0.85}"
 ATTENTION_BACKEND="${ATTENTION_BACKEND:-triton}"
+# sglang #34580, merged 18 Aug 2026, mainline images only. K3's MLA decode ran
+# stage-1 with constants tuned on CDNA3: BLOCK_N 16 where gfx950's MFMA tiles want
+# 32, a KV split budget treated as a rounding target so a split could overshoot by
+# a full wave, and stage 2 overwriting the caller's split count. AMD measured
+# 46-73% better ITL at LONG CONTEXT, 2-12% short, GSM8K unchanged (0.953 vs 0.955).
+#
+# It applies here on every count — _mla_tuning_applies() wants HIP, MLA,
+# head_dim 576, gfx95, and this env var; K3 is 576 and ATTENTION_BACKEND=triton is
+# the path the patch touches. It is the first upstream change aimed squarely at the
+# number this deployment is stuck on: decode cost at 100k.
+#
+# OFF BY DEFAULT UPSTREAM, and off here, for one reason worth repeating: it
+# REORDERS THE FP32 ACCUMULATION, so output is not bit-identical to the untuned
+# path. Treat it as an A/B with a benchmark, not as a setting. Restart-level —
+# it is read at launch, not per request.
+MLA_DECODE_TUNE="${MLA_DECODE_TUNE:-}"
 MODEL_DTYPE="${MODEL_DTYPE:-bfloat16}"
 CUDA_GRAPH_MAX_BS_DECODE="${CUDA_GRAPH_MAX_BS_DECODE:-256}"
 DISABLE_RADIX_CACHE="${DISABLE_RADIX_CACHE:-0}"
@@ -900,6 +955,57 @@ fi
 # ── check mode: can this image load this model? ─────────────────────────────
 # The cheap gate before committing to a ~1.5 TB download.
 
+# ── What levers does this image actually have? ──────────────────────────────
+#
+# A tag date is a build stamp, not a capability list, and the three things that
+# decide this deployment's performance move on three different clocks: sglang
+# main (daily), the aiter commit pinned INSIDE the image (unchanged since 29 Jul
+# 2026), and the ROCm flavour. Ask the image, the way renorm_bindings() below
+# does — one exec, textual, no import, cached, whole-line markers.
+#
+# Absence of `probed` means "could not tell" and must never be read as "the lever
+# is missing". That distinction is the whole lesson of the 12 Aug 'check' failure.
+IMAGE_LEVERS=""
+IMAGE_LEVERS_PROBED=0
+image_levers() {
+    if (( ! IMAGE_LEVERS_PROBED )); then
+        IMAGE_LEVERS_PROBED=1
+        IMAGE_LEVERS="$(apptainer exec "$SIF_PATH" bash -c '
+            root=/sgl-workspace/sglang/python/sglang
+            # Bounded search, and never a bare `find /`: MODEL_CACHE_DIR is 1.5 TB.
+            [[ -d "$root" ]] || root=$(find /sgl-workspace /opt /usr/lib /usr/local \
+                -maxdepth 7 -type d -path "*/python/sglang" 2>/dev/null | head -1)
+            [[ -n "$root" && -d "$root" ]] || exit 0
+            # #34580 (18 Aug 2026): gfx950 MLA decode stage-1 geometry, 46-73% ITL
+            # at long context. The env var is the whole interface.
+            grep -qs SGLANG_MLA_DECODE_TUNE "$root/srt/environ.py" && echo mla_tune
+            # #33981 (8 Aug 2026): the DSpark verify kernel that stops re-reading
+            # K3s shared MLA latent once per query head, ~12x redundant at TP8.
+            [[ -e "$root/kernels/ops/attention/verify_mla.py" ]] && echo verify_mla
+            # #34881 (18 Aug 2026): four Kimi-K3 tool-call defects. Two markers,
+            # both required, because either alone could plausibly pre-exist — the
+            # stream-truncation log line it added to the detector, and the
+            # "which marker came first" index the reasoning parser now computes.
+            if grep -qs "tools section ended with no complete tool call" \
+                    "$root/srt/function_call/kimik3_detector.py" \
+               && grep -qs "tools_idx" "$root/srt/parser/reasoning_parser.py"; then
+                echo k3_toolcall_fixes
+            fi
+            # aiter is pinned inside the image, independently of the sglang commit,
+            # and it is what the four SGLANG_/AITER_ env vars select. AITER_COMMIT
+            # is a real ENV in the published images; the git checkout keeps its
+            # .git, so there is a second opinion available.
+            a="${AITER_COMMIT:-}"
+            [[ -n "$a" ]] || a=$(git -C /sgl-workspace/aiter rev-parse HEAD 2>/dev/null || true)
+            [[ -n "$a" ]] && echo "aiter=${a:0:8}"
+            echo probed
+        ' 2>/dev/null || true)"
+    fi
+    printf '%s' "$IMAGE_LEVERS"
+}
+lever_has()   { grep -qxF "$1" <<<"$(image_levers)"; }
+lever_aiter() { sed -n 's/^aiter=//p' <<<"$(image_levers)" | head -1; }
+
 if [[ "$MODE" == "check" ]]; then
     log "Image:   $SIF_PATH"
     log "Model:   $MODEL_ID"
@@ -975,6 +1081,35 @@ if missing:
     sys.exit(1)
 print("\n  => This image can load this model. Safe to download the weights.")
 PY
+    echo
+    if lever_has probed; then
+        log "Image levers (a tag date is a build stamp, not a capability list):"
+        if lever_has verify_mla; then
+            log "  OK   #33981 verify_mla — DSpark's verify reads K3's MLA latent once, not once per head."
+        else
+            warn "  MISS #33981 verify_mla — DSpark verify runs an MHA kernel over MLA here."
+        fi
+        if lever_has mla_tune; then
+            log "  OK   #34580 SGLANG_MLA_DECODE_TUNE — set MLA_DECODE_TUNE=1 to use it (A/B it)."
+        else
+            warn "  MISS #34580 MLA decode tuning — MLA_DECODE_TUNE=1 would be inert on this image."
+        fi
+        if lever_has k3_toolcall_fixes; then
+            log "  OK   #34881 Kimi-K3 tool-call fixes appear present."
+        else
+            warn "  MISS #34881 — tool calls emitted before the reasoning marker are eaten as
+       reasoning, and a truncated tool section at stream end vanishes silently."
+        fi
+        aiter_sha="$(lever_aiter)"
+        if [[ -n "$aiter_sha" ]]; then
+            log "  aiter pin: $aiter_sha  (every published image through 20 Aug 2026 is d9e5ef7c,
+       29 Jul — aiter's own K3 gfx950 tuning since then ships in none of them)"
+        fi
+    else
+        warn "Could not read the image's sglang tree; no lever report."
+    fi
+    echo
+
     case "$rc" in
         0) log "check passed." ;;
         1) warn "check FAILED: this image cannot serve $MODEL_ID." ;;
@@ -1008,6 +1143,49 @@ if [[ "$weights_cached" -eq 0 ]]; then
     log "Weights not cached — first start downloads ~${EST_GB} GB. Run './serve-kimik3.sh download' first."
 else
     log "Found cached weights for $MODEL_ID."
+fi
+
+# Pin the WEIGHTS the way the draft is pinned, and for the same reason: a cache
+# can hold several snapshots at once, and `--model-path <repo id>` reads whichever
+# one refs/main points at — not necessarily the one this script just checked. That
+# cost a launch on the draft side on 1 Aug 2026. moonshotai/Kimi-K3 stood still
+# for three weeks and then moved on 20 Aug, so it is no longer hypothetical here
+# either. Resolve to a PATH and hand SGLang that.
+#
+# Serve only: 'download' has to be able to run when the pinned snapshot is exactly
+# what is missing, and 'check'/'parsers' never touch the weights at all.
+MODEL_PATH="$MODEL_ID"
+if [[ "$MODE" == "serve" ]] && (( weights_cached )); then
+    model_pin="tracking ${MODEL_REVISION:-main}"
+    if [[ "$MODEL_REVISION" =~ ^[0-9a-f]{40}$ ]]; then
+        model_pin="pinned"
+        MODEL_PATH="$weights_dir/snapshots/$MODEL_REVISION"
+        # Cheap to fix, and worth saying so: the HF cache stores one blob per
+        # content hash and a snapshot is symlinks into it, so fetching another
+        # revision of the same repo transfers only the files that actually differ.
+        [[ -d "$MODEL_PATH" ]] || die "MODEL_REVISION=$MODEL_REVISION is not in the cache.
+  Fetch it first:   MODEL_REVISION=$MODEL_REVISION ./serve-kimik3.sh download
+  That is NOT another 1561 GB: same-content files are already in blobs/ and are
+  symlinked into the new snapshot. Only what changed transfers.
+  Or track the branch instead:   MODEL_REVISION=main"
+    else
+        model_ref="$weights_dir/refs/${MODEL_REVISION:-main}"
+        if [[ -r "$model_ref" ]]; then
+            MODEL_PATH="$weights_dir/snapshots/$(<"$model_ref")"
+        else
+            MODEL_PATH="$(ls -1dt "$weights_dir"/snapshots/*/ 2>/dev/null | head -1)"
+            MODEL_PATH="${MODEL_PATH%/}"
+        fi
+        # Fall back to the repo id rather than passing an empty --model-path: a
+        # cache that is present but unreadable is SGLang's problem to report, not
+        # ours to guess at.
+        [[ -n "$MODEL_PATH" && -d "$MODEL_PATH" ]] || MODEL_PATH="$MODEL_ID"
+    fi
+    [[ "$MODEL_PATH" == "$MODEL_ID" ]]         || log "Weights: $MODEL_ID -> $(basename "$MODEL_PATH") ($model_pin)"
+elif [[ "$MODE" == "serve" && -n "$MODEL_REVISION" ]]; then
+    warn "MODEL_REVISION=$MODEL_REVISION cannot be enforced: the weights are not cached,
+  so SGLang will resolve $MODEL_ID through the hub and take whatever main is.
+  Run './serve-kimik3.sh download' first if the revision matters."
 fi
 
 # The draft is a SEPARATE checkpoint, and nothing above covers it. Without this
@@ -1109,14 +1287,18 @@ fi
 # ── Download mode (no GPU required) ─────────────────────────────────────────
 
 if [[ "$MODE" == "download" ]]; then
-    log "Prefetching $MODEL_ID into $MODEL_CACHE_DIR (~${EST_GB} GB, no GPU required) ..."
+    # Same pinning discipline as the draft below. An empty MODEL_REVISION tracks
+    # main; a sha fetches that snapshot, re-using every blob already in the cache.
+    model_rev_arg=""
+    [[ -n "$MODEL_REVISION" ]] && model_rev_arg=" --revision '$MODEL_REVISION'"
+    log "Prefetching $MODEL_ID${MODEL_REVISION:+ @ ${MODEL_REVISION:0:8}} into $MODEL_CACHE_DIR (~${EST_GB} GB, no GPU required) ..."
     apptainer exec \
         --bind "$MODEL_CACHE_DIR":"$MODEL_CACHE_DIR" \
         --env HF_HOME="$MODEL_CACHE_DIR" \
         --env HF_TOKEN="${HF_TOKEN:-}" \
         --env HF_HUB_ENABLE_HF_TRANSFER=1 \
         "$SIF_PATH" \
-        bash -c "hf download '$MODEL_ID' || huggingface-cli download '$MODEL_ID'" \
+        bash -c "hf download '$MODEL_ID'$model_rev_arg || huggingface-cli download '$MODEL_ID'$model_rev_arg" \
         || die "Weights download failed. Re-run to resume."
 
     if [[ "$SPECULATIVE" == "dspark" ]]; then
@@ -1347,8 +1529,9 @@ image_help() {
 #   sglang #32621 (28 Jul 07:37 UTC)  aliased top_P  -> a Triton kernel
 #   sglang #32641 (31 Jul 06:21 UTC)  added  top_K   -> a Triton kernel
 #
-# Our pinned rocm720-mi35x-k3-20260727 was pushed 28 Jul 05:48 UTC — about two
-# hours before the first of those. It has NEITHER, so both names are None, and
+# rocm720-mi35x-k3-20260727 — the default until 20 Aug 2026, and the anchor for
+# every number measured before it — was pushed 28 Jul 05:48 UTC, about two hours
+# before the first of those. It has NEITHER, so both names are None, and
 # calling one is `TypeError: 'NoneType' object is not callable` inside the
 # scheduler's event loop. That kills the SERVER, not the request (sglang #32569).
 #
@@ -1456,9 +1639,9 @@ if [[ "$SPECULATIVE" == "dspark" ]]; then
         else
             die "This image has no --enable-gdn-replayssm-spec.
   Coexistence with the extra_buffer radix strategy landed upstream on 31 Jul 2026
-  (sglang #32692), AFTER the pinned rocm720-mi35x-k3-20260727 build. Pull a
-  mainline v0.5.17-rocm720-mi35x-* image into a SECOND SIF_PATH and test it there
-  — see the README, 'Moving to a mainline image' — or set REPLAYSSM_SPEC=0."
+  (sglang #32692), after the retired rocm720-mi35x-k3-20260727 build. The default
+  image carries it, so this means SGLANG_IMAGE points at a pre-Aug build — move
+  forward, or set REPLAYSSM_SPEC=0."
         fi
     fi
 
@@ -1487,8 +1670,10 @@ if [[ "$SPECULATIVE" == "dspark" ]]; then
             warn "  not just that request. One such request poisons its whole batch."
             warn "  Safe only while every client leaves top_p at 1.0 and top_k unset."
         fi
-        warn "  Real fix: a mainline v0.5.17-rocm720-mi35x-* image (sglang #32621 +"
-        warn "  #32641), tested in a SECOND SIF_PATH first. Zero-risk: unset SPECULATIVE."
+        warn "  The default image (v0.5.17-rocm724-mi35x-*) already carries the fix"
+        warn "  (sglang #32621 + #32641), so seeing this means SGLANG_IMAGE has been"
+        warn "  pointed BACKWARDS — at rocm720-mi35x-k3-20260727 or another pre-Aug"
+        warn "  build. Move forward, or unset SPECULATIVE, which is zero-risk."
     fi
 
     # The second landmine, and the one a real client is far likelier to step on:
@@ -1498,8 +1683,8 @@ if [[ "$SPECULATIVE" == "dspark" ]]; then
         warn "  never binds tree_speculative_sampling_target_only — the kernel does not"
         warn "  exist on ROCm at all. A request with TEMPERATURE > 0 then raises"
         warn "  \"NameError: tree_speculative_sampling_target_only\" and KILLS THE SERVER"
-        warn "  (sglang #33694, fixed 6 Aug 2026 — mainline images only). Safe only"
-        warn "  while every client sends temperature 0, which toolcheck and the bench do."
+        warn "  (sglang #33694, fixed 6 Aug 2026 — carried by the default image). Safe"
+        warn "  only while every client sends temperature 0, as toolcheck and the bench do."
     fi
 
     # A draft has its own trained context, and past it the accept rate does not
@@ -1580,6 +1765,25 @@ if [[ "$ENABLE_AITER" == "1" ]]; then
     else
         warn "FLYDSL_FORCE=0 — using aiter's prebuilt gemm path, below upstream's numbers."
     fi
+fi
+
+# sglang #34580's gfx950 MLA decode geometry. An env var, not a flag, so an image
+# that has never heard of it ignores it silently — which is the safe direction,
+# but also means a typo or an old image costs you a benchmark before you notice.
+# So probe, and say so: the marker comes from the image's own environ.py.
+if [[ "$MLA_DECODE_TUNE" == "1" ]]; then
+    aiter_env+=(--env SGLANG_MLA_DECODE_TUNE=1)
+    if lever_has probed && ! lever_has mla_tune; then
+        warn "MLA_DECODE_TUNE=1 but this image has no SGLANG_MLA_DECODE_TUNE (sglang"
+        warn "  #34580, merged 18 Aug 2026). The variable is INERT here — whatever you"
+        warn "  measure is the untuned path. Use a v0.5.17-*-2026082x or later image."
+    else
+        log "MLA_DECODE_TUNE=1 — gfx950 MLA decode stage-1 tuning (sglang #34580)."
+        log "  AMD measured 46-73% better ITL at long context. It reorders the fp32"
+        log "  accumulation, so results are not bit-identical to the untuned path."
+    fi
+elif [[ -n "$MLA_DECODE_TUNE" && "$MLA_DECODE_TUNE" != "0" ]]; then
+    warn "MLA_DECODE_TUNE=$MLA_DECODE_TUNE is not 1 or 0 — treating it as off."
 fi
 
 # Skips the decode-time mamba lock, freeing one resident KDA state slot per
@@ -1679,7 +1883,7 @@ if [[ -n "$loader_cfg" ]]; then
 fi
 
 cmd=("${launcher[@]}"
-     --model-path "$MODEL_ID"
+     --model-path "$MODEL_PATH"
      --served-model-name "$SERVED_MODEL_NAME"
      --trust-remote-code
      --tp "$TP_SIZE"
@@ -1931,7 +2135,7 @@ cat <<EOF
   $SERVED_MODEL_NAME is up and serving on Bunya's MI355X.
 
   Model:       $MODEL_ID
-  Layout:      TP=$TP_SIZE, ctx=${CONTEXT_LEN:-model max (1M)}, spec=${SPECULATIVE:-off}
+  Layout:      TP=$TP_SIZE, ctx=${CONTEXT_LEN:-model max (1M)}, spec=${SPECULATIVE:-off}${MLA_DECODE_TUNE:+, mla-decode-tune=$MLA_DECODE_TUNE}
   Node:        $NODE_HOST     (job $JOBID)
   Endpoint:    http://$NODE_HOST:$PORT/v1   (OpenAI-compatible)
   Model name:  $SERVED_MODEL_NAME

@@ -36,36 +36,72 @@ export HF_TOKEN_FILE="${HF_TOKEN_FILE:-}"
 # Moonshot's release directly.
 export MODEL_ID="${MODEL_ID:-moonshotai/Kimi-K3}"
 
+# Pin the weights to a commit, the way SPECULATIVE's draft is pinned below.
+# The weights themselves have not changed since 27 Jul 2026 — but the repo took
+# its first commit in three weeks on 20 Aug (encoding_k3.py, Moonshot's reference
+# chat encoder; SGLang does not load it and reimplements the same logic itself),
+# which is enough to prove the repo is live. Without a pin, `--model-path <repo
+# id>` reads whichever snapshot refs/main happens to point at, which is not
+# necessarily the one this script just checked. That cost a launch on the draft
+# side on 1 Aug.
+#
+# 9f62e4e9 is the 27 Jul tip: the state every number in the README was measured
+# against. Set it empty, or to "main", to track the branch instead. Changing this
+# is cheap — the HF cache stores one blob per content hash, so a new revision
+# re-fetches only the files that actually differ, never 1.5 TB again.
+export MODEL_REVISION="${MODEL_REVISION:-9f62e4e9fffbd0a83ddd60e1c209d828994b3569}"
+
 # The name clients put in the OpenAI "model" field.
 export SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-kimi-k3}"
 
 # ── Container image ─────────────────────────────────────────────────────────
 
-# SGLang's day-0 AMD image for Kimi K3 on gfx950 (issue #32548).
+# THE DEFAULT MOVED ON 20 AUG 2026, from the day-0 branch image
+# (rocm720-mi35x-k3-20260727) to mainline. That branch — PR #32541 — merged on
+# 4 Aug and was deleted; its image stream ended at rocm720-mi35x-k3-20260803 and
+# has not been rebuilt since. Every number in the README dated before 20 Aug 2026
+# was measured on the old tag, and setting it explicitly (with the old SIF_PATH)
+# is how you reproduce them or roll back. Nothing in the weight cache changes.
 #
-# NOTE: this is built from the 'kimi-k3' branch (PR #32541), not from main. It
-# is pinned to a dated tag on purpose, and every measurement in the README was
-# taken on it. THAT BRANCH MERGED ON 4 AUG 2026 AND WAS DELETED; its image stream
-# ended at rocm720-mi35x-k3-20260803 and has not been rebuilt since. The
-# successor is the mainline lmsysorg/sglang-rocm:v0.5.1x-rocm720-mi35x-* series,
-# built nightly from main. As of 12 Aug 2026 there is a concrete reason to move:
-# sglang #33981 (merged 8 Aug) replaced the DSpark target-verify attention, which
-# had been running an MHA kernel over K3's MLA and re-reading the shared latent
-# once per head — 12x redundant at TP8, ~24 calls per step. AMD measured ITL
-# 1.45-2.42x on 8xMI355X with the same four aiter env vars this file sets.
-# v0.5.17-rocm720-mi35x-20260810 is the suggested target (the 0811 build dropped
-# a 5.4 GB layer, so verify the prebuilt aiter modules are still there first).
+# What mainline carries that the day-0 tag cannot:
+#   #33981 (8 Aug)   DSpark's verify step ran an MHA kernel over K3's MLA,
+#                    re-reading the shared latent once per query head — ~12x
+#                    redundant at TP8, ~24 calls a step. AMD measured ITL
+#                    1.45-2.42x on 8xMI355X with the four aiter vars this file sets.
+#   #34580 (18 Aug)  gfx950 MLA decode stage-1 geometry: 46-73% better ITL at LONG
+#                    CONTEXT, 2-12% short. Opt-in — see MLA_DECODE_TUNE below.
+#   #34881 (18 Aug)  four Kimi-K3 tool-call defects, two of them silent, including
+#                    tool calls emitted before the reasoning marker being eaten as
+#                    reasoning content. One behaviour change: tool_choice=required
+#                    together with response_format/regex/ebnf is now a 400.
+#   #33694 (6 Aug)   temperature > 0 took the whole scheduler down on ROCm — plus
+#                    both HIP renorm bindings (#32621, #32641), retiring the
+#                    top_p/top_k landmine described further down this file.
 #
-# Migrate into a SECOND SIF_PATH and re-verify with './serve-kimik3.sh check',
-# then 'parsers', 'toolcheck' and a full bench — a mainline image moves the
-# attention, sampling and speculative paths at once. See the README, "Moving to
-# a mainline image".
+# Why rocm724 rather than rocm720: upstream made ROCm 7.2.4 its primary AMD PR
+# gate on 20 Aug (#35602) and runs both flavours nightly (#35603), so 7.2.4 is
+# what their CI now tests first. It brings Ubuntu 24.04 and Python 3.12; torch
+# 2.11 and triton 3.7 (#30984) land only in tags dated 20260822 or later.
 #
-# The image ships its OWN ROCm (7.2 in this tag). It does not have to match the
+# READING A TAG DATE: the nightly cron starts at 12:00 UTC and the date is stamped
+# at push time, ~22 h later — v0.5.17-*-20260820 was pushed 09:51 UTC on 20 Aug,
+# so it is main as of 12:00 UTC on the 19th. A tag contains a PR only if it is
+# dated at least two days after that PR merged. And check the image's own
+# AITER_COMMIT, not just the tag: './serve-kimik3.sh check' prints it. Every
+# published image through 20 Aug still pins aiter d9e5ef7c (29 Jul), so aiter's
+# own K3 gfx950 tuning since then ships in none of them.
+#
+# CHANGING THIS IS A FULL RE-VERIFY, not a version bump: 'check', 'parsers',
+# 'toolcheck', then a bench at every shape you care about. A mainline image moves
+# the attention, sampling, speculative and tool-parsing paths at once. Build it
+# into a SECOND SIF_PATH so the old one is still there to fall back to. See the
+# README, "Moving to a mainline image".
+#
+# The image ships its OWN ROCm (7.2.4 in this tag). It does not have to match the
 # node's, but the further apart they drift the more likely GPU passthrough
 # breaks — see ROCM_MODE below and './serve-kimik3.sh gpucheck'. After changing
 # this value the aiter JIT dir re-seeds itself automatically.
-export SGLANG_IMAGE="${SGLANG_IMAGE:-docker://lmsysorg/sglang-rocm:rocm720-mi35x-k3-20260727}"
+export SGLANG_IMAGE="${SGLANG_IMAGE:-docker://lmsysorg/sglang-rocm:v0.5.17-rocm724-mi35x-20260820}"
 
 # Path to the Apptainer image FILE (built with './serve-kimik3.sh pull').
 # Must be a .sif file, not a directory. Defaults to
@@ -131,6 +167,28 @@ export MEM_FRACTION="${MEM_FRACTION:-0.85}"
 # KDA + MLA attention on gfx950.
 export ATTENTION_BACKEND="${ATTENTION_BACKEND:-triton}"
 
+# sglang #34580, merged 18 Aug 2026 — the single biggest lever aimed at this
+# deployment's actual weak spot, which is decode cost at long context.
+#
+# K3's MLA decode ran its stage 1 with constants tuned on CDNA3: BLOCK_N 16 where
+# gfx950's MFMA tiles want 32, a KV split budget treated as a rounding target so a
+# split could overshoot by a full wave, and stage 2 overwriting the caller's split
+# count. AMD's numbers: 46-73% better ITL at LONG CONTEXT, 2-12% ITL and 2-8% TTT
+# at short context, GSM8K unchanged (0.953 vs 0.955).
+#
+# It applies here on every count — the kernel wants HIP, MLA, head_dim 576 and
+# gfx95, and K3 on ATTENTION_BACKEND=triton is all four.
+#
+# OFF BY DEFAULT, upstream and here, for one reason: it REORDERS THE FP32
+# ACCUMULATION, so output is not bit-identical to the untuned path. That is why
+# it is an env var and not the default. Treat it as an A/B you run, not a setting
+# you adopt: bench 1024, 32k and 100k with it off, restart, bench them again with
+# it on. It is read at LAUNCH, so changing it needs a restart, not a new request.
+#
+# Needs a mainline image dated 20260820 or later; './serve-kimik3.sh check'
+# reports whether the image has it, and serve warns if you set it where it is inert.
+export MLA_DECODE_TUNE="${MLA_DECODE_TUNE:-}"
+
 # --dtype. The weights are MXFP4; this is the compute/activation dtype.
 export MODEL_DTYPE="${MODEL_DTYPE:-bfloat16}"
 
@@ -158,8 +216,12 @@ export CUDA_GRAPH_MAX_BS_DECODE="${CUDA_GRAPH_MAX_BS_DECODE:-256}"
 # all. opencode resends a near-identical context every turn.
 export DISABLE_RADIX_CACHE="${DISABLE_RADIX_CACHE:-0}"
 
-# KV cache dtype. Upstream passes none, so this is empty by default. Set e.g.
-# fp8_e4m3 only if you have benched it and it helps.
+# KV cache dtype. Empty by default — a DELIBERATE divergence, not an oversight.
+# Upstream's own K3 cookbook now sets --kv-cache-dtype fp8_e4m3 for MI355X, but
+# sglang #32938 reports fp8 KV making DSpark SLOWER, and DSpark is the thing this
+# deployment leans on below the crossover. Worth one bench at 100k with
+# SPECULATIVE empty, where the trade is memory for bandwidth and nothing else.
+# Set it only if you have measured it on your own shape.
 export KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-}"
 
 # ── Parsers (tool calling + thinking) ───────────────────────────────────────
@@ -207,13 +269,16 @@ export REASONING_PARSER="${REASONING_PARSER:-kimi_k3}"
 # practical answer for agentic clients is to compact at 40-50k and leave it on —
 # ~58 tok/s and 1.9 s TTFT, against 33.5 tok/s and 15.5 s at 100k with it off.
 #
-# ON THE PINNED IMAGE, "dspark" IS UNSAFE WITH A REAL CLIENT REGARDLESS — see the
-# sampling bug below. That is the strongest single reason to move to a mainline
-# image. See the README, 'DSpark collapsed at long context'.
+# THOSE NUMBERS ARE ALL FROM THE OLD DAY-0 IMAGE, and the 20 Aug default moves
+# both sides of the comparison: #33981 rewrote the DSpark verify attention, and
+# #34580's MLA decode tuning (MLA_DECODE_TUNE above) speeds decode with DSpark on
+# OR off. The 55-60k crossover therefore has to be RE-MEASURED, not assumed —
+# it can only have moved up. See the README, 'DSpark collapsed at long context'.
 #
-# Default OFF, and there is a sharper reason still than "one failure at a time".
+# Still default OFF, for the ordinary reason: get baseline serving working, then
+# add one thing. The sharper reason below is now historical.
 #
-# THE PINNED IMAGE HAS A LIVE SAMPLING BUG (sglang #32569). DSpark's verify step
+# THE OLD DAY-0 IMAGE HAD A LIVE SAMPLING BUG (sglang #32569). DSpark's verify step
 # calls top_k_renorm_prob / top_p_renorm_prob; on ROCm those are bound by an
 # is_hip() branch that landed in TWO halves — #32621 (top_p, 28 Jul 07:37 UTC)
 # and #32641 (top_k, 31 Jul 06:21 UTC). rocm720-mi35x-k3-20260727 was pushed
@@ -233,14 +298,11 @@ export REASONING_PARSER="${REASONING_PARSER:-kimi_k3}"
 # scheduler. top_p is optional; temperature is not, so this one is likelier to
 # find you.
 #
-# serve-kimik3.sh greps the image for the Triton aliases AND for that binding, and
-# warns at launch, so you cannot meet either unknowingly. Cheapest fix: keep
-# clients at top_p 1 and temperature 0. Real fix: a mainline
-# v0.5.17-rocm720-mi35x-* image in a SECOND SIF_PATH, then re-measure. See the
-# README, 'The sampling landmine'.
-#
-# Get baseline serving working first, then turn this on — that way a failure has
-# one cause, not two.
+# THE DEFAULT IMAGE CARRIES ALL THREE FIXES, so this is retired unless you pin
+# SGLANG_IMAGE backwards — which the 27 Jul anchor tag is. serve-kimik3.sh greps
+# the image for the Triton aliases AND for that binding and warns at launch, so
+# you cannot meet either unknowingly; if you see the warning, you have gone
+# backwards on purpose. See the README, 'The sampling landmine'.
 export SPECULATIVE="${SPECULATIVE:-}"
 export DSPARK_MODEL="${DSPARK_MODEL:-RadixArk/Kimi-K3-DSpark}"
 
@@ -263,11 +325,13 @@ export DSPARK_BLOCK_SIZE="${DSPARK_BLOCK_SIZE:-}"
 # different, mutually exclusive flag whose own help says KDA decode is SLOWER
 # with it — so the obvious "correction" is a silent regression, not a fix.
 #
-# Off by default because the pinned rocm720-mi35x-k3-20260727 image PREDATES
-# sglang #32692 (31 Jul), which is what lets this coexist with the extra_buffer
-# radix strategy we run. serve-kimik3.sh probes the image and refuses rather than
-# letting you discover that after a 1.5 TB load. Mainline carries the flag, so a
-# v0.5.17-rocm720-mi35x-* image in a SECOND SIF_PATH is what unlocks it.
+# Off by default, but the REASON changed on 20 Aug 2026. It used to be that the
+# day-0 image predated sglang #32692 (31 Jul) — what lets this coexist with the
+# extra_buffer radix strategy we run — so the flag was unavailable. The default
+# image has it. What is missing now is a measurement: nobody here has benched it.
+# serve-kimik3.sh still probes --help and refuses rather than letting you discover
+# a missing flag after a 1.5 TB load, so setting this to 1 on an old image fails
+# fast instead of silently.
 export REPLAYSSM_SPEC="${REPLAYSSM_SPEC:-0}"
 
 # ── KDA state pool (K3 hybrid attention) ────────────────────────────────────
@@ -335,7 +399,9 @@ export ROCM_MODE="${ROCM_MODE:-auto}"
 # Tells aiter the GPU architecture directly (as GPU_ARCHS), so it can skip its
 # rocminfo shell-out. NOTE: the rocm720-mi35x-k3-20260727 build of aiter does
 # NOT honour this at runtime — tested on bun161, 28 Jul 2026 — so it is kept
-# only for images that might. Use ROCMINFO_SHIM below instead.
+# only for images that might. Every image published since pins the same aiter
+# commit (d9e5ef7c, 29 Jul), so assume the same until someone re-tests it.
+# Use ROCMINFO_SHIM below instead.
 # Must name exactly ONE arch: a list makes aiter pick the first entry at
 # runtime regardless of the hardware (ROCm/aiter#3807). Empty = leave alone.
 export AITER_GPU_ARCHS="${AITER_GPU_ARCHS:-}"   # e.g. gfx950

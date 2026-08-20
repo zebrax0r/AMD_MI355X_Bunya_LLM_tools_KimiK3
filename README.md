@@ -12,7 +12,7 @@ from which all the Bunya-specific knowledge here is inherited.
 
 ---
 
-## What works today — verified 28 Jul, measured through 12 Aug 2026
+## What works today — verified 28 Jul, measured through 12 Aug, image current 20 Aug 2026
 
 K3 open weights landed on 27 Jul, and **SGLang shipped day-0 AMD support with a
 validated 8× MI355X recipe**. This repo reproduces that recipe.
@@ -21,7 +21,7 @@ validated 8× MI355X recipe**. This repo reproduces that recipe.
 |---|---|
 | Model | **`moonshotai/Kimi-K3`** — arch `KimiK3ForConditionalGeneration`, **1561 GB**, `mxfp4-pack-quantized`. The official release is already **MXFP4-native**, so there is no AMD requant to wait for. |
 | Shape | 93 layers, 896 experts (16 active), 1,048,576 context, `hidden_size` 7168, vision tower. KDA on every layer except every 4th, which is full MLA (`kv_lora_rank` 512). |
-| Engine | SGLang, image **`lmsysorg/sglang-rocm:rocm720-mi35x-k3-20260727`** |
+| Engine | SGLang, image **`lmsysorg/sglang-rocm:v0.5.17-rocm724-mi35x-20260820`** — mainline since 20 Aug; the day-0 `rocm720-mi35x-k3-20260727` tag every measurement below was taken on is kept as the [anchor](#moving-to-a-mainline-image) |
 | Parallelism | **TP8** — the whole node |
 | Throughput | **918 / 2074 / 3793 tok/s** at concurrency 2 / 8 / 32, measured here at 1024/512 with DSpark. Upstream's `820 / 2356 / 4898` is a different, unpublished workload — [why](#measured-on-bun161-29-jul-2026-dspark-1024512-tp8) |
 | Tool calling / thinking | `--tool-call-parser kimi_k3 --reasoning-parser kimi_k3` |
@@ -503,16 +503,19 @@ tests passed, and the one test using `temperature=0.1` turned every later reques
 into `Connection refused`.
 
 **`top_p` is optional; `temperature` is not**, so this is the likelier of the two
-to find a real client. Whether the pinned image carries the offending branch
-cannot be settled from the tag — it needs the probe.
+to find a real client. Whether a given image carries the offending branch cannot
+be settled from its tag — it needs the probe. (The day-0 image, probed on-node
+12 Aug 2026, turned out **not** to have it: `temperature > 0` was safe there. The
+default image since 20 Aug carries the fix outright.)
 
 `serve-kimik3.sh` greps the image at launch for both the two Triton aliases *and*
 that binding, and warns when either is missing, so you cannot enable DSpark and
 meet these unknowingly. It reads the `elif is_hip():` block specifically, because
 the call site for the unbound symbol is present either way and a whole-file grep
-proves nothing. Options, cheapest first: keep clients at `top_p: 1` and
-`temperature: 0`; move to a mainline `v0.5.17-rocm720-mi35x-*` image in a
-**second** `SIF_PATH` and re-measure; or leave `SPECULATIVE` unset.
+proves nothing. **The default image since 20 Aug 2026 has both fixes**, so seeing
+either warning means `SGLANG_IMAGE` points at a pre-August build. Options,
+cheapest first: move forward; keep clients at `top_p: 1` and `temperature: 0`; or
+leave `SPECULATIVE` unset.
 
 It stays off by default anyway, so that a first launch has one thing to go wrong
 instead of two — turn it on once baseline serving is proven.
@@ -772,6 +775,13 @@ dominates it, so it says more about TTFT than about decode.
 | **DSpark γ3, `56ce616a`** | **32k** | **17.20 ms** | **58.1** | **1.86 s** | 2.86 |
 | DSpark γ7, `56ce616a`, c=2 sweep shape | 1024 | — | 309–327 *(gen)* | — | 6.1–7.7 |
 
+**Every row in this table is the day-0 `rocm720-mi35x-k3-20260727` image**, which
+stopped being the default on 20 Aug 2026. Two merged changes in the new default
+move these numbers — #33981 rewrote the DSpark verify attention, and #34580's
+`MLA_DECODE_TUNE` retunes MLA decode with DSpark on *or* off — so treat rows 3–5
+as the pre-migration baseline and
+[the runbook](#the-runbook-in-order--as-of-20-aug-2026) as what replaces them.
+
 Rows 1–2 are bun160, 9 Aug 2026. Rows 3–6 are bun161, 12 Aug 2026, after the draft
 pin moved. Row 6 was an accidental run — a sourced `kimik3.env` leaked the sweep
 shape past a named mode — and turned out to be the control that matters: at 1024
@@ -831,6 +841,14 @@ So, for agentic sessions, in one line:
 > Let it drift to 100k and the best available is DSpark off at 33.5 tok/s and
 > 15.5 s.** Roughly 3× the throughput and 8× the latency, decided by session
 > hygiene rather than by any setting.
+
+**That policy is measured on the retired image and it is the thing most likely to
+change next.** The 20 Aug default carries #33981, which attacks the DSpark step
+directly, and #34580's `MLA_DECODE_TUNE`, which speeds MLA decode on both sides of
+the comparison. Both push the crossover **up**, never down — the question is by
+how much, and whether it clears 100k. Until steps 5–7 of
+[the runbook](#the-runbook-in-order--as-of-20-aug-2026) have been run, treat
+55–60k as the last number anyone measured rather than as the current answer.
 
 That closes the question this repo opened with on 9 Aug — *"is the answer to
 compact aggressively, or is something wrong?"* Both. A 4,096-token draft was
@@ -1033,13 +1051,14 @@ it is a different, mutually exclusive flag — its own help says **KDA decode is
 slower** with it than the packed baseline. So the obvious repair to the cookbook
 name is a silent regression rather than an error.
 
-`REPLAYSSM_SPEC=1` selects the right one. It is off by default because the pinned
-`rocm720-mi35x-k3-20260727` image **predates** sglang #32692 (31 Jul), which is
-what lets ReplaySSM coexist with the `extra_buffer` radix strategy we run. The
-script probes the image and refuses up front rather than letting you find out
-after a 1.5 TB load. Mainline has it — the flag exists in `main` today — so this
-is one more thing the migration unlocks. See
-[Moving to a mainline image](#moving-to-a-mainline-image).
+`REPLAYSSM_SPEC=1` selects the right one, and **the reason it is off changed on
+20 Aug 2026**. It used to be unavailable: the day-0 `rocm720-mi35x-k3-20260727`
+image predates sglang #32692 (31 Jul), which is what lets ReplaySSM coexist with
+the `extra_buffer` radix strategy we run, and the script probes `--help` and
+refuses up front rather than letting you find out after a 1.5 TB load. The
+[current default image](#moving-to-a-mainline-image) has the flag. What is missing
+now is a measurement — nobody here has benched it — so it stays off until someone
+does.
 
 #### Measured
 
@@ -1156,7 +1175,7 @@ and `presharded` (which removes the re-quantisation work entirely) is the lever.
 
 ---
 
-## Upstream drift — checked 12 Aug 2026
+## Upstream drift — checked 20 Aug 2026
 
 Everything here moves fast enough that a snapshot goes stale in days, so this
 section records **what was found and how to re-run the check**, not just the
@@ -1166,40 +1185,45 @@ answer.
 
 | | |
 |---|---|
-| Pinned here | `lmsysorg/sglang-rocm:rocm720-mi35x-k3-20260727` (29.2 GB, pushed 28 Jul) |
-| Newest K3 tag | `rocm720-mi35x-k3-20260803` — **the last one. The stream stopped there** |
-| First tag with both sampling fixes | `rocm720-mi35x-k3-20260731` — see [the sampling landmine](#the-sampling-landmine--read-this-before-enabling-dspark) |
-| Mainline | **PR #32541 merged 4 Aug.** K3 is in `main`; the `kimi-k3` branch is deleted |
-| Mainline image | `v0.5.17-rocm720-mi35x-20260811` — the successor stream, built nightly from `main` |
-| Suggested migration target | **`v0.5.17-rocm720-mi35x-20260810`** — see the layer-drop note below |
-| aiter inside those images | `AITER_COMMIT=d9e5ef7c` (**29 Jul**); ours is `dcd204ea` (23 Jul) |
-| ROCm 7.14 | **still no 7.14 + K3 image anywhere** |
+| **Default here since 20 Aug** | **`lmsysorg/sglang-rocm:v0.5.17-rocm724-mi35x-20260820`** (25.8 GB) |
+| Anchor for pre-20-Aug numbers | `rocm720-mi35x-k3-20260727` (29.2 GB, pushed 28 Jul) — day-0 branch build |
+| Newest K3-branch tag | `rocm720-mi35x-k3-20260803` — **the last one. That stream is retired** |
+| Nightly flavours | `gfx942`/`gfx950` × `rocm700`/`rocm720`/`rocm724`, all dated daily |
+| Why `rocm724` | upstream made 7.2.4 its **primary AMD PR gate** on 20 Aug (#35602), runs both nightly (#35603) |
+| Not yet in `rocm724` | torch 2.11 + triton 3.7 (#30984, merged 20 Aug) — first appears in `20260822` or later |
+| aiter inside every image | `AITER_COMMIT=d9e5ef7c` — **still 29 Jul**, unchanged in three weeks |
+| ROCm 7.14 | `rocm/pytorch` has twelve `rocm7.14_*` bases (16 Jul), **sglang has no 7.14 stage** |
 
-That last row is the one that matters for bun161, and it has not moved in two
-weeks. The 7.14 track is a separate series of `*-rocm7_14-mi35x-test-*` tags,
-last built **20 Jul** at `v0.5.15.post1` — before K3 support existed, and not
-rebuilt since. Two *newer* ROCm streams have appeared and neither helps:
-`rocm724` (7.2.4, mi30x/mi35x, last built 7 Aug at v0.5.16) closes none of the
-7.2 → 7.14 gap, and `rocm7.15-mi45x` is for different silicon. `rocm/sgl-dev`
-mirrors the same tags, so there is no separate AMD build to try either. **The
-`ROCMINFO_SHIM` workaround stays necessary**, and waiting is still the right
-posture.
+**The ROCm 7.14 row is not the blocker it looks like.** The base images exist —
+`rocm/pytorch:rocm7.14_ubuntu24.04_py3.12_pytorch_release_2.1x.0` and eleven
+siblings, all pushed 16 Jul. What does not exist is an **sglang** 7.14 stage:
+`docker/rocm.Dockerfile` builds `rocm700`, `rocm720` and `rocm724`, and nothing
+else. Building one needs an Apptainer def and fakeroot, because Bunya has no
+Docker, and it would be an unsupported flavour serving a model whose AMD path
+changes weekly. **`ROCMINFO_SHIM` stays necessary**, and waiting is still the
+right posture — see [the ROCm section](#the-node-is-rocm-714-the-image-is-724--and-that-is-fine).
 
-**Take `20260810`, not `20260811`, unless you check first.** The 11 Aug
-`rocm720-mi35x` build went from 40 layers / 29.60 GB to 39 layers / 23.65 GB — a
-5.38 GB layer that had been in every `rocm720` build since our pin is simply
-gone. This repo's aiter procedure depends on the image shipping prebuilt
-`module_*.so` to seed `AITER_JIT_DIR` from, and binding an empty dir hides them,
-so that is not a difference to discover after a 1.5 TB weight load. `check`
-answers it in a minute.
+**The `20260810` recommendation is retired — take the newest.** The 12 Aug review
+capped the migration target at `20260810` because the 11 Aug build lost a 5.38 GB
+layer (40 → 39 layers, 29.60 → 23.65 GB) and this repo's aiter procedure depends
+on the image shipping prebuilt `module_*.so` to seed `AITER_JIT_DIR` from. That
+layer has now been identified: commit `6f3fe13` (11 Aug), *"[AMD] Install AITER's
+pinned Triton wheel in the ROCm 7.2 image"*, deleted a clone-and-build-Triton-from-
+source block and replaced it with aiter's own `install_triton.sh`. The diff leaves
+`PREBUILD_KERNELS=1` and aiter's `build_ext --inplace` untouched. **The missing
+layer was a build tree, not the kernels.** `check` still verifies it in a minute,
+and should.
 
-**The images' aiter is a fortnight behind aiter's own K3 work.** Every published
-image pins `AITER_COMMIT=d9e5ef7c`, dated 29 Jul. Since then `ROCm/aiter` `main`
-landed `ca68b4f3` *tune Kimi-K3 prefill GEMMs for gfx950* (10 Aug), `05ec7fd9`
-*runtime-keyed Kimi-K3 A8W4 fmoe config* (10 Aug), `868ac1f7` *correct + faster
-a16w4 SiTUv2* (8 Aug), `50811372` *MLA 96-head 128-dim reduction*, and FlyDSL GDN
-decode work. None of it ships yet. So a second wave is coming that no image
-carries: **check the image's `AITER_COMMIT`, not just its tag date.**
+**The images' aiter is now three weeks behind aiter's own K3 work.** Every
+published image, through `20260820`, still pins `AITER_COMMIT=d9e5ef7c` (29 Jul);
+that default in `docker/rocm.Dockerfile` has not moved in eight days. Since it,
+`ROCm/aiter` `main` has landed `ca68b4f3` *tune Kimi-K3 prefill GEMMs for gfx950*
+(10 Aug), `05ec7fd9` *runtime-keyed Kimi-K3 A8W4 fmoe config* (10 Aug), `868ac1f7`
+*correct + faster a16w4 SiTUv2* (8 Aug), `243bebb` *tune chunked_pa_prefill params
+for gfx950* (19 Aug), `0159273` *[FlyDSL] MoE GEMM workgroup-cluster multicast*
+(20 Aug) and `9279f97` *[gfx950] retune small-M tiles in the A16W16 fallback*
+(20 Aug). **None of it ships in any image.** So: **check the image's
+`AITER_COMMIT`, not its tag date** — `./serve-kimik3.sh check` now prints it.
 
 ### The branch merged; mainline is the only live stream
 
@@ -1211,10 +1235,17 @@ before, at **`20260803`**, and have no successor — that stream is retired, not
 paused.
 
 The mainline nightlies are **`main` itself**, not a release branch:
-`.github/workflows/release-docker-amd-rocm720-nightly.yml` builds `gfx950-rocm720`
-from a plain default-branch checkout on a 12:00 UTC cron, which is why tags land
-at ~14:30 UTC. So `…-20260810` is `main` as of 10 Aug, and anything merged before
-then is in it.
+`.github/workflows/release-docker-amd-rocm720-nightly.yml` builds the
+`gfx942`/`gfx950` × `rocm720`/`rocm724` matrix from a plain default-branch
+checkout on a `0 12 * * *` cron.
+
+**A tag date is about a day later than the code in it.** `DATE=$(date +%Y%m%d)`
+is evaluated at *push* time, not at checkout, and these builds are long:
+`v0.5.17-rocm720-mi35x-20260820` was pushed at **09:51 UTC on 20 Aug**, which is
+before that day's cron even started. It is the run that began at 12:00 UTC on the
+**19th**. The 12 Aug version of this section said `…-20260810` was `main` as of
+10 Aug; it is closer to `main` as of the 9th. Working rule: **a tag contains a PR
+only if the tag is dated at least two days after that PR merged.**
 
 Mainline also settles the sampling landmine at the source — `main`'s
 `dflash_utils.py` binds both kernels under `is_hip()`, and #33694 binds the
@@ -1225,13 +1256,36 @@ which makes it the strongest single reason to migrate — ahead of any performan
 PR. Procedure in [Moving to a mainline image](#moving-to-a-mainline-image), always
 into a second `SIF_PATH`.
 
-Upstream's own MI355X cookbook cell is still marked `verified: false` and **still
-prescribes `rocm720-mi35x-k3-20260727`** — the exact image pinned here — for both
-mi350x and mi355x. Migrating puts this deployment ahead of the documented recipe,
-not behind it. (That cell also sets `--kv-cache-dtype fp8_e4m3` where this repo
-leaves it empty. Do not adopt it on faith: sglang
+**Upstream's cookbook has moved too, and it went the same way.** On 12 Aug its
+MI355X cell still prescribed `rocm720-mi35x-k3-20260727` — the image this repo
+had pinned. `docs/src/snippets/configs/moonshotai/kimi-k3.jsx` on `main` now says
+`v0.5.17-rocm720-mi35x-20260817`, still marked `verified: false`,
+`verificationStatus: 'in-progress'`. Note that their pin predates
+[#34580](#the-second-lever--34580-retuned-the-gfx950-mla-decode-geometry) by a
+day, so `20260820` puts this deployment slightly ahead of the documented recipe
+on the one change that matters most here.
+
+Their flags are otherwise ours: the same four aiter env vars,
+`--attention-backend triton`, `--tp-size 8`, `--dtype bfloat16`,
+`--mem-fraction-static 0.85`, both `kimi_k3` parsers. Two differences remain, and
+both are deliberate on this side. They set `--kv-cache-dtype fp8_e4m3` where this
+repo leaves it empty — do not adopt it on faith, sglang
 [#32938](https://github.com/sgl-project/sglang/issues/32938) reports fp8 KV
-*slowing* DSpark.)
+*slowing* DSpark. And they still write `--cuda-graph-max-bs 256`, a spelling
+mainline renamed; `--cuda-graph-max-bs-decode` is the current one.
+
+**AMD now runs K3 on MI35x in sglang's own nightly CI**, which is new since the
+last check: [#32568](https://github.com/sgl-project/sglang/pull/32568) (accuracy,
+17 Aug) and [#34985](https://github.com/sgl-project/sglang/pull/34985) (perf,
+18 Aug). GSM8K **0.953** on 8×MI355X against a 92% threshold, and a sweep at 4096
+input, batch [1, 1, 8, 16, 64], peaking at **1403.86 tok/s** output at batch 64.
+Their harness sets this repo's four env vars, `--tp 8`,
+`--attention-backend triton`, `--cuda-graph-max-bs-decode`,
+`--max-running-requests` — and **no `--speculative-*` flags at all**. Upstream's
+MI35x reference config is non-speculative, which is a mild independent vote for
+the policy [below](#the-crossover-is-around-5560k--and-that-is-the-operating-policy).
+It is also the first AMD figure published with a stated shape, unlike the
+820/2356/4898 numbers this README takes apart earlier.
 
 Branch commits between the pinned build and the merge that still matter:
 **#32621** (28 Jul) and **#32641** (31 Jul), the two halves of the HIP renorm
@@ -1240,7 +1294,7 @@ radix strategy ([the KDA section](#k3s-kda-state-pool--the-knobs-we-did-not-pass
 and *"[Kimi K3] Add reasoning, tool-call, and OpenAI serving"* (1 Aug), which is
 why `./serve-kimik3.sh parsers` is worth re-running against any newer image.
 
-**Merged into `main` since, i.e. present in a `20260810` image:**
+**Merged into `main` since, i.e. present in the `20260820` default:**
 
 - **#33981** (8 Aug) — the DSpark verify kernel. Its own section below.
 - **#33599** (5 Aug) — fuses K3's attn-residual aggregation on ROCm: `_score_kernel`,
@@ -1257,6 +1311,14 @@ why `./serve-kimik3.sh parsers` is worth re-running against any newer image.
   this repo sets `AITER_SITUV2_A8W4=1`.
 - **#34234** (10 Aug) — sizes the DFLASH draft KV pool from the draft's own
   attention geometry instead of scaling the target's by the layer ratio.
+- **#34580** (18 Aug) — the gfx950 MLA decode geometry. Its own section below.
+- **#34881** (18 Aug) — four Kimi-K3 tool-call defects. Its own section below.
+- **#32593** (15 Aug) — a Helion backend for Kimi Delta Attention, 1.1× decode and
+  1.6× prefill on the KDA kernels. **NVIDIA only** — tested on GB200, no ROCm
+  path — so `--linear-attn-backend helion` is not ours to try. Noted because KDA
+  is 69 of K3's 93 layers and it will look relevant in a changelog.
+- **#35077** (19 Aug) — mixed NVFP4/FP8 K3 checkpoints. For the CUDA NVFP4 build,
+  not the `mxfp4-pack-quantized` weights this repo serves.
 
 **Open, and worth watching — the MI355X decode headroom is queued, not landed:**
 
@@ -1305,10 +1367,94 @@ Measured by AMD, 8×MI355X TP8, 8k in / 1k out, `--attention-backend triton` wit
 GSM8K 0.951. Note their accept length holds above 7 at 8k — consistent with the
 long-context draft, and with the collapse here being the 4k checkpoint.
 
-**This is the missing half of the long-context story.** The retrained draft fixes
-the accept rate; #33981 attacks the 128 ms step. Neither alone is expected to
-beat `SPECULATIVE=""` at 100k — together they might, and that pair is
-[the runbook](#measured-at-100k--bun160-9-aug-and-bun161-12-aug-2026) rows 3 and 5.
+**This is one half of the long-context story.** The retrained draft fixes the
+accept rate; #33981 attacks the ~117 ms step. It is no longer queued — it is in
+the default image as of 20 Aug 2026, and re-measuring the crossover with it is
+[the runbook](#the-runbook-in-order--as-of-20-aug-2026).
+
+### The second lever — #34580 retuned the gfx950 MLA decode geometry
+
+PR [#34580](https://github.com/sgl-project/sglang/pull/34580), *"[AMD] Optimize
+KIMI-K3 with Triton MLA decode kernel by tuning the stage-1 geometry for gfx950"*,
+**merged 18 Aug 2026**. Where #33981 fixes the DSpark verify path specifically,
+this one speeds MLA decode itself — **with DSpark on or off**.
+
+The author's framing is that the stage-1 constants were tuned on CDNA3 and fit
+badly at the batch sizes long-context serving actually runs at:
+
+- `BLOCK_N` 16 → **32** on the HIP path, so the MFMA tiles are used
+- the KV split budget becomes a **hard ceiling** instead of a rounding target, so
+  a split can no longer overshoot by a full wave
+- split counts are passed to **both** stages, instead of stage 2 overwriting what
+  the caller chose
+- per-sequence geometry counts are preserved when deterministic inference is on
+
+Measured by AMD: **46–73% better ITL at long context**, 2–12% ITL and 2–8% TTT at
+short context, GSM8K unchanged (0.953 vs 0.955).
+
+It is **opt-in**, and the gate is worth reading, because every clause of it is
+satisfied here:
+
+```python
+def _mla_tuning_applies(has_mla: bool, head_dim: int) -> bool:
+    return (_is_hip and has_mla and head_dim == 576
+            and is_gfx95_supported() and envs.SGLANG_MLA_DECODE_TUNE.get())
+```
+
+HIP, MLA, `head_dim == 576`, gfx950 — and the file it patches,
+`kernels/ops/attention/decode_attention.py`, is the path
+`ATTENTION_BACKEND=triton` takes. Set `MLA_DECODE_TUNE=1` in `kimik3.env` to turn
+it on.
+
+**Why it is not on by default here.** Upstream ships it off because it *reorders
+the fp32 accumulation* — output is not bit-identical to the untuned path. That is
+a reasonable thing to accept, and an unreasonable thing to accept silently, so it
+is an A/B in the runbook rather than a default. `./serve-kimik3.sh check` reports
+whether the image has it at all, and `serve` warns if you set it where it would
+be inert.
+
+**This is the first upstream change aimed squarely at the number this deployment
+is actually stuck on.** Not the accept rate — that was the draft, and it is fixed
+— but the cost of a decode step at 100k, which is what makes `SPECULATIVE=""`
+win up there at 29.83 ms TPOT.
+
+### #34881 — Kimi K3 was losing tool calls, and two of the ways were silent
+
+PR [#34881](https://github.com/sgl-project/sglang/pull/34881), *"Stop losing
+Kimi-K3 tool calls to reasoning, constraint conflicts, and truncation"*, **merged
+18 Aug 2026**, cherry-picked to `release/v0.5.18` as #35399. Upstream puts the
+rate at **~190 parsing errors a day**, and says two of the four defects failed
+silently — so that is a floor, not a measurement. The four:
+
+1. native XTML/prose output was routed through the JSON-array decoder
+2. `response_format` together with `tool_choice=required` silently dropped the
+   tool constraint. **Behaviour change:** that combination is now a **400**
+   (`auto` still warns and continues)
+3. **tool calls emitted before `<|close|>think<|sep|>` were consumed as reasoning
+   content.** Now the parser splits on whichever marker appears first
+4. an incomplete tool section at stream end produced no output *and no log line*.
+   Now it reports the truncation and releases the held-back text
+
+It touches `function_call/kimik3_detector.py`, `parser/reasoning_parser.py`,
+`serving_chat.py`, `serving_responses.py` and `protocol.py`.
+
+**Why this matters here specifically.** Defects 3 and 4 are streaming-path
+failures that present as *"the agent occasionally does nothing"* — no error, no
+log, just a turn that produced no tool call. The
+[Step 5b round trip](#step-5b--prove-tool-calling-round-trips) cannot see either
+one, and neither can `toolcheck`: they are non-streaming, two-turn checks. The
+opencode and kimicode verifications recorded here on 12 Aug are honest about what
+they tested, and this is the class of bug they could not have caught. Re-run a
+real session against the new image, not just `toolcheck`.
+
+Same-day, and probably not a coincidence: `moonshotai/Kimi-K3` itself took its
+first commit in three weeks on **20 Aug** — `a590ce09`, *"Update encoding_k3.py"*,
+which rewrites `normalize_tool_arguments()` to return `(key, XTML type, text)`
+triples and stops dropping whitespace-only reasoning. That file is Moonshot's
+reference encoder; it is **not** in `tokenizer_config.json`'s `auto_map` (which
+names `tokenization_kimi.TikTokenTokenizer`), so SGLang never loads it and
+reimplements the same logic in `kimik3_detector.py`. Harmless in itself — but it
+is why `MODEL_REVISION` now exists.
 
 ### The biggest lever we still cannot pull — AITER MLA prefill
 
@@ -1344,7 +1490,7 @@ and worth re-benching at 10k input, not just 1024.
 
 #### The half of it we might already have — aiter for decode only
 
-The decode head-pad is present in the pinned image's own `aiter_backend.py`, so
+The decode head-pad is present in the image's own `aiter_backend.py`, so
 the prefill gap need not block the decode path: SGLang takes
 `--prefill-attention-backend` / `--decode-attention-backend`, and they override
 the global `--attention-backend`. That is reachable today with no code change,
@@ -1377,17 +1523,26 @@ wrong attention kernel produces fluent gibberish rather than a crash, so
 
 ### Weights
 
-- **`moonshotai/Kimi-K3` has not moved since 27 Jul.** No 1.5 TB re-download.
-  Single MXFP4 checkpoint; no quantization variants published.
-- `RadixArk/Kimi-K3-DSpark` moved again on 1 Aug — see
+- **`moonshotai/Kimi-K3`'s weights have not moved since 27 Jul.** Still one MXFP4
+  checkpoint, no quantization variants, no K3.1. **The repo did move on 20 Aug**,
+  for the first time in three weeks: `a590ce09`, *"Update encoding_k3.py"* — the
+  reference chat encoder, which SGLang does not load. No re-download needed, but
+  it is why `MODEL_REVISION` exists now.
+- `RadixArk/Kimi-K3-DSpark`'s weights have not moved since the 31 Jul retrain. The
+  tip is `3c5bac30` (16 Aug), a README link edit, so the `56ce616a` default is
+  still the right pin — see
   [the draft pinning section](#the-draft-repo-is-a-moving-target--pin-it).
 
 ### Re-running the check
 
 ```bash
-# newest K3 image tags
+# newest mi35x image tags, all flavours (the k3-* stream is retired)
 curl -s "https://hub.docker.com/v2/repositories/lmsysorg/sglang-rocm/tags?page_size=100&ordering=last_updated" \
-  | python3 -c "import json,sys;[print(t['name'],t['last_updated'][:10]) for t in json.load(sys.stdin)['results'] if 'k3' in t['name']]"
+  | python3 -c "import json,sys;[print(t['name'],t['last_updated'][:10],round(t['full_size']/1e9,1)) for t in json.load(sys.stdin)['results'] if 'mi35x' in t['name']]"
+
+# is the aiter pin still 29 Jul? (this is the one that does NOT move with the tag)
+curl -s "https://raw.githubusercontent.com/sgl-project/sglang/main/docker/rocm.Dockerfile" \
+  | grep -m1 AITER_COMMIT_DEFAULT
 
 # have the weights changed under you?
 for m in moonshotai/Kimi-K3 RadixArk/Kimi-K3-DSpark; do
@@ -1395,8 +1550,8 @@ for m in moonshotai/Kimi-K3 RadixArk/Kimi-K3-DSpark; do
     | python3 -c "import json,sys;d=json.load(sys.stdin);print('$m', d['lastModified'][:10], d['sha'][:8])"
 done
 
-# has the AITER prefill PR landed? (#32541 merged 4 Aug; kept for the record)
-for pr in 32541 33341; do
+# have the queued decode PRs landed? (#33341 prefill, #33303/#34198 KDA, #33735 ASM)
+for pr in 33341 33303 34198 33735; do
   curl -s "https://api.github.com/repos/sgl-project/sglang/pulls/$pr" \
     | python3 -c "import json,sys;d=json.load(sys.stdin);print(d['number'], d['state'], d['merged_at'], '->', d['base']['ref'])"
 done
@@ -1415,95 +1570,124 @@ apptainer exec "$SIF_PATH" grep -o 'top_[kp]_renorm_probs_triton' \
 
 ## Moving to a mainline image
 
-The default image is built from SGLang's `kimi-k3` branch (PR #32541) and pinned
-to a dated tag. **That branch merged on 4 Aug 2026 and was deleted, and its image
-stream ended at `rocm720-mi35x-k3-20260803`** — see
-[the drift section](#the-branch-merged-mainline-is-the-only-live-stream).
-The pin still works, and every measurement in this file was taken on it, but it
-is now a dead tag on a retired stream. Migrating is a matter of when, not
-whether.
+**The default moved on 20 Aug 2026.** `SGLANG_IMAGE` now points at
+`v0.5.17-rocm724-mi35x-20260820`; the day-0 `rocm720-mi35x-k3-20260727` tag is
+kept as the **anchor** for every number in this file dated before then. Setting
+it back, with the old `SIF_PATH`, is a complete rollback — nothing in the weight
+cache changes.
 
-Never migrate in place. Point at a second `.sif` so the working one survives:
+What the new default carries that the old tag cannot:
+[#33981](#the-lever-that-did-land--33981-rewrote-the-dspark-verify-attention)
+(DSpark verify over MLA),
+[#34580](#the-second-lever--34580-retuned-the-gfx950-mla-decode-geometry) (gfx950
+MLA decode geometry, opt-in),
+[#34881](#34881--kimi-k3-was-losing-tool-calls-and-two-of-the-ways-were-silent)
+(tool-call losses), #33694 and both renorm bindings — which together retire
+[the sampling landmine](#the-sampling-landmine--read-this-before-enabling-dspark).
+
+**Still never migrate in place.** Build into a second `.sif` so the working one
+survives, whether you are taking this default for the first time or trying
+something newer:
 
 ```bash
-# check what's current:
+# what's current, across all mi35x flavours:
 curl -s "https://hub.docker.com/v2/repositories/lmsysorg/sglang-rocm/tags?page_size=100&ordering=last_updated" \
   | python3 -c "import json,sys;[print(t['name'],t['last_updated'][:10]) for t in json.load(sys.stdin)['results'] if 'mi35x' in t['name']]"
 
-# then, in kimik3.env, point at a fresh sif so the working one is preserved:
-export SGLANG_IMAGE="docker://lmsysorg/sglang-rocm:<newer-mi35x-tag>"
-export SIF_PATH="$MODEL_CACHE_DIR/kimik3-mi355x-new.sif"
-./serve-kimik3.sh pull && ./serve-kimik3.sh check     # must still know KimiK3ForConditionalGeneration
+# in kimik3.env, keep the working sif and build a new one alongside it:
+export SGLANG_IMAGE="docker://lmsysorg/sglang-rocm:v0.5.17-rocm724-mi35x-20260820"
+export SIF_PATH="$MODEL_CACHE_DIR/sglang-rocm724-20260820.sif"
+./serve-kimik3.sh pull && ./serve-kimik3.sh check
 ```
 
-Then `parsers`, then `toolcheck`, then a full `bench-kimik3.sh sweep` — a
-mainline image changes the attention, sampling and speculative paths at once, so
-nothing in this file's tables carries over by assumption. Revert those two
-variables if anything regresses. Same procedure for trying any newer image.
+`check` now ends with a **lever report** — which of #33981, #34580 and #34881 the
+image actually carries, and the `AITER_COMMIT` it was built with. That is the
+answer to "is this tag new enough", and it does not depend on reading the date
+right.
 
-### The runbook, in order — as of 12 Aug 2026
+Then `parsers`, then `toolcheck`, then a full bench. A mainline image changes the
+attention, sampling, speculative *and* tool-parsing paths at once, so nothing in
+this file's tables carries over by assumption.
 
-Ordered by value per minute of allocation, from the upstream review. Every bench
-row is `longcontext` (100k/512, c=1, n=4) unless stated, and fills a row of the
-[long-context table](#measured-at-100k--bun160-9-aug-and-bun161-12-aug-2026).
+### The runbook, in order — as of 20 Aug 2026
 
-**0 — fetch the new draft.** Login node, ~4.5 GB, no GPU:
+Ordered so every number attributes to one change. **Clear `DSPARK_BLOCK_SIZE`
+from `kimik3.env` first** if it is still `3` from the gamma test.
+
+**0 — login node.** `git pull`, then:
 
 ```bash
-./serve-kimik3.sh download        # DSPARK_REVISION now defaults to 56ce616a…
+./serve-kimik3.sh download     # MODEL_REVISION and DSPARK_REVISION both pinned
 ```
 
-**1 — the draft, isolated.** Pinned image, `SPECULATIVE=dspark`, new default
-revision. One variable against run A of 9 Aug.
+A no-op against an existing cache unless a pin is overridden. If `MODEL_REVISION`
+is new to your cache it fetches a snapshot, not a checkpoint: same-content files
+are already in `blobs/` and get symlinked, so only what changed transfers.
 
-*Predicted:* accept 1.39 → **3–4.5**, and decode landing **near the 33.5 tok/s
-DSpark-off baseline** — because `4.3 × 7.8 steps/s ≈ 33.5`. That is not a
-disappointing result, it is the test of the step-cost model. Well above 33.5 and
-the 128 ms step was not what we measured; well below and the draft is not being
-read the way its card implies. Either way, say which.
-
-*If accept does not recover at all*, stop before spending a second allocation:
-the YaRN config may not be reaching the draft on an image this old. `dspark.py`'s
-fused KV-write fast path bails to a per-layer fallback when the rotary is not a
-plain `RotaryEmbedding`, which is safe but is a sign the config is being read
-differently than upstream's own runs.
-
-**2 — mainline image, gated.** Second `SIF_PATH`, never in place:
+**1 — build the new SIF, keeping the old one.**
 
 ```bash
-SGLANG_IMAGE=docker://lmsysorg/sglang-rocm:v0.5.17-rocm720-mi35x-20260810 \
-SIF_PATH=$MODEL_CACHE_DIR/sglang-mainline-20260810.sif \
-  ./serve-kimik3.sh pull && ./serve-kimik3.sh check
+SGLANG_IMAGE=docker://lmsysorg/sglang-rocm:v0.5.17-rocm724-mi35x-20260820 \
+SIF_PATH=$MODEL_CACHE_DIR/sglang-rocm724-20260820.sif \
+  ./serve-kimik3.sh pull
 ```
 
-Stop at the first failure, in this order: `check` (and confirm the image still
-ships prebuilt aiter `module_*.so` — the 0811 build lost a 5.4 GB layer),
-`--help` against the pinned image's (`--enable-linear-replayssm-spec` **exists**
-in mainline where it was a phantom on the pin, so `REPLAYSSM_SPEC=1` becomes
-reachable), `parsers`, `toolcheck`.
+**2–4 — the gates, cheapest first. Stop at the first failure.**
 
-**3 — mainline baselines.** `SPECULATIVE=""` at 100k *and* 1024. Not a
-formality: #33599 and #33764 both touch the non-speculative path.
+1. `check` — the registry is non-empty and knows `KimiK3ForConditionalGeneration`;
+   the image still ships prebuilt aiter `module_*.so`; and the lever report shows
+   `verify_mla`, `mla_tune` and `aiter=d9e5ef7c`.
+2. `parsers` — both `kimi_k3` parsers still registered. #34881 rewrote
+   `kimik3_detector.py` and `reasoning_parser.py`, so this is no longer a
+   formality.
+3. `--help` against the old image — `--enable-gdn-replayssm-spec` is now
+   reachable (`REPLAYSSM_SPEC=1` no longer dies), and
+   `--cuda-graph-max-bs-decode` should still be the spelling.
 
-**4 — the one the plan is for.** Mainline + long-context draft + DSpark, at 100k
-and 1024. Retrained draft × #33981's verify kernel. Upstream's 1.45–2.42× ITL
-figure is at 8k/1k, so treat it as a direction, not a target.
+**5 — the new baseline.** `SPECULATIVE=""`, `MLA_DECODE_TUNE` unset. Sweep at
+1024, `longcontext` at 100k, and `BENCH_INPUT_LEN=32768 longcontext`. This is the
+control for the whole image jump — three weeks of `main`, a new ROCm, a new
+Python, a new torch. Compare against **26.49 ms** TPOT at 1k and **29.83 ms** at
+100k.
 
-**5 — optional.** `KV_CACHE_DTYPE=fp8_e4m3` at 100k with DSpark off. Upstream's
-MI355X cell sets it and #32938 says it hurts DSpark; one run settles it for this
+**6 — one variable: `MLA_DECODE_TUNE=1`.** Still `SPECULATIVE=""`, restart, same
+three shapes. The claim under test is 46–73% ITL at long context, and 29.83 ms is
+the number to beat.
+
+**7 — the run the migration is for.** `SPECULATIVE=dspark` with whichever
+`MLA_DECODE_TUNE` setting won step 6, at 1024, 32k and 100k. #33981 moves the
+DSpark side and #34580 moves both, so **the ~55–60k crossover has to be
+re-located, not assumed** — it can only have moved up. If it lands past 100k, the
+compaction policy [above](#the-crossover-is-around-5560k--and-that-is-the-operating-policy)
+changes.
+
+**8 — clients.** `toolcheck`, then a *real* kimicode or opencode session.
+#34881's third and fourth defects only show on the streaming path; a two-turn
+round trip cannot see them.
+
+**9 — optional.** `KV_CACHE_DTYPE=fp8_e4m3` at 100k with DSpark off. Upstream's
+cookbook sets it and #32938 says it hurts DSpark; one run settles it for this
 shape.
 
-Then re-read the `SPECULATIVE` guidance in `kimik3-env.example` against run 4
+**Rollback, at any point:**
+
+```bash
+export SGLANG_IMAGE="docker://lmsysorg/sglang-rocm:rocm720-mi35x-k3-20260727"
+export SIF_PATH="$MODEL_CACHE_DIR/kimik3-mi355x.sif"
+```
+
+Then re-read the `SPECULATIVE` guidance in `kimik3-env.example` against step 7
 rather than assuming it still holds.
 
 ---
 
-## The node is ROCm 7.14, the image is 7.2 — and that is fine
+## The node is ROCm 7.14, the image is 7.2.4 — and that is fine
 
-Every MI355X node runs **ROCm 7.14** on bare metal; the pinned image ships
-**7.2**. They do not have to match, and since **28 Jul 2026** this repo has
-handled the mismatch automatically. What follows is why it works, because the
-failure it prevents looks fatal and is not.
+Every MI355X node runs **ROCm 7.14** on bare metal; the default image ships
+**7.2.4** (it shipped 7.2.0 until 20 Aug 2026, and the gap this section is about
+is the same either way). They do not have to match, and since **28 Jul 2026** this
+repo has handled the mismatch automatically. What follows is why it works,
+because the failure it prevents looks fatal and is not.
 
 The symptom, on an unpatched setup:
 
@@ -1528,7 +1712,7 @@ aiter shells out to `rocminfo` purely to *name the architecture* and reports onl
 its exit status, which is how a cosmetic failure becomes a fatal one.
 
 **`ROCMINFO_SHIM` (default `auto`) fixes it**, and will keep being necessary for
-as long as the image ships 7.2. The script snapshots the *host's* working
+as long as the image ships anything older than the node. The script snapshots the *host's* working
 `rocminfo` output and binds a one-line script replaying it over the container's
 binary — real output for this node, nothing links against it, no host libraries
 involved. `AITER_GPU_ARCHS=gfx950` looks like the obvious fix instead and **does
@@ -1560,12 +1744,14 @@ arch" from "the container cannot reach the GPUs" — those need opposite respons
 node+image, so a working node pays for it once.
 
 **If torch sees zero devices in every mode**, you need an image built on a newer
-ROCm, and as of 12 Aug 2026 there is not one: the `rocm7_14-mi35x-test` stream
-stopped on **20 Jul**, before K3 existed, and the newer `rocm724` and
-`rocm7.15-mi45x` streams do not help. Building one is `sglang/docker/rocm.Dockerfile`
-with `SGL_BRANCH`, `GPU_ARCH=gfx950` and a `BASE_IMAGE_950_*` override, 45–90
-minutes — and **Bunya has no Docker**, so it needs an Apptainer def with fakeroot
-(check with RCC first) or a machine that does.
+ROCm — and as of 20 Aug 2026 there still is not one. ROCm 7.2.4 is the newest
+flavour sglang builds; `rocm/pytorch` publishes twelve `rocm7.14_*` base images
+(16 Jul), but `docker/rocm.Dockerfile` has stages for `rocm700`, `rocm720` and
+`rocm724` and nothing else, so there is no 7.14 sglang image to pull. Building one
+means adding a stage and running that Dockerfile with `SGL_BRANCH`,
+`GPU_ARCH=gfx950` and a `BASE_IMAGE_950_*` override, 45–90 minutes — and **Bunya
+has no Docker**, so it needs an Apptainer def with fakeroot (check with RCC
+first) or a machine that does.
 
 ---
 
@@ -1625,8 +1811,9 @@ All knobs live in `kimik3.env` (copied from `kimik3-env.example`). Anything you
 | `MODEL_CACHE_DIR` | *(required)* | Scratch path for HF cache + `.sif` + API key + log (~1.7 TB) |
 | `HF_TOKEN` / `HF_TOKEN_FILE` | *(required first run)* | HuggingFace token, inline or from a file |
 | `MODEL_ID` | `moonshotai/Kimi-K3` | Model repo (already MXFP4-native) |
+| `MODEL_REVISION` | `9f62e4e9…` | **Pinned by default** to the 27 Jul tip — the state every table here was measured against. A 40-hex value is a snapshot, `main` or empty tracks the branch. Resolves to a snapshot *path*, so SGLang cannot read a different one |
 | `SERVED_MODEL_NAME` | `kimi-k3` | Name clients use in the `model` field |
-| `SGLANG_IMAGE` | `lmsysorg/sglang-rocm:rocm720-mi35x-k3-20260727` | Day-0 AMD image (branch build — see above) |
+| `SGLANG_IMAGE` | `lmsysorg/sglang-rocm:v0.5.17-rocm724-mi35x-20260820` | Mainline nightly, ROCm 7.2.4. Moved here 20 Aug 2026; `rocm720-mi35x-k3-20260727` is the anchor for older numbers ([why](#moving-to-a-mainline-image)) |
 | `SIF_PATH` | `$MODEL_CACHE_DIR/kimik3-mi355x.sif` | Where the Apptainer image is stored |
 | `APPTAINER_CACHEDIR` / `_TMPDIR` | *(near `$MODEL_CACHE_DIR`)* | Apptainer cache/scratch, kept off `/home` |
 | `AITER_JIT_DIR` | `$MODEL_CACHE_DIR/aiter-jit` | Writable copy of aiter's `jit/`, bound over the in-image one |
@@ -1638,23 +1825,24 @@ All knobs live in `kimik3.env` (copied from `kimik3-env.example`). Anything you
 | `CONTEXT_LEN` | *(empty)* | Empty = model max (1M), as upstream. Set `262144` if KV won't allocate |
 | `MEM_FRACTION` | `0.85` | `--mem-fraction-static` (upstream's validated value) |
 | `ATTENTION_BACKEND` | `triton` | `--attention-backend` |
+| `MLA_DECODE_TUNE` | *(empty)* | `1` exports `SGLANG_MLA_DECODE_TUNE=1` — gfx950 MLA decode geometry, **46–73% ITL at long context** ([#34580](#the-second-lever--34580-retuned-the-gfx950-mla-decode-geometry)). Off by default because it reorders the fp32 accumulation; A/B it |
 | `MODEL_DTYPE` | `bfloat16` | `--dtype` (compute dtype; weights are MXFP4) |
 | `CUDA_GRAPH_MAX_BS_DECODE` | `256` | `--cuda-graph-max-bs-decode` (note: not `--cuda-graph-max-bs`) |
 | `DISABLE_RADIX_CACHE` | `0` | Prefix caching ON — our deviation, measured. `1` restores upstream's setting |
-| `KV_CACHE_DTYPE` | *(empty)* | Upstream passes none |
+| `KV_CACHE_DTYPE` | *(empty)* | Empty on purpose: upstream's cookbook now sets `fp8_e4m3`, but #32938 reports fp8 KV slowing DSpark |
 | `TOOL_PARSER` | `kimi_k3` | Tool-call parser; `none` to omit |
 | `REASONING_PARSER` | `kimi_k3` | Thinking parser; `none` to omit |
 | `SPECULATIVE` | *(empty)* | `dspark` enables DSpark speculative decoding |
 | `DSPARK_MODEL` | `RadixArk/Kimi-K3-DSpark` | Draft model for DSpark |
 | `DSPARK_BLOCK_SIZE` | *(empty)* | `--speculative-dspark-block-size`. Empty infers gamma from the draft (7 today); setting it anchors against draft drift |
-| `REPLAYSSM_SPEC` | `0` | `--enable-gdn-replayssm-spec` — **not** the cookbook's non-existent `--enable-linear-replayssm-spec`. Absent from the pinned image, present in mainline ([why](#k3s-kda-state-pool--the-knobs-we-did-not-pass)) |
+| `REPLAYSSM_SPEC` | `0` | `--enable-gdn-replayssm-spec` — **not** the cookbook's non-existent `--enable-linear-replayssm-spec`. Reachable since the 20 Aug image; still off because nobody has benched it ([why](#k3s-kda-state-pool--the-knobs-we-did-not-pass)) |
 | `MAMBA_FULL_MEMORY_RATIO` | *(empty → 0.9)* | KDA state pool vs MLA KV pool. Follows mean request length, not a universal default |
 | `MAMBA_SSM_DTYPE` | *(empty → fp32)* | `bfloat16` halves KDA state memory. Watch accept length |
 | `MAMBA_RADIX_STRATEGY` | *(empty → `extra_buffer`)* | State slots per request: 5 / `extra_buffer_lazy` 4 / `no_buffer` 3 |
 | `MAMBA_SKIP_DECODE_LOCK` | `0` | `SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK=1` — one fewer state slot per request (experimental) |
 | `ENABLE_AITER` | `1` | Exports the four `SGLANG_*`/`AITER_*` K3 variables |
 | `ROCM_MODE` | `auto` | GPU passthrough: `auto` probes, `rocm` uses `--rocm`, `devices` binds `/dev/kfd` only |
-| `AITER_GPU_ARCHS` | *(empty)* | Sets `GPU_ARCHS`. Ignored at runtime by the pinned aiter build — prefer `ROCMINFO_SHIM` |
+| `AITER_GPU_ARCHS` | *(empty)* | Sets `GPU_ARCHS`. Ignored at runtime by the aiter build every image ships — prefer `ROCMINFO_SHIM` |
 | `ROCMINFO_SHIM` | `auto` | Replay the host's `rocminfo` output inside the container when the image's own fails |
 | `SET_CPU_AFFINITY` | `0` | Keep `0` under a SLURM cgroup (see troubleshooting) |
 | `READY_TIMEOUT` | `14400` | Seconds to wait for health (cold load is ~1.5 TB) |
@@ -1715,15 +1903,15 @@ All knobs live in `kimik3.env` (copied from `kimik3-env.example`). Anything you
   `./serve-kimik3.sh gpucheck` shows torch seeing 8 GPUs, only `rocminfo` is
   broken and `ROCMINFO_SHIM=auto` (the default) handles it. `AITER_GPU_ARCHS=gfx950`
   looks right and is ignored at runtime. See
-  [The node is ROCm 7.14, the image is 7.2](#the-node-is-rocm-714-the-image-is-72--and-that-is-fine).
+  [The node is ROCm 7.14, the image is 7.2.4](#the-node-is-rocm-714-the-image-is-724--and-that-is-fine).
 - **KV cache OOM at startup**: set `CONTEXT_LEN=262144` first, and only then
   consider `MEM_FRACTION`. One knob at a time.
 - **Cold start crawls, with bursts and dips**: SGLang went single-threaded. Run
   `./serve-kimik3.sh loadstat` — it looks for the `falling back to
   single-threaded weight loading` line. Set `WEIGHT_LOAD_THREADS=8`. See
   [Weight loading](#weight-loading--why-a-cold-start-sawtooths).
-- **`unrecognized arguments: --model-loader-extra-config`**: the pinned day-0
-  branch image predates the flag. The script probes `--help` and drops it with a
+- **`unrecognized arguments: --model-loader-extra-config`**: the day-0 branch
+  image predates the flag. The script probes `--help` and drops it with a
   warning rather than dying after a 1.5 TB load, so if you see this it came from
   `EXTRA_ENGINE_ARGS`. Set `WEIGHT_LOAD_THREADS=0`.
 - **Host OOM during weight load**: `WEIGHT_LOAD_THREADS` is too high. The buffered
@@ -1742,11 +1930,12 @@ All knobs live in `kimik3.env` (copied from `kimik3-env.example`). Anything you
   Python CLI, and its provider type is `openai_legacy`, not `openai`. See the
   table in [Step 6b](#step-6b--connect-kimicode-optional).
 - **`TypeError: 'NoneType' object is not callable`** (or `NameError:
-  top_k_renorm_prob`) with DSpark, *mid-session, killing the server* — the pinned
-  image has no HIP renorm kernels ([#32569](https://github.com/sgl-project/sglang/issues/32569)).
+  top_k_renorm_prob`) with DSpark, *mid-session, killing the server* — the image
+  has no HIP renorm kernels ([#32569](https://github.com/sgl-project/sglang/issues/32569)).
   Triggered by a request with `top_p < 1.0` or `top_k` set; a healthy server that
-  dies the moment a new client connects is this. Send `"top_p": 1`, or move to a
-  mainline image, or unset `SPECULATIVE`. Full mechanism in
+  dies the moment a new client connects is this. **The default image since 20 Aug
+  2026 has both kernels**, so this means `SGLANG_IMAGE` points at a pre-August
+  build. Send `"top_p": 1`, move forward, or unset `SPECULATIVE`. Full mechanism in
   [The sampling landmine](#the-sampling-landmine--read-this-before-enabling-dspark).
 - **`NameError: tree_speculative_sampling_target_only`** with DSpark, *killing the
   server*, on a request with `temperature > 0` — the non-greedy verify kernel does
@@ -1792,10 +1981,36 @@ All knobs live in `kimik3.env` (copied from `kimik3-env.example`). Anything you
   to use whatever you already have. **Expected once, after 12 Aug 2026**: the
   default moved to the long-context draft `56ce616a…`, which is a different 4.5 GB
   checkpoint, so the first `git pull` needs one `download`.
+- **`MODEL_REVISION=… is not in the cache`** — the weights pin names a snapshot you
+  have never fetched. `./serve-kimik3.sh download` gets it, or set
+  `MODEL_REVISION=main` to use whatever you already have. **This is not another
+  1561 GB**: the HF cache stores one blob per content hash, so a second revision
+  of the same repo is symlinks plus whatever genuinely changed — for the 20 Aug
+  commit, one Python file. Expected once, after 20 Aug 2026, when `MODEL_REVISION`
+  first appeared.
+- **The agent occasionally does nothing** — a turn that produces no tool call, no
+  error and no log line. Two of the four defects fixed by
+  [#34881](#34881--kimi-k3-was-losing-tool-calls-and-two-of-the-ways-were-silent)
+  look exactly like this: a tool call emitted before the reasoning marker gets
+  consumed as reasoning content, and a tool section truncated at stream end is
+  dropped in silence. Both are streaming-path only, which is why `toolcheck`
+  passes throughout. Fixed in images from `20260820`; there is no client-side
+  workaround.
+- **HTTP 400 on a request that used to work**, mentioning `tool_choice` and
+  `response_format` — also #34881, and deliberate. `tool_choice=required` combined
+  with `response_format`/`regex`/`ebnf` is an unsatisfiable pair; it used to be
+  dropped with a warning and is now rejected. `tool_choice=auto` still warns and
+  continues. Drop one of the two constraints.
+- **`MLA_DECODE_TUNE=1 but this image has no SGLANG_MLA_DECODE_TUNE`** — the image
+  predates [#34580](#the-second-lever--34580-retuned-the-gfx950-mla-decode-geometry)
+  (18 Aug 2026) and the variable is inert, so anything you measure is the untuned
+  path. Not fatal, and deliberately only a warning: use a `20260820` or later
+  image. `./serve-kimik3.sh check` lists which levers an image has before you
+  spend an allocation finding out.
 - **`This image has no --enable-gdn-replayssm-spec`** — `REPLAYSSM_SPEC=1` against
-  the pinned image, which predates sglang #32692. Expected there; see
-  [KDA state pool](#k3s-kda-state-pool--the-knobs-we-did-not-pass). Mainline has
-  the flag — migrate into a *second* `SIF_PATH`, or set `REPLAYSSM_SPEC=0`.
+  a pre-August image, which predates sglang #32692. See
+  [KDA state pool](#k3s-kda-state-pool--the-knobs-we-did-not-pass). The default
+  image has the flag; on an older one, set `REPLAYSSM_SPEC=0`.
 - **The server rejects `--enable-linear-replayssm-spec`** — because it does not
   exist, anywhere. It is an error in upstream's cookbook. Use `REPLAYSSM_SPEC=1`,
   which passes `--enable-gdn-replayssm-spec`. Do **not** substitute
@@ -1874,10 +2089,12 @@ All knobs live in `kimik3.env` (copied from `kimik3-env.example`). Anything you
 - [sglang#32541 — day-0 Kimi K3 support](https://github.com/sgl-project/sglang/pull/32541) — branch, NVIDIA and AMD image tags
 - [sglang#32548 — [Kimi-K3][AMD] Day 0 and Performance Tracking](https://github.com/sgl-project/sglang/issues/32548) — **the MI355X recipe and every perf number in this README**
 - [sglang#32569](https://github.com/sgl-project/sglang/issues/32569) — the open DSPARK crash · [#33694](https://github.com/sgl-project/sglang/pull/33694) — its `temperature > 0` sibling
-- [sglang#33981](https://github.com/sgl-project/sglang/pull/33981) — **the DSpark verify MLA kernel**, merged 8 Aug 2026, mainline images only
+- [sglang#33981](https://github.com/sgl-project/sglang/pull/33981) — **the DSpark verify MLA kernel**, merged 8 Aug 2026 · [#34580](https://github.com/sgl-project/sglang/pull/34580) — **the gfx950 MLA decode geometry**, merged 18 Aug 2026, `SGLANG_MLA_DECODE_TUNE`
+- [sglang#34881](https://github.com/sgl-project/sglang/pull/34881) — **four Kimi-K3 tool-call defects**, merged 18 Aug 2026 · [#32568](https://github.com/sgl-project/sglang/pull/32568) / [#34985](https://github.com/sgl-project/sglang/pull/34985) — AMD's own K3 MI35x nightly accuracy and perf jobs
 - [sglang#32968](https://github.com/sgl-project/sglang/issues/32968) — long-context `[PAD]` storms and NaN logits · [#32855](https://github.com/sgl-project/sglang/issues/32855) — where upstream says to re-pull the retrained draft
 - [SGLang Kimi-K3 cookbook](https://docs.sglang.io/cookbook/autoregressive/Moonshotai/Kimi-K3) — the MI35x cell, the KDA knob surface and the `--mamba-full-memory-ratio` calculator. **Its `--enable-linear-replayssm-spec` does not exist** — see [KDA state pool](#k3s-kda-state-pool--the-knobs-we-did-not-pass)
-- [sglang#32692](https://github.com/sgl-project/sglang/pull/32692) — ReplaySSM with `extra_buffer`, landed 31 Jul 2026, after the pinned image
+- [sglang#32692](https://github.com/sgl-project/sglang/pull/32692) — ReplaySSM with `extra_buffer`, landed 31 Jul 2026, after the day-0 image
+- [sglang `docker/rocm.Dockerfile`](https://github.com/sgl-project/sglang/blob/main/docker/rocm.Dockerfile) — the `AITER_COMMIT_DEFAULT` pin and the three ROCm stages (7.0, 7.2, 7.2.4 — **no 7.14**)
 - [moonshotai/Kimi-K3](https://huggingface.co/moonshotai/Kimi-K3) · [RadixArk/Kimi-K3-DSpark](https://huggingface.co/RadixArk/Kimi-K3-DSpark)
 - [LMSYS: Kimi K3 day-0 support](https://www.lmsys.org/blog/2026-07-27-kimi-k3-day0-support) · [Kimi K3 tech blog](https://www.kimi.com/blog/kimi-k3) — KDA, Attention Residuals, 16/896 sparsity
 - [vLLM K3 preview](https://vllm.ai/blog/2026-07-22-kimi-k3-preview) · [vllm#50000](https://github.com/vllm-project/vllm/pull/50000) — the NVIDIA-only alternative, for when a ROCm build appears
