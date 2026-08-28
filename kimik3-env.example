@@ -145,9 +145,23 @@ export AITER_JIT_TARGET="${AITER_JIT_TARGET:-}"
 #
 # serve-kimik3.sh binds this directory over /tmp/aiter_configs for every mode
 # that imports sglang (serve, check, parsers, loadstat, gpucheck), so the merge
-# writes somewhere you own. Defaults to $MODEL_CACHE_DIR/aiter-configs. Set it
-# elsewhere only if scratch is unwritable; the contents are regenerated on every
-# process start, so deleting it is always safe.
+# writes somewhere you own. Confirmed on bun160 on 28 Aug 2026, where
+# /tmp/aiter_configs belonged to another user entirely — mounting over a
+# directory needs no permission on it, which is why this works where chmod
+# cannot. The script names the owner in its log before it does so.
+#
+# Defaults to $MODEL_CACHE_DIR/aiter-configs/$SLURM_JOB_ID — per user AND per
+# job. Two of your own jobs, on different nodes with different images, would
+# otherwise race to overwrite the same merged CSV and one would silently read
+# tuning built from the other image. Contents are rebuilt on every process
+# start, so deleting any of it is always safe; job directories left behind are
+# pruned after a week. Set this only if scratch is unwritable.
+#
+# If the bind itself cannot be made, serve-kimik3.sh falls back to pointing each
+# AITER_CONFIG_* variable at a single path, which makes aiter skip the merge and
+# never touch /tmp at all. That keeps the job alive at the cost of the per-model
+# GEMM tuning the merge carried, so it warns loudly and those numbers are not
+# comparable to a normal run.
 #
 # Reached for the first time on 28 Aug 2026, with the move to a mainline image —
 # not because aiter changed (AITER_COMMIT is the same d9e5ef7c in both images)

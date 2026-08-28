@@ -296,7 +296,9 @@ bench_binds=()
 # Bind the same directory serve-kimik3.sh does. Write-test it first: a --bind
 # that cannot be made kills the container outright, and a benchmark that refuses
 # to start is worse than one that runs on someone else's /tmp and might not.
-AITER_CONFIG_DIR="${AITER_CONFIG_DIR:-$MODEL_CACHE_DIR/aiter-configs}"
+# Per user AND per job, matching serve-kimik3.sh: inside an allocation both
+# resolve to the same directory, outside one they cannot collide.
+AITER_CONFIG_DIR="${AITER_CONFIG_DIR:-$MODEL_CACHE_DIR/aiter-configs/${SLURM_JOB_ID:-$$}}"
 if mkdir -p "$AITER_CONFIG_DIR" 2>/dev/null && [[ -w "$AITER_CONFIG_DIR" ]] \
    && apptainer exec --bind "$AITER_CONFIG_DIR":/tmp/aiter_configs "$SIF_PATH" \
         sh -c 'touch /tmp/aiter_configs/.write-test && rm -f /tmp/aiter_configs/.write-test' \
@@ -305,7 +307,8 @@ if mkdir -p "$AITER_CONFIG_DIR" 2>/dev/null && [[ -w "$AITER_CONFIG_DIR" ]] \
 else
     warn "Could not bind $AITER_CONFIG_DIR over /tmp/aiter_configs — if the bench dies"
     warn "  with 'Permission denied: /tmp/aiter_configs/*.lock', that directory belongs"
-    warn "  to another user on this node. See the README troubleshooting entry."
+    warn "  to another user on this node. The default bench module imports no aiter, so"
+    warn "  try BENCH_MODULE=sglang.bench_serving; serve-kimik3.sh has a further fallback."
 fi
 
 # ── One benchmark run ───────────────────────────────────────────────────────

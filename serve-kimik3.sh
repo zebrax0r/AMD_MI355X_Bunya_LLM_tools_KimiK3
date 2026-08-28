@@ -520,30 +520,104 @@ export SINGULARITY_TMPDIR="$APPTAINER_TMPDIR"
 # model registry — which is exactly how the AITER_JIT_DIR trap made 'check' tell
 # us a mainline image could not serve K3 on 12 Aug. A probe that cannot import is
 # not a probe that answered no.
-AITER_CONFIG_DIR="${AITER_CONFIG_DIR:-$MODEL_CACHE_DIR/aiter-configs}"
-AITER_CONFIG_BIND=()
+#
+# The path inside the container is not ours to choose — aiter hardcodes it. What
+# we choose is what it RESOLVES to, and that has to be unique per user AND per
+# job: two of our own jobs, on different nodes with different images, would
+# otherwise race to overwrite the same merged CSV, and one of them would read
+# tuning built from the other image. os.replace() is atomic, so that corruption
+# is silent. $MODEL_CACHE_DIR is already per-user; the job id makes it per-run.
+#
+# Contents are rebuilt from scratch on every process start, so nothing is lost by
+# not reusing them, and old job directories are pruned after a week.
+aiter_config_base="$MODEL_CACHE_DIR/aiter-configs"
+AITER_CONFIG_DIR="${AITER_CONFIG_DIR:-$aiter_config_base/${SLURM_JOB_ID:-$$}}"
+AITER_CONFIG_ARGS=()
+
+# The last resort, for when the bind itself cannot be made. Every op's config
+# path is ALSO reachable by environment variable, and update_config_files()
+# short-circuits on a path list of length one:
+#
+#     path_list = file_path.split(os.pathsep)
+#     if len(path_list) <= 1:
+#         return file_path
+#
+# so pointing each variable at its own single default file skips the merge, and
+# with it every touch of /tmp. That costs the configs/model_configs/ merge, which
+# is where per-model tuning lives — a real but unmeasured performance loss, taken
+# only to keep a job alive that would otherwise die at import.
+#
+# Read the variable names out of the IMAGE rather than listing them here. They
+# are constants of the form
+#     AITER_CONFIG_<OP> = os.getenv("AITER_CONFIG_<OP>", f"{AITER_ROOT_DIR}/...")
+# and a newer aiter will add more; anything this misses still reaches /tmp and
+# still dies. find_spec locates aiter without importing it, which matters — an
+# import here is the very thing that is failing.
+AITER_CONFIG_ENV_PY='
+import importlib.util, os, re
+spec = importlib.util.find_spec("aiter")
+pkg  = os.path.dirname(spec.origin or "")
+src  = open(os.path.join(pkg, "jit", "core.py")).read()
+root = os.path.dirname(pkg)
+pat  = r"(AITER_CONFIG_[A-Z0-9_]+)\s*=\s*os\.getenv\(\s*\"[^\"]+\"\s*,\s*f?\"([^\"]+)\""
+for name, path in re.findall(pat, src):
+    path = path.replace("{AITER_ROOT_DIR}", root)
+    if os.path.exists(path):
+        print("%s=%s" % (name, path))
+'
+
 aiter_config_setup() {
+    local owner line nops=0
     [[ -n "$AITER_CONFIG_DIR" ]] || return 0
-    if ! mkdir -p "$AITER_CONFIG_DIR" 2>/dev/null || [[ ! -w "$AITER_CONFIG_DIR" ]]; then
-        warn "AITER_CONFIG_DIR='$AITER_CONFIG_DIR' is not writable — leaving /tmp/aiter_configs"
-        warn "  as the container finds it. If another user on this node owns that directory,"
-        warn "  importing sglang will fail with 'Permission denied: .../*.csv.lock'."
-        return 0
+
+    # Say who owns it before we mount over it. This is the one diagnostic that
+    # turns "PermissionError 30 frames deep" into one line you can act on, and
+    # it is free — the host's /tmp is what the container sees.
+    if [[ -e /tmp/aiter_configs && ! -w /tmp/aiter_configs ]]; then
+        owner="$(stat -c '%U' /tmp/aiter_configs 2>/dev/null \
+                 || stat -f '%Su' /tmp/aiter_configs 2>/dev/null || echo '?')"
+        log "/tmp/aiter_configs on this node belongs to '$owner', not you — binding over it."
     fi
-    # Belt and braces: the auto-pull above has already put it there.
-    [[ -f "$SIF_PATH" ]] || return 0
-    # Verify the bind before relying on it. Mounting over a directory owned by
-    # someone else is fine, but the mount point still has to exist in the image,
-    # and a failed --bind kills the container at startup rather than degrading.
-    if apptainer exec --bind "$AITER_CONFIG_DIR":/tmp/aiter_configs "$SIF_PATH" \
-            sh -c 'touch /tmp/aiter_configs/.write-test && rm -f /tmp/aiter_configs/.write-test' \
-            >/dev/null 2>&1; then
-        AITER_CONFIG_BIND=(--bind "$AITER_CONFIG_DIR":/tmp/aiter_configs)
+
+    # Prune abandoned job directories, but only under the base we chose: an
+    # AITER_CONFIG_DIR set by hand is the caller's, and we do not delete in it.
+    if [[ "$AITER_CONFIG_DIR" == "$aiter_config_base/"* && -d "$aiter_config_base" ]]; then
+        find "$aiter_config_base" -mindepth 1 -maxdepth 1 -type d -mtime +7 \
+            -exec rm -rf {} + 2>/dev/null || true
+    fi
+
+    if ! mkdir -p "$AITER_CONFIG_DIR" 2>/dev/null || [[ ! -w "$AITER_CONFIG_DIR" ]]; then
+        warn "AITER_CONFIG_DIR='$AITER_CONFIG_DIR' is not writable."
+    elif [[ -f "$SIF_PATH" ]] \
+         && apptainer exec --bind "$AITER_CONFIG_DIR":/tmp/aiter_configs "$SIF_PATH" \
+              sh -c 'touch /tmp/aiter_configs/.write-test && rm -f /tmp/aiter_configs/.write-test' \
+              >/dev/null 2>&1; then
+        # Verified, not assumed. A --bind that cannot be made kills the container
+        # at startup rather than degrading, so it is tested before it is relied on.
+        AITER_CONFIG_ARGS=(--bind "$AITER_CONFIG_DIR":/tmp/aiter_configs)
+        return 0
     else
-        warn "Could not bind $AITER_CONFIG_DIR over /tmp/aiter_configs in this image —"
-        warn "  falling back to whatever /tmp the container gets. If aiter then dies with"
-        warn "  'Permission denied: /tmp/aiter_configs/*.lock', that directory belongs to"
-        warn "  another user on this node: set AITER_CONFIG_DIR elsewhere, or move nodes."
+        warn "Could not bind $AITER_CONFIG_DIR over /tmp/aiter_configs in this image."
+    fi
+
+    # Bind unavailable — fall back to skipping the merge entirely.
+    [[ -f "$SIF_PATH" ]] || return 0
+    while IFS= read -r line; do
+        if [[ "$line" == AITER_CONFIG_*=/* ]]; then
+            AITER_CONFIG_ARGS+=(--env "$line"); nops=$(( nops + 1 ))
+        fi
+    done < <(apptainer exec "$SIF_PATH" python3 -c "$AITER_CONFIG_ENV_PY" 2>/dev/null || true)
+
+    if (( nops )); then
+        warn "  Falling back to single-path AITER_CONFIG_* variables ($nops ops):"
+        warn "  aiter will skip the configs/model_configs/ merge and never touch /tmp."
+        warn "  The run survives; it loses whatever per-model GEMM tuning that merge"
+        warn "  carried. Do not compare its numbers against a normal run."
+    else
+        warn "  Could not read aiter's config variables from the image either, so there"
+        warn "  is nothing left to try. If the import dies with 'Permission denied:"
+        warn "  /tmp/aiter_configs/*.lock', that directory belongs to another user on"
+        warn "  this node — set AITER_CONFIG_DIR somewhere writable, or move nodes."
     fi
 }
 
@@ -645,7 +719,7 @@ fi
 case "$MODE" in
     serve|check|parsers|loadstat|gpucheck)
         aiter_config_setup
-        PROBE_ENV+=(${AITER_CONFIG_BIND[@]+"${AITER_CONFIG_BIND[@]}"})
+        PROBE_ENV+=(${AITER_CONFIG_ARGS[@]+"${AITER_CONFIG_ARGS[@]}"})
         ;;
 esac
 
@@ -869,7 +943,7 @@ if [[ "$MODE" == "gpucheck" ]]; then
     # it — the .seeded marker records the in-image target. Testing a container
     # configured differently from the one we launch is how the read-only-.sif
     # bug survived three attempts.
-    probe_extra=(${AITER_CONFIG_BIND[@]+"${AITER_CONFIG_BIND[@]}"})
+    probe_extra=(${AITER_CONFIG_ARGS[@]+"${AITER_CONFIG_ARGS[@]}"})
     jit_dir="${AITER_JIT_DIR:-$MODEL_CACHE_DIR/aiter-jit}"
     if [[ -f "$jit_dir/.seeded" ]]; then
         jit_target="$(cut -d'|' -f2 "$jit_dir/.seeded" 2>/dev/null || true)"
@@ -2014,7 +2088,7 @@ prefetch_env=()
 
 base_args=(--bind "$MODEL_CACHE_DIR":"$MODEL_CACHE_DIR"
     ${cache_bind[@]+"${cache_bind[@]}"}
-    ${AITER_CONFIG_BIND[@]+"${AITER_CONFIG_BIND[@]}"}
+    ${AITER_CONFIG_ARGS[@]+"${AITER_CONFIG_ARGS[@]}"}
     ${shim_args[@]+"${shim_args[@]}"}
     ${presharded_bind[@]+"${presharded_bind[@]}"}
     --env HF_HOME="$MODEL_CACHE_DIR"

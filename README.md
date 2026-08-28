@@ -1823,7 +1823,7 @@ All knobs live in `kimik3.env` (copied from `kimik3-env.example`). Anything you
 | `APPTAINER_CACHEDIR` / `_TMPDIR` | *(near `$MODEL_CACHE_DIR`)* | Apptainer cache/scratch, kept off `/home` |
 | `AITER_JIT_DIR` | `$MODEL_CACHE_DIR/aiter-jit` | Writable copy of aiter's `jit/`, bound over the in-image one |
 | `AITER_JIT_TARGET` | *(auto-detected)* | In-image `jit/` path to bind over; set only if detection is wrong |
-| `AITER_CONFIG_DIR` | `$MODEL_CACHE_DIR/aiter-configs` | Bound over aiter's hardcoded `/tmp/aiter_configs`, which is **shared between users** on the node ([why](#notes--troubleshooting)) |
+| `AITER_CONFIG_DIR` | `$MODEL_CACHE_DIR/aiter-configs/$SLURM_JOB_ID` | Bound over aiter's hardcoded `/tmp/aiter_configs`, which is **shared between users** on the node. Per user *and* per job ([why](#notes--troubleshooting)) |
 | `KIMIK3_API_KEY` | *(auto-generated)* | Bearer key; saved to `$MODEL_CACHE_DIR/kimik3-api-key` |
 | `PORT` | `30000` | Endpoint port on the node |
 | `TP_SIZE` | `8` | Tensor parallel = **total GPU count** |
@@ -2070,12 +2070,40 @@ All knobs live in `kimik3.env` (copied from `kimik3-env.example`). Anything you
   `AITER_CONFIG_GEMM_BF16_FILE` at module scope. Three weeks of sglang reached a
   trap that had been sitting there the whole time.
 
-  The script now binds `AITER_CONFIG_DIR` (default
-  `$MODEL_CACHE_DIR/aiter-configs`) over `/tmp/aiter_configs` for every mode that
-  imports sglang — `serve`, `check`, `parsers`, `loadstat`, `gpucheck` — after
-  write-testing the bind, so a bind that cannot be made warns and degrades
-  instead of killing the container at startup. The contents are regenerated on
-  every process start, so deleting that directory is always safe.
+  Confirmed on `bun160` on 28 Aug 2026: `/tmp/aiter_configs/bf16_tuned_gemm.csv`
+  was owned by a different user, dated 20 Aug. You cannot `chmod` your way out of
+  that, and waiting for it to be cleaned up is not a plan — but you do not need
+  permission on a directory to **mount over** it.
+
+  So the script binds `AITER_CONFIG_DIR` over `/tmp/aiter_configs` for every mode
+  that imports sglang — `serve`, `check`, `parsers`, `loadstat`, `gpucheck` —
+  plus the bench. The container-side name is fixed, because aiter hardcodes it;
+  the host side is ours to make unique, and it is unique **per user and per
+  job**: `$MODEL_CACHE_DIR/aiter-configs/$SLURM_JOB_ID`. Two of your own jobs on
+  different nodes with different images would otherwise race to overwrite the
+  same merged CSV, and `os.replace()` is atomic, so the loser would read tuning
+  built from the other image with nothing in the log. Contents are rebuilt on
+  every process start, so nothing is lost by not sharing them; job directories
+  left behind are pruned after a week. When `/tmp/aiter_configs` exists and is
+  not yours, the script names its owner in the log before mounting over it.
+
+  The bind is write-tested first, because a `--bind` that cannot be made kills
+  the container outright rather than degrading. If it fails, there is one more
+  move: every op's config path is *also* an environment variable, and
+  `update_config_files()` returns early on a path list of length one —
+
+  ```python
+  path_list = file_path.split(os.pathsep)
+  if len(path_list) <= 1:
+      return file_path
+  ```
+
+  — so pointing each `AITER_CONFIG_*` at its own single default file skips the
+  merge and never touches `/tmp`. The script reads those variable names out of
+  the image's own `core.py` rather than hardcoding a list (a newer aiter will add
+  ops, and anything missed still dies), and warns that the run has lost whatever
+  per-model tuning the merge carried. It keeps a job alive; its numbers are not
+  comparable to a normal run.
 
   This is the same class as the `AITER_JIT_DIR` trap above, **and it fails the
   same misleading way in `check`**: the import error empties SGLang's model
@@ -2083,15 +2111,9 @@ All knobs live in `kimik3.env` (copied from `kimik3-env.example`). Anything you
   are not looking for it. `check` now names both traps when the registry comes
   back empty.
 
-  Two manual escapes if you are running an older copy of the script:
+  On an older copy of the script,
   `APPTAINER_BIND=$MODEL_CACHE_DIR/aiter-configs:/tmp/aiter_configs` does the
-  same job from the environment; or point the per-op variable named in the
-  traceback at a **single** path —
-  `AITER_CONFIG_GEMM_BF16=/sgl-workspace/aiter/aiter/configs/bf16_tuned_gemm.csv`
-  — which makes `update_config_files()` return early without touching `/tmp` at
-  all. The second one costs you the `model_configs/` merge, which is where the
-  per-model tuning lives, and there are ten such variables, so it is a way to
-  get a run out, not a fix.
+  same job from the environment.
 - **Crash at graph capture: `[Errno 30] Read-only file system:
   '.../aiter/jit/flydsl_cache/...'`** — *hit for real on 28 Jul 2026.* The FP4
   MoE JIT-compiles FlyDSL kernels at CUDA-graph capture and writes them into
