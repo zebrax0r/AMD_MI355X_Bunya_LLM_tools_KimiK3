@@ -486,6 +486,67 @@ export APPTAINER_CACHEDIR APPTAINER_TMPDIR
 export SINGULARITY_CACHEDIR="$APPTAINER_CACHEDIR"
 export SINGULARITY_TMPDIR="$APPTAINER_TMPDIR"
 
+# ── aiter writes its tuned-GEMM configs to a HARDCODED /tmp/aiter_configs ───
+#
+# aiter/jit/core.py:get_config_file() globs aiter/configs/model_configs/ for
+# per-op tuned CSVs and, when it finds any, merges them with the base config and
+# writes the result to Path("/tmp/aiter_configs/<op>.csv") — taking a FileBaton
+# lock at "<op>.csv.lock" first. That path is a literal. There is no environment
+# variable for it, and the merge is what carries the per-model tuning, so
+# skipping it costs performance.
+#
+# Apptainer bind-mounts the HOST's /tmp into the container by default, so that
+# literal resolves to a directory shared with every other user on the node.
+# Whoever runs a K3 container first creates /tmp/aiter_configs owned by them,
+# mode 0755, and every later user's O_CREAT|O_EXCL on the lock file inside it
+# fails at IMPORT time with:
+#
+#   PermissionError: [Errno 13] Permission denied:
+#     '/tmp/aiter_configs/bf16_tuned_gemm.csv.lock'
+#
+# HIT FOR REAL ON 28 AUG 2026, on the first serve after the image moved to
+# mainline. It is new because of a new import edge, not new aiter: sglang's
+# moe/moe_runner/deep_gemm.py now imports sglang.kernels.ops.attention.dsv4,
+# whose gemm.py does `from aiter.tuned_gemm import tgemm`, and tuned_gemm reads
+# AITER_CONFIG_GEMM_BF16_FILE at module scope. AITER_COMMIT is the same
+# d9e5ef7c in both images; three weeks of sglang is what reached the trap.
+#
+# Fix: give the container its own /tmp/aiter_configs, bound over the shared one.
+# Same shape as the AITER_JIT_DIR seeding further down, and for the same reason —
+# a read-only .sif and a shared node both need writable state to live on scratch.
+#
+# This has to cover the probes too, not just 'serve'. 'check', 'parsers' and
+# 'loadstat' all import sglang, and an import that dies here reports as an EMPTY
+# model registry — which is exactly how the AITER_JIT_DIR trap made 'check' tell
+# us a mainline image could not serve K3 on 12 Aug. A probe that cannot import is
+# not a probe that answered no.
+AITER_CONFIG_DIR="${AITER_CONFIG_DIR:-$MODEL_CACHE_DIR/aiter-configs}"
+AITER_CONFIG_BIND=()
+aiter_config_setup() {
+    [[ -n "$AITER_CONFIG_DIR" ]] || return 0
+    if ! mkdir -p "$AITER_CONFIG_DIR" 2>/dev/null || [[ ! -w "$AITER_CONFIG_DIR" ]]; then
+        warn "AITER_CONFIG_DIR='$AITER_CONFIG_DIR' is not writable — leaving /tmp/aiter_configs"
+        warn "  as the container finds it. If another user on this node owns that directory,"
+        warn "  importing sglang will fail with 'Permission denied: .../*.csv.lock'."
+        return 0
+    fi
+    # Belt and braces: the auto-pull above has already put it there.
+    [[ -f "$SIF_PATH" ]] || return 0
+    # Verify the bind before relying on it. Mounting over a directory owned by
+    # someone else is fine, but the mount point still has to exist in the image,
+    # and a failed --bind kills the container at startup rather than degrading.
+    if apptainer exec --bind "$AITER_CONFIG_DIR":/tmp/aiter_configs "$SIF_PATH" \
+            sh -c 'touch /tmp/aiter_configs/.write-test && rm -f /tmp/aiter_configs/.write-test' \
+            >/dev/null 2>&1; then
+        AITER_CONFIG_BIND=(--bind "$AITER_CONFIG_DIR":/tmp/aiter_configs)
+    else
+        warn "Could not bind $AITER_CONFIG_DIR over /tmp/aiter_configs in this image —"
+        warn "  falling back to whatever /tmp the container gets. If aiter then dies with"
+        warn "  'Permission denied: /tmp/aiter_configs/*.lock', that directory belongs to"
+        warn "  another user on this node: set AITER_CONFIG_DIR elsewhere, or move nodes."
+    fi
+}
+
 # ── Building the .sif ───────────────────────────────────────────────────────
 
 # Apptainer 1.5.0 (6 May 2026) started wrapping mksquashfs in a bundled `proot`
@@ -577,6 +638,16 @@ if [[ ! -f "$SIF_PATH" ]]; then
     pull_image \
         || die "apptainer pull failed. Run './serve-kimik3.sh pull' explicitly to debug."
 fi
+
+# Now that the image is on disk, settle the /tmp/aiter_configs bind (see above).
+# Only the modes that import sglang pay for the probe. PROBE_ENV carries it so
+# every read-only probe runs in the same container the server will.
+case "$MODE" in
+    serve|check|parsers|loadstat|gpucheck)
+        aiter_config_setup
+        PROBE_ENV+=(${AITER_CONFIG_BIND[@]+"${AITER_CONFIG_BIND[@]}"})
+        ;;
+esac
 
 # Resolve HF token: env var, then token file.
 if [[ -z "${HF_TOKEN:-}" && -n "${HF_TOKEN_FILE:-}" ]]; then
@@ -798,13 +869,13 @@ if [[ "$MODE" == "gpucheck" ]]; then
     # it — the .seeded marker records the in-image target. Testing a container
     # configured differently from the one we launch is how the read-only-.sif
     # bug survived three attempts.
-    probe_extra=()
+    probe_extra=(${AITER_CONFIG_BIND[@]+"${AITER_CONFIG_BIND[@]}"})
     jit_dir="${AITER_JIT_DIR:-$MODEL_CACHE_DIR/aiter-jit}"
     if [[ -f "$jit_dir/.seeded" ]]; then
         jit_target="$(cut -d'|' -f2 "$jit_dir/.seeded" 2>/dev/null || true)"
         if [[ "$jit_target" == /* ]]; then
-            probe_extra=(--bind "$MODEL_CACHE_DIR":"$MODEL_CACHE_DIR"
-                         --bind "$jit_dir":"$jit_target")
+            probe_extra+=(--bind "$MODEL_CACHE_DIR":"$MODEL_CACHE_DIR"
+                          --bind "$jit_dir":"$jit_target")
             log "Probing with the aiter JIT bind: $jit_dir -> $jit_target"
         fi
     fi
@@ -1071,7 +1142,8 @@ if not known:
     print("     tested. Every model module failed to import — look for repeated")
     print("     'Ignore import error when loading sglang.srt.models.*' above.")
     print("     A trailing \": ''\" on those lines is the aiter AITER_JIT_DIR trap;")
-    print("     see the README troubleshooting entry for FileNotFoundError: ''.")
+    print("     a PermissionError on /tmp/aiter_configs/*.lock is the shared-/tmp")
+    print("     trap — see both README troubleshooting entries.")
     sys.exit(3)
 
 if missing:
@@ -1942,6 +2014,7 @@ prefetch_env=()
 
 base_args=(--bind "$MODEL_CACHE_DIR":"$MODEL_CACHE_DIR"
     ${cache_bind[@]+"${cache_bind[@]}"}
+    ${AITER_CONFIG_BIND[@]+"${AITER_CONFIG_BIND[@]}"}
     ${shim_args[@]+"${shim_args[@]}"}
     ${presharded_bind[@]+"${presharded_bind[@]}"}
     --env HF_HOME="$MODEL_CACHE_DIR"
@@ -2117,7 +2190,10 @@ while true; do
      Unknown architecture?   ./serve-kimik3.sh check
      Unknown parser name?    ./serve-kimik3.sh parsers
      KV cache OOM?           set CONTEXT_LEN=262144 in kimik3.env and retry
-     DSpark TypeError?       unset SPECULATIVE (sglang issue #32569)"
+     DSpark TypeError?       unset SPECULATIVE (sglang issue #32569)
+     Permission denied on
+     /tmp/aiter_configs/*?   another user on this node owns that directory;
+                             set AITER_CONFIG_DIR in kimik3.env (see README)"
     fi
     if (( $(date +%s) - start_ts > READY_TIMEOUT )); then
         die "Server did not become healthy within ${READY_TIMEOUT}s. Check: tail -f $LOG_FILE"

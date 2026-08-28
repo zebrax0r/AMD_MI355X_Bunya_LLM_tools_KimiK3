@@ -130,6 +130,30 @@ export AITER_JIT_DIR="${AITER_JIT_DIR:-}"
 # (it warns loudly when it cannot find aiter at all).
 export AITER_JIT_TARGET="${AITER_JIT_TARGET:-}"
 
+# aiter's SECOND writable-state trap, and this one is shared between USERS.
+# aiter/jit/core.py merges the per-op tuned-GEMM CSVs it finds under
+# aiter/configs/model_configs/ and writes the result to a hardcoded
+# /tmp/aiter_configs/<op>.csv, locking /tmp/aiter_configs/<op>.csv.lock first.
+# There is no environment variable for that path — it is a literal in the source.
+#
+# Apptainer bind-mounts the HOST's /tmp into the container, so on a shared node
+# whoever runs a K3 container first owns /tmp/aiter_configs, and everyone after
+# them dies at IMPORT time with:
+#
+#   PermissionError: [Errno 13] Permission denied:
+#     '/tmp/aiter_configs/bf16_tuned_gemm.csv.lock'
+#
+# serve-kimik3.sh binds this directory over /tmp/aiter_configs for every mode
+# that imports sglang (serve, check, parsers, loadstat, gpucheck), so the merge
+# writes somewhere you own. Defaults to $MODEL_CACHE_DIR/aiter-configs. Set it
+# elsewhere only if scratch is unwritable; the contents are regenerated on every
+# process start, so deleting it is always safe.
+#
+# Reached for the first time on 28 Aug 2026, with the move to a mainline image —
+# not because aiter changed (AITER_COMMIT is the same d9e5ef7c in both images)
+# but because sglang's MoE runner now imports aiter.tuned_gemm at module scope.
+export AITER_CONFIG_DIR="${AITER_CONFIG_DIR:-}"
+
 # ── Endpoint auth ───────────────────────────────────────────────────────────
 
 # API key for the endpoint (clients send "Authorization: Bearer ..."). Leave

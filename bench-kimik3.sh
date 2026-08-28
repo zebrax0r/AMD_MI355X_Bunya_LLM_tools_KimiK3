@@ -280,6 +280,34 @@ AITER_JIT_DIR="${AITER_JIT_DIR:-$MODEL_CACHE_DIR/aiter-jit}"
 bench_binds=()
 [[ -d "$AITER_JIT_DIR" ]] && bench_binds+=(--bind "$AITER_JIT_DIR")
 
+# aiter's SECOND writable-state trap, and this one is shared between USERS.
+# aiter/jit/core.py merges the tuned-GEMM CSVs it finds under configs/model_configs/
+# and writes the result to a hardcoded /tmp/aiter_configs/<op>.csv, locking
+# beside it first. Apptainer bind-mounts the HOST's /tmp in, so on a shared node
+# the first user to run a K3 container owns that directory and everyone after
+# them dies at import with:
+#
+#   PermissionError: [Errno 13] Permission denied:
+#     '/tmp/aiter_configs/bf16_tuned_gemm.csv.lock'
+#
+# This script usually escapes it, because sglang.bench_serving imports no aiter —
+# but the fallback module goes disaggregation.utils -> quantization -> ... ->
+# aiter.tuned_gemm, which is exactly the chain that killed 'serve' on 28 Aug 2026.
+# Bind the same directory serve-kimik3.sh does. Write-test it first: a --bind
+# that cannot be made kills the container outright, and a benchmark that refuses
+# to start is worse than one that runs on someone else's /tmp and might not.
+AITER_CONFIG_DIR="${AITER_CONFIG_DIR:-$MODEL_CACHE_DIR/aiter-configs}"
+if mkdir -p "$AITER_CONFIG_DIR" 2>/dev/null && [[ -w "$AITER_CONFIG_DIR" ]] \
+   && apptainer exec --bind "$AITER_CONFIG_DIR":/tmp/aiter_configs "$SIF_PATH" \
+        sh -c 'touch /tmp/aiter_configs/.write-test && rm -f /tmp/aiter_configs/.write-test' \
+        >/dev/null 2>&1; then
+    bench_binds+=(--bind "$AITER_CONFIG_DIR":/tmp/aiter_configs)
+else
+    warn "Could not bind $AITER_CONFIG_DIR over /tmp/aiter_configs — if the bench dies"
+    warn "  with 'Permission denied: /tmp/aiter_configs/*.lock', that directory belongs"
+    warn "  to another user on this node. See the README troubleshooting entry."
+fi
+
 # ── One benchmark run ───────────────────────────────────────────────────────
 # $1 = max concurrency, $2 = request rate ("inf" to saturate)
 

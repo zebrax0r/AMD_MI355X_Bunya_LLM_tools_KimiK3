@@ -1614,6 +1614,11 @@ this file's tables carries over by assumption.
 Ordered so every number attributes to one change. **Clear `DSPARK_BLOCK_SIZE`
 from `kimik3.env` first** if it is still `3` from the gamma test.
 
+The first attempt at step 5, on 28 Aug, never reached the weight load: aiter's
+tuned-GEMM configs are written to a `/tmp` path shared with every other user on
+the node. Fixed in the script — `git pull` before you start, and see
+[the troubleshooting entry](#notes--troubleshooting) for what it was.
+
 **0 — login node.** `git pull`, then:
 
 ```bash
@@ -1818,6 +1823,7 @@ All knobs live in `kimik3.env` (copied from `kimik3-env.example`). Anything you
 | `APPTAINER_CACHEDIR` / `_TMPDIR` | *(near `$MODEL_CACHE_DIR`)* | Apptainer cache/scratch, kept off `/home` |
 | `AITER_JIT_DIR` | `$MODEL_CACHE_DIR/aiter-jit` | Writable copy of aiter's `jit/`, bound over the in-image one |
 | `AITER_JIT_TARGET` | *(auto-detected)* | In-image `jit/` path to bind over; set only if detection is wrong |
+| `AITER_CONFIG_DIR` | `$MODEL_CACHE_DIR/aiter-configs` | Bound over aiter's hardcoded `/tmp/aiter_configs`, which is **shared between users** on the node ([why](#notes--troubleshooting)) |
 | `KIMIK3_API_KEY` | *(auto-generated)* | Bearer key; saved to `$MODEL_CACHE_DIR/kimik3-api-key` |
 | `PORT` | `30000` | Endpoint port on the node |
 | `TP_SIZE` | `8` | Tensor parallel = **total GPU count** |
@@ -2044,6 +2050,48 @@ All knobs live in `kimik3.env` (copied from `kimik3-env.example`). Anything you
   it **prefers the old path wherever it exists** and only falls back when the
   image has nothing else. Set `BENCH_MODULE` to force one. The resolved name is
   recorded in every results file.
+- **Every mode dies at import with `PermissionError: [Errno 13] Permission
+  denied: '/tmp/aiter_configs/bf16_tuned_gemm.csv.lock'`** — *hit for real on
+  28 Aug 2026, the first serve on the mainline image.* aiter's
+  `get_config_file()` globs `aiter/configs/model_configs/` for per-op tuned GEMM
+  CSVs and, when it finds any, merges them with the base config and writes the
+  result to a **hardcoded** `/tmp/aiter_configs/<op>.csv`, taking a `FileBaton`
+  lock beside it first. There is no environment variable for that directory — it
+  is a literal in `aiter/jit/core.py`. Apptainer bind-mounts the **host's**
+  `/tmp` into the container, so on a shared node the first person to run a K3
+  container owns `/tmp/aiter_configs` at mode 0755, and everyone after them gets
+  `EACCES` on the lock file's `O_CREAT|O_EXCL`.
+
+  Nothing is wrong with the image, and aiter did not change: `AITER_COMMIT` is
+  the same `d9e5ef7c` (29 Jul) in the 27 Jul image and in `…-20260820`. The
+  *import graph* changed. sglang's `moe/moe_runner/deep_gemm.py` now imports
+  `sglang.kernels.ops.attention.dsv4`, whose `gemm.py` does
+  `from aiter.tuned_gemm import tgemm`, and `tuned_gemm` reads
+  `AITER_CONFIG_GEMM_BF16_FILE` at module scope. Three weeks of sglang reached a
+  trap that had been sitting there the whole time.
+
+  The script now binds `AITER_CONFIG_DIR` (default
+  `$MODEL_CACHE_DIR/aiter-configs`) over `/tmp/aiter_configs` for every mode that
+  imports sglang — `serve`, `check`, `parsers`, `loadstat`, `gpucheck` — after
+  write-testing the bind, so a bind that cannot be made warns and degrades
+  instead of killing the container at startup. The contents are regenerated on
+  every process start, so deleting that directory is always safe.
+
+  This is the same class as the `AITER_JIT_DIR` trap above, **and it fails the
+  same misleading way in `check`**: the import error empties SGLang's model
+  registry, and an empty registry reads as "this image cannot serve K3" if you
+  are not looking for it. `check` now names both traps when the registry comes
+  back empty.
+
+  Two manual escapes if you are running an older copy of the script:
+  `APPTAINER_BIND=$MODEL_CACHE_DIR/aiter-configs:/tmp/aiter_configs` does the
+  same job from the environment; or point the per-op variable named in the
+  traceback at a **single** path —
+  `AITER_CONFIG_GEMM_BF16=/sgl-workspace/aiter/aiter/configs/bf16_tuned_gemm.csv`
+  — which makes `update_config_files()` return early without touching `/tmp` at
+  all. The second one costs you the `model_configs/` merge, which is where the
+  per-model tuning lives, and there are ten such variables, so it is a way to
+  get a run out, not a fix.
 - **Crash at graph capture: `[Errno 30] Read-only file system:
   '.../aiter/jit/flydsl_cache/...'`** — *hit for real on 28 Jul 2026.* The FP4
   MoE JIT-compiles FlyDSL kernels at CUDA-graph capture and writes them into
