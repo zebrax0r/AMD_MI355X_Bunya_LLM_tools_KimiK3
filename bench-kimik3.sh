@@ -276,9 +276,17 @@ echo "# bench_module=$BENCH_MODULE" >> "$OUT_FILE"
 # is enough to poison any import of aiter inside the container. serve-kimik3.sh
 # resolves this to a real path and never sees it; this script did not. Resolve it
 # the same way, and bind it so the container can actually write there.
+# Mainline resolves TRITON_CACHE_DIR, TORCHINDUCTOR_CACHE_DIR and its own JIT
+# cache from SGLANG_CACHE_DIR, which defaults to ~/.cache/sglang. Bunya's /home
+# has a quota; keep it on scratch, and use the same root serve-kimik3.sh does so
+# the two do not compile the same kernels twice.
+SGLANG_CACHE_DIR="${SGLANG_CACHE_DIR:-$MODEL_CACHE_DIR/sglang-cache}"
+mkdir -p "$SGLANG_CACHE_DIR" 2>/dev/null || true
+
 AITER_JIT_DIR="${AITER_JIT_DIR:-$MODEL_CACHE_DIR/aiter-jit}"
 bench_binds=()
 [[ -d "$AITER_JIT_DIR" ]] && bench_binds+=(--bind "$AITER_JIT_DIR")
+[[ -d "$SGLANG_CACHE_DIR" ]] && bench_binds+=(--bind "$SGLANG_CACHE_DIR")
 
 # aiter's SECOND writable-state trap, and this one is shared between USERS.
 # aiter/jit/core.py merges the tuned-GEMM CSVs it finds under configs/model_configs/
@@ -323,6 +331,7 @@ run_one() {
     apptainer exec \
         --env "OPENAI_API_KEY=${KIMIK3_API_KEY:-}" \
         --env "AITER_JIT_DIR=$AITER_JIT_DIR" \
+        --env "SGLANG_CACHE_DIR=$SGLANG_CACHE_DIR" \
         ${bench_binds[@]+"${bench_binds[@]}"} \
         "$SIF_PATH" \
         python3 -m "$BENCH_MODULE" \

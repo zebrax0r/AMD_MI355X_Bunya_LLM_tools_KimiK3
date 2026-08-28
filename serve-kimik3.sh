@@ -188,7 +188,16 @@ EXTRA_ENGINE_ARGS="${EXTRA_ENGINE_ARGS:-}"
 # Probes need a writable path, not the real JIT cache. /tmp is writable inside an
 # Apptainer container with no bind, so this works regardless of what a given exec
 # mounts. 'serve' keeps using the seeded, bound AITER_JIT_DIR resolved below.
-PROBE_ENV=(--env AITER_JIT_DIR=/tmp/aiter-jit)
+#
+# Both probe paths carry the uid, because /tmp is SHARED BETWEEN USERS on these
+# nodes and a bare /tmp/aiter-jit is the same trap /tmp/aiter_configs turned out
+# to be: whoever gets there first owns it, and everyone after them gets EACCES.
+# Mainline also moved its compiled-kernel caches under SGLANG_CACHE_DIR
+# (default ~/.cache/sglang), which probes have no use for and /home cannot
+# afford — see the SGLANG_CACHE_DIR block below.
+PROBE_TMP="/tmp/kimik3-$(id -u 2>/dev/null || echo user)"
+PROBE_ENV=(--env "AITER_JIT_DIR=$PROBE_TMP/aiter-jit"
+           --env "SGLANG_CACHE_DIR=$PROBE_TMP/sglang-cache")
 
 MODEL_CACHE_DIR="${MODEL_CACHE_DIR:-}"
 SIF_PATH="${SIF_PATH:-}"
@@ -530,6 +539,28 @@ export SINGULARITY_TMPDIR="$APPTAINER_TMPDIR"
 #
 # Contents are rebuilt from scratch on every process start, so nothing is lost by
 # not reusing them, and old job directories are pruned after a week.
+# ── Mainline moved every compiled-kernel cache onto /home ──────────────────
+#
+# sglang now resolves TRITON_CACHE_DIR, TORCHINDUCTOR_CACHE_DIR, its deep_gemm
+# cache and its own JIT cache from one root:
+#
+#     SGLANG_CACHE_DIR = EnvStr(os.path.expanduser("~/.cache/sglang"))
+#
+# and says so at startup ("Compiled-kernel caches now live under
+# SGLANG_CACHE_DIR (/home/$USER/.cache/sglang)"). Bunya's /home has a tight
+# quota — it is why APPTAINER_CACHEDIR and APPTAINER_TMPDIR are forced onto
+# scratch above — and Triton/CuTeDSL output for a model this size is not small.
+# A full /home fails in ways that look like anything but a full /home.
+#
+# Point it at scratch. Persisting it is a bonus, not the reason: compiled
+# kernels survive a restart, so a warm start skips the recompile.
+SGLANG_CACHE_DIR="${SGLANG_CACHE_DIR:-$MODEL_CACHE_DIR/sglang-cache}"
+mkdir -p "$SGLANG_CACHE_DIR" 2>/dev/null || true
+if [[ ! -w "$SGLANG_CACHE_DIR" ]]; then
+    warn "SGLANG_CACHE_DIR='$SGLANG_CACHE_DIR' is not writable — sglang will fall back"
+    warn "  to ~/.cache/sglang on /home, which has a quota. Fix the path in kimik3.env."
+fi
+
 aiter_config_base="$MODEL_CACHE_DIR/aiter-configs"
 AITER_CONFIG_DIR="${AITER_CONFIG_DIR:-$aiter_config_base/${SLURM_JOB_ID:-$$}}"
 AITER_CONFIG_ARGS=()
@@ -2091,6 +2122,8 @@ base_args=(--bind "$MODEL_CACHE_DIR":"$MODEL_CACHE_DIR"
     ${AITER_CONFIG_ARGS[@]+"${AITER_CONFIG_ARGS[@]}"}
     ${shim_args[@]+"${shim_args[@]}"}
     ${presharded_bind[@]+"${presharded_bind[@]}"}
+    --bind "$SGLANG_CACHE_DIR":"$SGLANG_CACHE_DIR"
+    --env SGLANG_CACHE_DIR="$SGLANG_CACHE_DIR"
     --env HF_HOME="$MODEL_CACHE_DIR"
     --env HF_TOKEN="${HF_TOKEN:-}"
     --env HF_HUB_ENABLE_HF_TRANSFER=1

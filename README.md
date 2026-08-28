@@ -757,7 +757,7 @@ were learned by silently running `longcontext` at 1024/512 c=2/8/32, twice.
 Expect a long wait before the first token — prefill at 100k is the slow path on
 `ATTENTION_BACKEND=triton`, and that TTFT is a headline result, not a warmup
 cost. It is also the number
-[AITER MLA prefill](#the-biggest-lever-we-still-cannot-pull--aiter-mla-prefill)
+[AITER MLA prefill](#the-biggest-lever--aiter-mla-prefill--landed-on-28-august)
 would move most.
 
 #### Measured at 100k — bun160 9 Aug and bun161 12 Aug 2026
@@ -832,7 +832,7 @@ conclusion does not hinge on it.
 
 TTFT matters as much as TPOT here: **1.86 s at 32k against 15.5 s at 100k**, 8.3×
 for 3× the context. Prefill is superlinear where decode is flat — that is the
-[AITER MLA prefill](#the-biggest-lever-we-still-cannot-pull--aiter-mla-prefill)
+[AITER MLA prefill](#the-biggest-lever--aiter-mla-prefill--landed-on-28-august)
 lever, still stalled upstream.
 
 So, for agentic sessions, in one line:
@@ -874,7 +874,7 @@ TTFT of 15.5 s is a *cold* 100k prefill — four unrelated random prompts share 
 prefix. A real agentic turn hits the radix cache (`#cached-token: 105344` against
 `#new-token: 18`) and pays almost none of it. Do not quote this number as what
 opencode users experience; quote it as what
-[AITER MLA prefill](#the-biggest-lever-we-still-cannot-pull--aiter-mla-prefill)
+[AITER MLA prefill](#the-biggest-lever--aiter-mla-prefill--landed-on-28-august)
 would attack.
 
 **Turning DSpark off is worth 2.93× at 100k.** TTFT moved 1% (15359 vs 15526 ms)
@@ -912,7 +912,7 @@ Two consequences:
   decode from 1k decode, so row 3 is now a small experiment, not a lever.
 - **The remaining long-context weakness is prefill, not decode** — the 15.5 s
   cold TTFT, which is
-  [AITER MLA prefill](#the-biggest-lever-we-still-cannot-pull--aiter-mla-prefill)
+  [AITER MLA prefill](#the-biggest-lever--aiter-mla-prefill--landed-on-28-august)
   territory and unavailable. In normal agentic use the radix cache means you
   rarely pay it.
 
@@ -1175,11 +1175,57 @@ and `presharded` (which removes the re-quantisation work entirely) is the lever.
 
 ---
 
-## Upstream drift — checked 20 Aug 2026
+## Upstream drift — checked 28 Aug 2026
 
 Everything here moves fast enough that a snapshot goes stale in days, so this
 section records **what was found and how to re-run the check**, not just the
 answer.
+
+### What moved between 20 and 28 August
+
+Eight days, and three of the four things this repo was waiting on moved.
+
+**The nightly stream is now `v0.5.18`.** `main`'s version bumped on 22 Aug, so
+the tags read `v0.5.18-rocm724-mi35x-2026082x`. Newest at the time of writing:
+**`v0.5.18-rocm724-mi35x-20260827`** (25.94 GB, pushed 27 Aug 18:16 UTC).
+
+**The aiter pin moved for the first time since 29 July.** PR
+[#35810](https://github.com/sgl-project/sglang/pull/35810) (21 Aug) sets
+`AITER_COMMIT_DEFAULT="c16d44b9"` — aiter of **18 Aug**. Every tag from
+`20260822` carries it; `v0.5.17-…-20260820`, this repo's current default, does
+not. What it brings: `41d6c527` MLA PS `16mx8_32nx1_fp8fp8` opus kernel (+3–8%),
+`e1526c68` `fused_qk_rope_reshape_and_cache` gfx950 optimisations, `cf173e05`
+48-head 128-dim MLA reduction, `fb82bf7e` dropping the `batch_size == 1`
+constraint from the fp8 KV Gluon MLA regime, plus the 10 Aug K3 prefill-GEMM and
+A8W4 fmoe tuning. What it still misses, by three days: `3cddd950` *Tune Kimi-K3
+A4W4 and FP8 projections* (21 Aug) and `eb84cb02` *Tune mla_decode_rope fp32
+config for gfx950* (20 Aug).
+
+**`rocm724` is now Python 3.12 + torch 2.11 + triton 3.7.** [#30984](https://github.com/sgl-project/sglang/pull/30984)
+merged 20 Aug, so it is in `20260822` and later — one more moving part than the
+`20260820` image the migration was planned around.
+
+**The AITER MLA prefill lever landed** — [see below](#the-biggest-lever--aiter-mla-prefill--landed-on-28-august).
+Not as #33341, which is still open and untouched since 3 Aug, but as
+[#36356](https://github.com/sgl-project/sglang/pull/36356), merged **28 Aug
+01:30 UTC**. That is *after* the 27 Aug nightly's source snapshot, so the first
+image to carry it is dated **`20260828`**.
+
+**Three K3 PRs merged on 28 Aug that do not apply to us**, worth naming so the
+next check does not re-read them:
+[#36211](https://github.com/sgl-project/sglang/pull/36211) declares
+`packed_modules_mapping` so quantization configs can match per-shard
+`exclude_modules` against fused runtime prefixes — for NVFP4 checkpoints;
+[#36603](https://github.com/sgl-project/sglang/pull/36603) fixes dense ModelSlim
+W4A8 MLA weights being replaced by GGUF placeholders; and
+[#35630](https://github.com/sgl-project/sglang/pull/35630) enables Mori-EP, which
+is an expert-parallel path, not a TP8 single-node one. Our checkpoint is
+`mxfp4-pack-quantized` and untouched by all three.
+
+**Still open, still nothing:** #33303 (FlyDSL KDA fused decode, last touched
+7 Aug), #33735 (gfx950 ASM AttnResidual, 11 Aug), #33341 (superseded in
+practice by #36356). Upstream's cookbook is still pinned to
+`v0.5.17-rocm720-mi35x-20260817`, still `verified: false`.
 
 ### Containers
 
@@ -1190,8 +1236,9 @@ answer.
 | Newest K3-branch tag | `rocm720-mi35x-k3-20260803` — **the last one. That stream is retired** |
 | Nightly flavours | `gfx942`/`gfx950` × `rocm700`/`rocm720`/`rocm724`, all dated daily |
 | Why `rocm724` | upstream made 7.2.4 its **primary AMD PR gate** on 20 Aug (#35602), runs both nightly (#35603) |
-| Not yet in `rocm724` | torch 2.11 + triton 3.7 (#30984, merged 20 Aug) — first appears in `20260822` or later |
-| aiter inside every image | `AITER_COMMIT=d9e5ef7c` — **still 29 Jul**, unchanged in three weeks |
+| Newest tag (28 Aug) | `v0.5.18-rocm724-mi35x-20260827` (25.94 GB) — the stream bumped to `v0.5.18` on 22 Aug |
+| In `rocm724` from `20260822` | Python 3.12 + torch 2.11 + triton 3.7 (#30984, merged 20 Aug) |
+| aiter inside the image | `d9e5ef7c` (29 Jul) through `20260821`; **`c16d44b9` (18 Aug) from `20260822`** (#35810) |
 | ROCm 7.14 | `rocm/pytorch` has twelve `rocm7.14_*` bases (16 Jul), **sglang has no 7.14 stage** |
 
 **The ROCm 7.14 row is not the blocker it looks like.** The base images exist —
@@ -1214,16 +1261,16 @@ source block and replaced it with aiter's own `install_triton.sh`. The diff leav
 layer was a build tree, not the kernels.** `check` still verifies it in a minute,
 and should.
 
-**The images' aiter is now three weeks behind aiter's own K3 work.** Every
-published image, through `20260820`, still pins `AITER_COMMIT=d9e5ef7c` (29 Jul);
-that default in `docker/rocm.Dockerfile` has not moved in eight days. Since it,
-`ROCm/aiter` `main` has landed `ca68b4f3` *tune Kimi-K3 prefill GEMMs for gfx950*
-(10 Aug), `05ec7fd9` *runtime-keyed Kimi-K3 A8W4 fmoe config* (10 Aug), `868ac1f7`
-*correct + faster a16w4 SiTUv2* (8 Aug), `243bebb` *tune chunked_pa_prefill params
-for gfx950* (19 Aug), `0159273` *[FlyDSL] MoE GEMM workgroup-cluster multicast*
-(20 Aug) and `9279f97` *[gfx950] retune small-M tiles in the A16W16 fallback*
-(20 Aug). **None of it ships in any image.** So: **check the image's
-`AITER_COMMIT`, not its tag date** — `./serve-kimik3.sh check` now prints it.
+**The image's aiter caught up on 21 Aug, and is now ten days behind.** Through
+`20260821` every image pinned `AITER_COMMIT=d9e5ef7c` (29 Jul) — three weeks
+stale, including the 10 Aug K3 prefill-GEMM and A8W4 fmoe tuning. #35810 moved it
+to `c16d44b9` (18 Aug), which lands all of that. It still misses `3cddd950`
+*Tune Kimi-K3 A4W4 and FP8 projections* (21 Aug), `eb84cb02` *Tune
+mla_decode_rope fp32 config for gfx950* (20 Aug), `243bebb` *chunked_pa_prefill*
+(19 Aug) and `0159273` *[FlyDSL] MoE GEMM workgroup-cluster multicast* (20 Aug).
+The pin moves on someone's PR, not on a schedule, so the rule stands and matters
+more now that it does move: **check the image's `AITER_COMMIT`, not its tag
+date** — `./serve-kimik3.sh check` prints it.
 
 ### The branch merged; mainline is the only live stream
 
@@ -1456,22 +1503,58 @@ names `tokenization_kimi.TikTokenTokenizer`), so SGLang never loads it and
 reimplements the same logic in `kimik3_detector.py`. Harmless in itself — but it
 is why `MODEL_REVISION` now exists.
 
-### The biggest lever we still cannot pull — AITER MLA prefill
+### The biggest lever — AITER MLA prefill — landed on 28 August
 
-PR [#33341](https://github.com/sgl-project/sglang/pull/33341), *"[AMD] Enable
-aiter MLA for 12-head models via 12→16 zero-pad (Kimi-K3)"*, opened 3 Aug by AMD.
-**Still open at the 12 Aug check, still `dirty`, and still untouched since the day
-it opened** — nine days of conflicts nobody has resolved. It targets `main`,
-which is where K3 lives now, so it is no longer aimed at a side branch; it is
-simply stalled. It is in no image today, and `ATTENTION_BACKEND=triton` stays the
-right setting.
+**It merged on 28 Aug 2026** — as [#36356](https://github.com/sgl-project/sglang/pull/36356),
+*"[AMD] Enable aiter mla asm path through padding attn heads for Kimi K3"*, at
+01:30 UTC. Not as #33341, the 3 Aug PR this section used to track: that one is
+still open and untouched, superseded in practice rather than merged.
 
-K3 at TP8 gives each rank 12 attention heads, and AITER's MLA kernels want 16.
-Both the old branch and `main` already pad for **decode**
-(`_mla_decode_fwd_with_head_pad`); the gap this PR closes is the absorbed
-**prefill** path, plus a non-power-of-2 head mask in `cache_ops` and a NoPE guard
-for K3's `skip_rope`. That makes it a **TTFT lever, not an aggregate-throughput
-one** — which is exactly the axis `bench-kimik3.sh throughput` does not measure.
+The blocker was arithmetic. aiter's MLA reduce kernel accepts a head count of 4,
+8, or a multiple of 16 in [16, 128]. K3 has 96 query heads, so TP8 gives each
+rank **12**, and asking for the aiter backend aborted the process outright:
+
+```
+[AITER] csrc/kernels/mla/reduce.cu:1264 kn_mla_reduce_v1 doesn't support the
+        specified settings: #heads: 12, head dimension: 128.
+Fatal Python error: Aborted
+```
+
+#36356 adds `pad_heads()` to repeat q/k/v up to 16 and slice the extra output
+columns off, for **both** prefill and decode, copies aiter's supported shapes
+into `_MLA_REDUCE_V1_HEADS` so unsupported ones fall back to aiter FA instead of
+aborting, and fixes a second K3-specific crash: `mla_use_nope: true` means some
+layers have no rope, and `_skip_rope_for_aiter_fused_mla` was handing
+`rotary_emb = None` to the fused kernel (`AttributeError: 'NoneType' object has
+no attribute 'cos_cache'`). Two files, 119 lines. **No new environment variable,
+and no behaviour change for head counts that already worked** — for us the change
+is simply that the aiter path stops aborting.
+
+Upstream's own accuracy numbers, 8×MI355X TP8, GSM8K over 1300:
+
+| prefill backend | decode backend | GSM8K | invalid | output tok/s |
+|---|---|---|---|---|
+| **aiter** | **triton** | **0.958** | 0.001 | **774** |
+| aiter | aiter | 0.947 | 0.001 | 754 |
+
+Note which row wins: **aiter for prefill, triton for decode** — which is what
+this repo would want anyway, since `MLA_DECODE_TUNE` (#34580) tunes the *triton*
+decode kernel. The two levers compose rather than compete. Their run used
+`--kv-cache-dtype fp8_e4m3`, `--page-size 128` and `--disable-radix-cache`, none
+of which we use, so those tok/s are not comparable to our tables.
+
+**First image to carry it is dated `20260828`**: the 27 Aug nightly's source
+snapshot is 27 Aug 12:00 UTC, and this merged 13½ hours later.
+
+Reach it with no code change — `EXTRA_ENGINE_ARGS` is passed through verbatim:
+
+```bash
+# kimik3.env — one variable at a time, and re-verify output afterwards
+export EXTRA_ENGINE_ARGS="--prefill-attention-backend aiter --decode-attention-backend triton"
+```
+
+The older numbers below come from #33341's description and are what we have
+until this is run here. They are the reason it is worth running.
 
 Its numbers, 8×MI355X TP8, `--attention-backend aiter` vs `triton`:
 
@@ -1484,14 +1567,13 @@ Its numbers, 8×MI355X TP8, `--attention-backend aiter` vs `triton`:
 
 Note how little it does at short context and how much at long: this matters for
 agentic sessions that resend a large context every turn, and barely at all for
-the 1024/512 shape every table in this README uses. If it merges and reaches an
-image, it is worth a `check` + `parsers` + full re-bench in a second `SIF_PATH` —
-and worth re-benching at 10k input, not just 1024.
+the 1024/512 shape every table in this README uses. **Bench it at 10k and 100k
+input, not at 1024** — 1024 is the shape it barely moves.
 
-#### The half of it we might already have — aiter for decode only
+#### The half we already had — aiter for decode only
 
-The decode head-pad is present in the image's own `aiter_backend.py`, so
-the prefill gap need not block the decode path: SGLang takes
+Before #36356, the decode head-pad was already present in the image's own
+`aiter_backend.py`, so the prefill gap need not block the decode path: SGLang takes
 `--prefill-attention-backend` / `--decode-attention-backend`, and they override
 the global `--attention-backend`. That is reachable today with no code change,
 because `EXTRA_ENGINE_ARGS` is passed through verbatim:
@@ -1519,7 +1601,8 @@ dominates — it is not a c=1 decode result and should not be read as one.
 
 Worth running as a cheap experiment, not as a lever. **It has not been run.** A
 wrong attention kernel produces fluent gibberish rather than a crash, so
-`parsers` and `toolcheck` are mandatory before believing any number it produces.
+`parsers` and `toolcheck` are mandatory before believing any number it produces —
+and that applies to the prefill side of #36356 just as much.
 
 ### Weights
 
@@ -1618,6 +1701,22 @@ The first attempt at step 5, on 28 Aug, never reached the weight load: aiter's
 tuned-GEMM configs are written to a `/tmp` path shared with every other user on
 the node. Fixed in the script — `git pull` before you start, and see
 [the troubleshooting entry](#notes--troubleshooting) for what it was.
+
+**Which image to start on, as of 28 Aug.** Step 1 below still names
+`v0.5.17-rocm724-mi35x-20260820`, the default in `serve-kimik3.sh`. Two newer
+options exist and both are defensible:
+
+| | carries | costs |
+|---|---|---|
+| `v0.5.17-rocm724-mi35x-20260820` *(default)* | #33981, #34580, #34881 | aiter `d9e5ef7c` (29 Jul), torch 2.10 |
+| `v0.5.18-rocm724-mi35x-20260827` | + aiter `c16d44b9` (18 Aug), torch 2.11, triton 3.7 | one week more `main`, one more toolchain jump |
+| `v0.5.18-rocm724-mi35x-20260828` *(expected ~14:00–18:30 UTC on 28 Aug)* | + **#36356**, the aiter MLA prefill path | a nightly with no soak at all |
+
+The case for waiting for `20260828` is that #36356 is the lever this repo has
+been tracking since 3 Aug, and picking it up later means re-baselining the whole
+runbook a second time. The case against is that it is hours old. Note it changes
+nothing unless you pass `--prefill-attention-backend aiter`, so taking that image
+and leaving the flag alone costs nothing over `20260827`.
 
 **0 — login node.** `git pull`, then:
 
@@ -1823,6 +1922,7 @@ All knobs live in `kimik3.env` (copied from `kimik3-env.example`). Anything you
 | `APPTAINER_CACHEDIR` / `_TMPDIR` | *(near `$MODEL_CACHE_DIR`)* | Apptainer cache/scratch, kept off `/home` |
 | `AITER_JIT_DIR` | `$MODEL_CACHE_DIR/aiter-jit` | Writable copy of aiter's `jit/`, bound over the in-image one |
 | `AITER_JIT_TARGET` | *(auto-detected)* | In-image `jit/` path to bind over; set only if detection is wrong |
+| `SGLANG_CACHE_DIR` | `$MODEL_CACHE_DIR/sglang-cache` | Root for Triton, TorchInductor, deep_gemm and sglang JIT caches. Mainline defaults it to `~/.cache/sglang`, i.e. **onto `/home`'s quota** |
 | `AITER_CONFIG_DIR` | `$MODEL_CACHE_DIR/aiter-configs/$SLURM_JOB_ID` | Bound over aiter's hardcoded `/tmp/aiter_configs`, which is **shared between users** on the node. Per user *and* per job ([why](#notes--troubleshooting)) |
 | `KIMIK3_API_KEY` | *(auto-generated)* | Bearer key; saved to `$MODEL_CACHE_DIR/kimik3-api-key` |
 | `PORT` | `30000` | Endpoint port on the node |
@@ -2050,6 +2150,28 @@ All knobs live in `kimik3.env` (copied from `kimik3-env.example`). Anything you
   it **prefers the old path wherever it exists** and only falls back when the
   image has nothing else. Set `BENCH_MODULE` to force one. The resolved name is
   recorded in every results file.
+- **`/home` fills up, or a run dies in a way that makes no sense after a fresh
+  image.** Mainline sglang announces this at startup:
+
+  ```
+  Compiled-kernel caches now live under SGLANG_CACHE_DIR (/home/$USER/.cache/sglang)
+  ```
+
+  It resolves `TRITON_CACHE_DIR`, `TORCHINDUCTOR_CACHE_DIR`, its deep_gemm cache
+  and its own JIT cache from that one root, whose default is on `/home` — the
+  same tight quota that already forces `APPTAINER_CACHEDIR` onto scratch. Triton
+  and CuTeDSL output for a model this size is not small, and a full `/home` fails
+  in ways that look like anything but a full `/home`.
+
+  Both scripts now set `SGLANG_CACHE_DIR=$MODEL_CACHE_DIR/sglang-cache` and bind
+  it, so nothing lands on `/home`, and compiled kernels survive a restart. Once
+  that is in effect, `~/.cache/sglang` and `~/.triton` can be deleted — sglang
+  says it leaves the old directories alone in case another framework uses them.
+
+  The probe paths in `serve-kimik3.sh` moved at the same time, from
+  `/tmp/aiter-jit` to `/tmp/kimik3-$(id -u)/…`. `/tmp` is shared between users on
+  these nodes, and a bare `/tmp/aiter-jit` is the same trap `/tmp/aiter_configs`
+  turned out to be.
 - **Every mode dies at import with `PermissionError: [Errno 13] Permission
   denied: '/tmp/aiter_configs/bf16_tuned_gemm.csv.lock'`** — *hit for real on
   28 Aug 2026, the first serve on the mainline image.* aiter's

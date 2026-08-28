@@ -113,6 +113,30 @@ export SIF_PATH="${SIF_PATH:-}"
 export APPTAINER_CACHEDIR="${APPTAINER_CACHEDIR:-}"
 export APPTAINER_TMPDIR="${APPTAINER_TMPDIR:-}"
 
+# Where mainline sglang puts every compiled-kernel cache. It resolves
+# TRITON_CACHE_DIR, TORCHINDUCTOR_CACHE_DIR, its deep_gemm cache and its own JIT
+# cache from this one root, and announces it at startup:
+#
+#   Compiled-kernel caches now live under SGLANG_CACHE_DIR (/home/$USER/.cache/sglang)
+#
+# That default is on /home, which has the same tight quota that sends
+# APPTAINER_CACHEDIR to scratch — and Triton/CuTeDSL output for a model this
+# size is not small. A full /home fails in ways that look like anything but a
+# full /home. serve-kimik3.sh and bench-kimik3.sh both point this at
+# $MODEL_CACHE_DIR/sglang-cache and bind it, so nothing lands on /home.
+#
+# Persisting it is a bonus: compiled kernels survive a restart, so a warm start
+# skips the recompile. Deleting it only costs one recompile.
+#
+# Once this is in effect you can reclaim ~/.cache/sglang and ~/.triton — mainline
+# says it leaves the old directories alone in case another framework uses them.
+#
+# Left empty here, as everything else is: both scripts substitute the default, so
+# the empty value never reaches sglang. If you run python inside the container by
+# hand after sourcing this file, give it a real path first — an exported-but-empty
+# cache root is the same shape of trap as AITER_JIT_DIR above.
+export SGLANG_CACHE_DIR="${SGLANG_CACHE_DIR:-}"
+
 # The MXFP4 MoE JIT-compiles FlyDSL kernels into aiter's jit/ directory INSIDE
 # the image, which is read-only in a .sif — so capture dies with "[Errno 30]
 # Read-only file system: .../aiter/jit/flydsl_cache/...", and it dies only
