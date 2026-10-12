@@ -1,6 +1,6 @@
 #!/bin/bash --login
 #SBATCH --job-name=kimik3-mi355x
-#SBATCH --partition=admin_test
+#SBATCH --partition=gpu_rocm
 #SBATCH --account=a_rcc
 #SBATCH --qos=sdf
 #SBATCH --nodes=1
@@ -18,7 +18,7 @@
 #   mkdir -p logs && sbatch serve-kimik3.sbatch
 #
 # The partition/account/qos/gres above are the discovered MI355X recipe:
-#   --partition=admin_test  (the MI355X nodes live here, not gpu_rocm)
+#   --partition=gpu_rocm    (moved from admin_test by Oct 2026; 7-day max walltime)
 #   --account=a_rcc  --qos=sdf  --gres=gpu:mi355x:8
 # The MI355X nodes are bun159/bun160/bun161; the gres lands you on a free one.
 # Add e.g. '#SBATCH --nodelist=bun161' if you want to pin a specific node.

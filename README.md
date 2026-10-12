@@ -12,7 +12,14 @@ from which all the Bunya-specific knowledge here is inherited.
 
 ---
 
-## What works today — verified 28 Jul, measured through 12 Aug, image current 20 Aug 2026
+## What works today — re-measured 12 Oct 2026
+
+> **12 Oct 2026:** new default image `v0.5.21-rocm724-mi35x-20261011`, aiter
+> prefill, `MLA_DECODE_TUNE=1`, and DSpark **on by default**. DSpark now wins at
+> every context length up to 100k (11.86 ms TPOT at 100k, 4.10 ms at 1024 c=2).
+> The nodes moved to the `gpu_rocm` partition. See
+> [12 Oct 2026: the sweep](#12-oct-2026-the-sweep). Older sections below are
+> kept as history, and their numbers are from older images.
 
 K3 open weights landed on 27 Jul, and **SGLang shipped day-0 AMD support with a
 validated 8× MI355X recipe**. This repo reproduces that recipe.
@@ -21,17 +28,20 @@ validated 8× MI355X recipe**. This repo reproduces that recipe.
 |---|---|
 | Model | **`moonshotai/Kimi-K3`** — arch `KimiK3ForConditionalGeneration`, **1561 GB**, `mxfp4-pack-quantized`. The official release is already **MXFP4-native**, so there is no AMD requant to wait for. |
 | Shape | 93 layers, 896 experts (16 active), 1,048,576 context, `hidden_size` 7168, vision tower. KDA on every layer except every 4th, which is full MLA (`kv_lora_rank` 512). |
-| Engine | SGLang, image **`lmsysorg/sglang-rocm:v0.5.17-rocm724-mi35x-20260820`** — mainline since 20 Aug; the day-0 `rocm720-mi35x-k3-20260727` tag every measurement below was taken on is kept as the [anchor](#moving-to-a-mainline-image) |
+| Engine | SGLang, image **`lmsysorg/sglang-rocm:v0.5.21-rocm724-mi35x-20261011`** since 12 Oct ([why](#12-oct-2026-the-sweep)). Mainline since 20 Aug; the day-0 `rocm720-mi35x-k3-20260727` tag that most measurements below were taken on is kept as the [anchor](#moving-to-a-mainline-image) |
 | Parallelism | **TP8** — the whole node |
-| Throughput | **918 / 2074 / 3793 tok/s** at concurrency 2 / 8 / 32, measured here at 1024/512 with DSpark. Upstream's `820 / 2356 / 4898` is a different, unpublished workload — [why](#measured-on-bun161-29-jul-2026-dspark-1024512-tp8) |
+| Throughput | **398 / 900 / 2729 output tok/s** at concurrency 2 / 8 / 32 (1024/512, DSpark) as of 12 Oct, and **11.86 ms TPOT at 100k**. The 29 Jul figure was **918 / 2074 / 3793 total tok/s**, measured here at 1024/512 with DSpark. Upstream's `820 / 2356 / 4898` is a different, unpublished workload — [why](#measured-on-bun161-29-jul-2026-dspark-1024512-tp8) |
 | Tool calling / thinking | `--tool-call-parser kimi_k3 --reasoning-parser kimi_k3` |
 | Auth | Bearer API key, auto-generated into `$MODEL_CACHE_DIR/kimik3-api-key` |
 | Clients | **opencode and kimicode both verified end to end** — tool calls, edits, long sessions |
 
-**Why SGLang and not vLLM.** vLLM has K3 support in flight (PR #50000), but its
-day-0 image is `vllm/vllm-openai:kimi-k3` — **NVIDIA only, no ROCm build** — and
-that branch carries private dependencies. SGLang published an AMD image, a
-validated MI355X recipe, and measured numbers. For this hardware it is not close.
+**Why SGLang and not vLLM.** At launch, vLLM's K3 image was
+`vllm/vllm-openai:kimi-k3`, which was NVIDIA only with no ROCm build, and that
+branch carried private dependencies. SGLang published an AMD image, a validated
+MI355X recipe, and measured numbers. *That has changed since:* by 12 Oct vLLM
+lists MI355X as verified for K3 on `vllm/vllm-openai-rocm:nightly-rocm100`, a ROCm
+10 image. It has not been benchmarked here. See
+[the sweep](#what-else-was-looked-at-and-not-taken).
 
 > **On third-party "how to self-host K3" blog posts.** At least one widely-shared
 > article recommends vLLM `v0.7.2` with a repo `moonshotai/Kimi-K3-MXFP4` and
@@ -113,9 +123,11 @@ this a single-node job at all.
 - **Apptainer, not podman**, and it lives **only on compute nodes** — never the
   login nodes. So `pull`, `check`, `parsers`, `download` and `serve` all run
   inside a `salloc`/`sbatch` allocation. (`stop` and `status` work anywhere.)
-- **The MI355X nodes are `bun159`, `bun160`, `bun161`**, in the **`admin_test`**
-  partition (not `gpu_rocm`). Submit with
-  `--partition=admin_test --account=a_rcc --qos=sdf --gres=gpu:mi355x:8` — the
+- **The MI355X nodes are `bun159`, `bun160`, `bun161`**, in the **`gpu_rocm`**
+  partition (7-day max walltime). They lived in `admin_test` until some time
+  between 28 Aug and 12 Oct 2026; `admin_test` now holds no MI355X nodes, so an
+  old command line queues forever rather than failing. Submit with
+  `--partition=gpu_rocm --account=a_rcc --qos=sdf --gres=gpu:mi355x:8` — the
   scheduler lands you on whichever is free; the serve banner prints the actual
   hostname to use for tunnels.
 - **Run from `/scratch`** (`/scratch/user/$USER/...`), not `/home` (tight quota)
@@ -138,7 +150,7 @@ scontrol show node bun161 | grep -iE 'Gres|Partitions|State'
 ## Prerequisites
 
 - **A Bunya account** with the `a_rcc` scheduling account and access to the
-  `admin_test` partition / `sdf` QoS (a special allocation — confirm with
+  `gpu_rocm` partition / `sdf` QoS (a special allocation — confirm with
   `rcc-support@uq.edu.au` if `salloc` is rejected).
 - **~1.7 TB free scratch** on `/scratch/user/$USER`: 1561 GB of weights, ~30 GB
   for the `.sif`, plus the DSpark draft if you enable it. **Check this with
@@ -192,7 +204,7 @@ At minimum set `MODEL_CACHE_DIR` (absolute scratch path, ~1.7 TB free) and
 ### Step 2 — Allocate an MI355X node
 
 ```bash
-salloc --partition=admin_test --account=a_rcc --qos=sdf \
+salloc --partition=gpu_rocm --account=a_rcc --qos=sdf \
        --nodes=1 --gres=gpu:mi355x:8 --ntasks-per-node=1 \
        --cpus-per-task=192 --mem=1800G --time=12:00:00
 ```
@@ -677,6 +689,11 @@ What changed is *where* the line falls. DSpark at **32k** is 17.20 ms TPOT again
 an interpolated ~28 ms baseline — a 1.6× win — so the sign flips somewhere around
 **55–60k**, not below 1024. See
 [the crossover](#the-crossover-is-around-5560k--and-that-is-the-operating-policy).
+
+> **Superseded 12 Oct 2026.** On `v0.5.21-*-20261011` DSpark wins at 100k too
+> (11.86 vs 17.58 ms TPOT), so it is now on by default with no context cap. See
+> [12 Oct 2026: the sweep](#12-oct-2026-the-sweep). The policy below applied to
+> the day-0 image.
 
 ```bash
 # kimik3.env — sessions that stay under ~50k
@@ -1172,6 +1189,183 @@ Watch `rocm-smi` and the log during a start. If HBM fills in bursts while the CP
 idle, the bottleneck is read-side and threads are the right knob. If reads are
 smooth but HBM lags, it is conversion and H2D — more reader threads will not help,
 and `presharded` (which removes the re-quantisation work entirely) is the lever.
+
+---
+
+## 12 Oct 2026: the sweep
+
+Six weeks after the last check, one variable at a time, everything on **bun161**
+inside one allocation. The result is the new default config, and it is faster
+than anything earlier in this README at every shape:
+
+```bash
+# what serve-kimik3.sh now does with an empty kimik3.env
+SGLANG_IMAGE=docker://lmsysorg/sglang-rocm:v0.5.21-rocm724-mi35x-20261011
+PREFILL_ATTENTION_BACKEND=aiter     # decode stays on ATTENTION_BACKEND=triton
+MLA_DECODE_TUNE=1
+SPECULATIVE=dspark                  # draft still pinned at 56ce616a
+```
+
+### The headline
+
+| shape | 27 Jul / 12 Aug (day-0 image) | 12 Oct, DSpark off | **12 Oct, DSpark on** |
+|---|---|---|---|
+| 1024 c=2 TPOT / output tok/s | 5.61 ms / 306 (DSpark) | 16.53 ms / 115 | **4.10 ms / 398** |
+| 1024 c=8 output tok/s | 691 (DSpark) | 326 | **900** |
+| 1024 c=32 output tok/s / TTFT | 1264 / 663 ms (DSpark) | 847 / 1.33 s | **2729 / 1.25 s** |
+| 32k TPOT | 17.20 ms (DSpark) | 16.46 ms | **5.80 ms** (accept 3.29) |
+| 64k TPOT | — | ~17 ms | **9.91 ms** (accept 2.90) |
+| 100k TPOT | 29.83 ms (off) / 52.04 (DSpark) | 17.58 ms | **11.86 ms** (accept 2.76) |
+| 100k TTFT | 15.4 s | 6.24 s | **6.29 s** |
+
+**The DSpark crossover is gone.** On the day-0 image DSpark won below ~55–60k
+and lost 1.7× above it. Now it wins at 100k too, by 1.5×, so the "compact at
+40–50k or turn DSpark off" policy in
+[DSpark collapsed at long context](#dspark-collapsed-at-long-context--because-the-draft-was-a-4k-model)
+is retired. Wherever the new line falls, it is past 100k.
+
+Note what did *not* come back: **acceptance length at long context**. It was 6.90
+at 100k on 12 Aug and is 2.76 now, same draft, same revision. DSpark wins anyway
+because the verify step got far cheaper (#33981, #34537 and the new MLA decode).
+Two likely suspects, neither tested: aiter prefill changing the hidden states the
+draft conditions on, or upstream DSpark scheduling changes since 20 Aug. If
+acceptance recovers, there is more on the table.
+
+Every row passed a quality probe before it was benched: one arithmetic answer,
+plus a needle code recalled from ~30k tokens of filler at temperature 0. Every
+adopted config also passed `toolcheck`.
+
+### Step by step
+
+All runs use TP8, radix cache on, bf16 KV, and DSpark off unless the row says
+otherwise. TPOT is the median; 1024 means 1024 in / 512 out, n=200; 32k and 100k
+are c=1, n=4.
+
+| step | change | 100k TPOT / TTFT | 32k TPOT / TTFT | 1024 c=2 / c=32 TPOT | verdict |
+|---|---|---|---|---|---|
+| 3 | **image → v0.5.21-20261011**, triton both phases | 18.57 ms / 11.06 s | 17.19 / 1.32 s | 16.65 / 32.66 | **adopt** |
+| 4a | + fused KDA decode (#34198) | 18.50 / 11.05 s | 17.13 / 1.31 s | 16.62 / 32.68 | no effect, off |
+| 4b | + `MLA_DECODE_TUNE=1` (#34580) | 17.58 / 11.06 s | 16.49 / 1.31 s | 16.54 / 32.62 | **adopt**, −5% |
+| 5 | + aiter **prefill** (#34438) | 17.58 / **6.24 s** | 16.46 / 0.95 s | 16.53 / 32.62 | **adopt**, −44% TTFT |
+| 5b | + aiter **decode** too | 17.12 / 6.30 s | 16.30 / 1.39 s | 16.79 / 23.38 | **reject**, see below |
+| 6 | DCP8 + fp8 KV, aiter both | 17.30 / 6.26 s | 16.95 / 0.95 s | 17.70 / — | capacity mode, see below |
+| 7 | step 5 + **DSpark** | **11.86 / 6.29 s** | **5.80 / 0.97 s** | **4.10 / 8.20** | **adopt** |
+
+**The image alone is most of it.** v0.5.21 carries aiter `e7d2453f` (25 Sep);
+the 27 Aug image carried `c16d44b9` (18 Aug). Against the day-0 baseline, 100k TPOT
+went 29.83 → 18.57 ms with no flag changed. The first weight load on it took
+1,443 s, but that was cold GPFS, not the image: every reload after it took 160–172 s.
+
+**Fused KDA decode (#34198) is armed but does nothing measurable.** The env var
+was renamed after merge to `SGLANG_ROCM_K3_KDA_FUSED_BACKEND`; `check` now
+reports which name the image reads, and `KDA_FUSED_DECODE=1` sets it. Inside the
+image the fused op reports enabled and available. The likely reason it doesn't
+help is that CUDA graphs already hide the launch overhead it removes. It is off
+by default.
+
+**aiter decode (5b) costs far more than it gives.** With context above 8,192
+tokens, sglang silently multiplies `mem_fraction_static` by 0.85 for the aiter
+decode backend (0.85 → 0.7225). The KV pool fell from 852k tokens to 131k, max
+running requests from 75 to 11, and c=32 throughput halved (847 → 435 output
+tok/s, TTFT 25.8 s), all to save 3% TPOT at 100k.
+`SGLANG_AITER_HONOR_EXPLICIT_MEM_FRACTION=1` turns the scaling off.
+
+**fp8 KV was only tried with DCP**, never with DSpark, because sglang #32938
+reports fp8 KV slowing DSpark down.
+
+### DCP8 + fp8 KV — a capacity mode
+
+Decode context parallelism shards the MLA KV cache across all eight GPUs instead
+of replicating it. On ROCm it needs the aiter decode backend (the Gluon MLA
+kernel) and runs with fp8 KV. The first attempt died at startup with
+`Not enough GPU memory for hybrid … max_mamba_cache_size=-5`, because of the
+0.85 scaling above. This works:
+
+```bash
+SGLANG_AITER_HONOR_EXPLICIT_MEM_FRACTION=1 MEM_FRACTION=0.80 SPECULATIVE= \
+KV_CACHE_DTYPE=fp8_e4m3 \
+EXTRA_ENGINE_ARGS="--prefill-attention-backend aiter --decode-attention-backend aiter --dcp-size 8 --dcp-comm-backend a2a" \
+./serve-kimik3.sh serve --detach
+```
+
+| | step 5 | DCP8 |
+|---|---|---|
+| KV pool | 852k tokens | **6.66M tokens** (7.8×) |
+| max running requests | 75 | 36 |
+| 100k TPOT / TTFT | 17.58 ms / 6.24 s | 17.30 ms / 6.26 s |
+| 1024 c=2 TPOT | 16.53 ms | 17.70 ms (+7%) |
+| 1024 c=32 output tok/s | 847 | 834 |
+
+Quality passed. It is not a speed lever. It is for many concurrent long sessions,
+or for contexts past what 852k tokens of KV can hold across them. It has not
+been tried with DSpark.
+
+### With DSpark on, the request ceiling is 27
+
+The KDA state cache also holds the draft's state. With step 7's config the KV
+pool is 757,568 tokens with 33 GB free, but max running requests is **27**,
+down from 75. That is plenty for one or two agentic users. If you need more,
+`MAMBA_SSM_DTYPE=bfloat16` halves the state size (see
+[K3's KDA state pool](#k3s-kda-state-pool--the-knobs-we-did-not-pass)).
+
+### The 28 Aug 100k crash was an OOM, not firmware
+
+`v0.5.18-rocm724-mi35x-20260827` died on the first 100k prefill. These nodes
+run MEC firmware 0x2c, and InferenceX sets `HSA_NO_SCRATCH_RECLAIM=1` below
+firmware 177, so that was the first suspect. Re-run with it set, the crash
+reproduced, and the real error was in the log all along:
+
+```
+torch.OutOfMemoryError: … Tried to allocate 1.75 GiB … 686 MiB free
+  in aiter _flydsl_v2_stage2_wrapper
+```
+
+It was an aiter FlyDSL MoE allocation on the first 16,384-token prefill chunk.
+v0.5.21 does not crash at the same shape. `HSA_NO_SCRATCH_RECLAIM` is still
+available as a knob, but nothing here needs it. The log is
+`logs/kimik3-server-20260828-crash-v0518-0827-nospec.log` (local; `logs/` is gitignored).
+
+### Do not raise CHUNKED_PREFILL_SIZE past ~32k
+
+sglang #43438 (open) is an int32 overflow in `attn_residual` / `attn_res_hip`
+when a single forward carries **≥ 37,451 tokens**. The default chunk is 16,384.
+Leave it there or below 32k.
+
+### What else was looked at and not taken
+
+- **`amd/Kimi-K3-Quark-MXFP4-AttnFP8`** (1,506 GB): AMD's requant with fp8
+  attention. It is 55 GB smaller but it is a different checkpoint, so it would
+  mean a full download and quality re-verify, with no measured speed claim to
+  justify that. Not tried.
+- **vLLM** now lists MI355X as verified for K3, on
+  `vllm/vllm-openai-rocm:nightly-rocm100`. That is a ROCm 10 userspace image
+  against these nodes' ROCm 7.14 KFD, so `gpucheck` is the first gate. Not
+  benchmarked here. The "NVIDIA only" claim near the top of this README is out
+  of date.
+- **ATOM** (`rocm/atom-dev`) and the **InferenceX** AgentX lanes: references for
+  what AMD tunes for, not drop-in servers for this repo.
+- **Alternative DSpark drafts** (`Inferact/Kimi-K3-DSpark`,
+  `RedHatAI/Kimi-K3-speculator.dspark`): worth an A/B on acceptance at long
+  context, given the drop above. Not tried.
+- **Weights:** unchanged. The only `moonshotai/Kimi-K3` commit since the pin
+  (2 Sep) edits the README eval table.
+
+### Bunya moved the nodes
+
+bun159–161 are now in **`gpu_rocm`** (7-day max walltime), not `admin_test`.
+They moved some time between 28 Aug and 12 Oct. `serve-kimik3.sbatch` now
+requests `gpu_rocm`, and an unmodified older copy will queue forever.
+
+### Not yet done
+
+- **A real streaming kimicode/opencode session** on the step-7 config.
+  `toolcheck` is non-streaming, so it cannot see the streaming tool-call paths
+  that #34881 changed.
+- **`check` fetches `configuration_kimi_k3.py` from HF `main`**, not the pinned
+  weight revision. It is harmless while the weights are unchanged, but it is a
+  pinning gap.
+
+Raw logs are in `logs/step*-*` and `logs/kimik3-server-20261012-*.log` on the node. `logs/` is gitignored because the server logs record the launch command line.
 
 ---
 
@@ -1917,7 +2111,7 @@ All knobs live in `kimik3.env` (copied from `kimik3-env.example`). Anything you
 | `MODEL_ID` | `moonshotai/Kimi-K3` | Model repo (already MXFP4-native) |
 | `MODEL_REVISION` | `9f62e4e9…` | **Pinned by default** to the 27 Jul tip — the state every table here was measured against. A 40-hex value is a snapshot, `main` or empty tracks the branch. Resolves to a snapshot *path*, so SGLang cannot read a different one |
 | `SERVED_MODEL_NAME` | `kimi-k3` | Name clients use in the `model` field |
-| `SGLANG_IMAGE` | `lmsysorg/sglang-rocm:v0.5.17-rocm724-mi35x-20260820` | Mainline nightly, ROCm 7.2.4. Moved here 20 Aug 2026; `rocm720-mi35x-k3-20260727` is the anchor for older numbers ([why](#moving-to-a-mainline-image)) |
+| `SGLANG_IMAGE` | `lmsysorg/sglang-rocm:v0.5.21-rocm724-mi35x-20261011` | Mainline nightly, ROCm 7.2.4, aiter `e7d2453f`. Moved here 12 Oct 2026 ([why](#12-oct-2026-the-sweep)); `rocm720-mi35x-k3-20260727` is the anchor for older numbers |
 | `SIF_PATH` | `$MODEL_CACHE_DIR/kimik3-mi355x.sif` | Where the Apptainer image is stored |
 | `APPTAINER_CACHEDIR` / `_TMPDIR` | *(near `$MODEL_CACHE_DIR`)* | Apptainer cache/scratch, kept off `/home` |
 | `AITER_JIT_DIR` | `$MODEL_CACHE_DIR/aiter-jit` | Writable copy of aiter's `jit/`, bound over the in-image one |
@@ -1930,22 +2124,26 @@ All knobs live in `kimik3.env` (copied from `kimik3-env.example`). Anything you
 | `DP_SIZE` | `1` | dp-attention groups; must divide `TP_SIZE` |
 | `CONTEXT_LEN` | *(empty)* | Empty = model max (1M), as upstream. Set `262144` if KV won't allocate |
 | `MEM_FRACTION` | `0.85` | `--mem-fraction-static` (upstream's validated value) |
-| `ATTENTION_BACKEND` | `triton` | `--attention-backend` |
-| `MLA_DECODE_TUNE` | *(empty)* | `1` exports `SGLANG_MLA_DECODE_TUNE=1` — gfx950 MLA decode geometry, **46–73% ITL at long context** ([#34580](#the-second-lever--34580-retuned-the-gfx950-mla-decode-geometry)). Off by default because it reorders the fp32 accumulation; A/B it |
+| `ATTENTION_BACKEND` | `triton` | `--attention-backend`; applies to any phase not overridden below |
+| `PREFILL_ATTENTION_BACKEND` | `aiter` | `--prefill-attention-backend`. Set empty (`PREFILL_ATTENTION_BACKEND=`) to pass nothing. aiter cuts 100k TTFT 44% ([measured](#step-by-step)) |
+| `DECODE_ATTENTION_BACKEND` | *(empty)* | `--decode-attention-backend`. `aiter` makes sglang scale `MEM_FRACTION` by 0.85 above 8k context, shrinking the KV pool ~6×, unless `SGLANG_AITER_HONOR_EXPLICIT_MEM_FRACTION=1` |
+| `MLA_DECODE_TUNE` | `1` | Exports `SGLANG_MLA_DECODE_TUNE=1`, the gfx950 MLA decode geometry from [#34580](#the-second-lever--34580-retuned-the-gfx950-mla-decode-geometry). Measured −5% TPOT at 100k on v0.5.21. It reorders the fp32 accumulation, which is why it is off upstream. `0` turns it off |
 | `MODEL_DTYPE` | `bfloat16` | `--dtype` (compute dtype; weights are MXFP4) |
 | `CUDA_GRAPH_MAX_BS_DECODE` | `256` | `--cuda-graph-max-bs-decode` (note: not `--cuda-graph-max-bs`) |
 | `DISABLE_RADIX_CACHE` | `0` | Prefix caching ON — our deviation, measured. `1` restores upstream's setting |
 | `KV_CACHE_DTYPE` | *(empty)* | Empty on purpose: upstream's cookbook now sets `fp8_e4m3`, but #32938 reports fp8 KV slowing DSpark |
 | `TOOL_PARSER` | `kimi_k3` | Tool-call parser; `none` to omit |
 | `REASONING_PARSER` | `kimi_k3` | Thinking parser; `none` to omit |
-| `SPECULATIVE` | *(empty)* | `dspark` enables DSpark speculative decoding |
+| `SPECULATIVE` | `dspark` | DSpark speculative decoding. Wins at every context up to 100k on v0.5.21 ([measured](#the-headline)). Set **empty**, not unset, to turn it off |
 | `DSPARK_MODEL` | `RadixArk/Kimi-K3-DSpark` | Draft model for DSpark |
 | `DSPARK_BLOCK_SIZE` | *(empty)* | `--speculative-dspark-block-size`. Empty infers gamma from the draft (7 today); setting it anchors against draft drift |
-| `REPLAYSSM_SPEC` | `0` | `--enable-gdn-replayssm-spec` — **not** the cookbook's non-existent `--enable-linear-replayssm-spec`. Reachable since the 20 Aug image; still off because nobody has benched it ([why](#k3s-kda-state-pool--the-knobs-we-did-not-pass)) |
+| `REPLAYSSM_SPEC` | `0` | `--enable-linear-replayssm-spec`, falling back to the older `--enable-gdn-replayssm-spec` on images that predate the rename (v0.5.21 has the linear name). Not to be confused with `--enable-linear-replayssm` (no `-spec`). Reachable since the 20 Aug image; still off because nobody has benched it ([why](#k3s-kda-state-pool--the-knobs-we-did-not-pass)) |
 | `MAMBA_FULL_MEMORY_RATIO` | *(empty → 0.9)* | KDA state pool vs MLA KV pool. Follows mean request length, not a universal default |
 | `MAMBA_SSM_DTYPE` | *(empty → fp32)* | `bfloat16` halves KDA state memory. Watch accept length |
 | `MAMBA_RADIX_STRATEGY` | *(empty → `extra_buffer`)* | State slots per request: 5 / `extra_buffer_lazy` 4 / `no_buffer` 3 |
 | `MAMBA_SKIP_DECODE_LOCK` | `0` | `SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK=1` — one fewer state slot per request (experimental) |
+| `KDA_FUSED_DECODE` | `0` | `1` sets #34198's fused gfx950 KDA decode env var (whichever name the image reads; `check` reports it). No measurable effect on 12 Oct |
+| `HSA_NO_SCRATCH_RECLAIM` | *(empty)* | Passed through to the container if set. Ruled out as the cause of the 28 Aug crash ([why](#the-28-aug-100k-crash-was-an-oom-not-firmware)) |
 | `ENABLE_AITER` | `1` | Exports the four `SGLANG_*`/`AITER_*` K3 variables |
 | `ROCM_MODE` | `auto` | GPU passthrough: `auto` probes, `rocm` uses `--rocm`, `devices` binds `/dev/kfd` only |
 | `AITER_GPU_ARCHS` | *(empty)* | Sets `GPU_ARCHS`. Ignored at runtime by the aiter build every image ships — prefer `ROCMINFO_SHIM` |
@@ -2127,7 +2325,7 @@ All knobs live in `kimik3.env` (copied from `kimik3-env.example`). Anything you
   the scheduler builds the draft worker *after* the main model has finished
   loading, so this used to appear at the end of a full 1.5 TB load. The script now
   preflights the draft cache and refuses to start without it. Fix with
-  `./serve-kimik3.sh download`, or `unset SPECULATIVE` to serve without it.
+  `./serve-kimik3.sh download`, or `SPECULATIVE= ./serve-kimik3.sh serve` (set but empty) to serve without it.
 - **Crash: "CPU number N is not eligible; choose between [...]"** in
   `set_gpu_proc_affinity`: the image sets `SGLANG_SET_CPU_AFFINITY=1`, but
   SGLang pins to CPUs from the *full* node topology, which fails under a SLURM
@@ -2269,7 +2467,7 @@ All knobs live in `kimik3.env` (copied from `kimik3-env.example`). Anything you
   default to scratch near `MODEL_CACHE_DIR` — make sure that has room and isn't
   on `/home`.
 - **`salloc` rejected**: verify the recipe with the `sinfo`/`sacctmgr` commands
-  above. `admin_test` is restricted; ask `rcc-support@uq.edu.au`.
+  above. The `sdf` QoS is restricted; ask `rcc-support@uq.edu.au`.
 - **opencode doesn't see the model**: it only reads config at startup — restart
   it after `opencode-setup.sh`, and make sure `KIMIK3_API_KEY` is exported in
   that shell (or you used `--embed-key`).

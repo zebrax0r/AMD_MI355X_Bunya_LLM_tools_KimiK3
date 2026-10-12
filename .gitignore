@@ -1,4 +1,5 @@
 kimik3.env
+kimik3.env.*
 logs/
 bench/
 *.bak

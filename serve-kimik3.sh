@@ -104,13 +104,28 @@ SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-kimi-k3}"
 # rocm720-mi35x-k3-20260727 stays the ANCHOR for every number measured before
 # 20 Aug 2026. Set it explicitly, with the old SIF_PATH, to reproduce them — or to
 # roll back, which costs nothing: no weight in the cache changes.
-SGLANG_IMAGE="${SGLANG_IMAGE:-docker://lmsysorg/sglang-rocm:v0.5.17-rocm724-mi35x-20260820}"
+# THE DEFAULT MOVED AGAIN ON 12 OCT 2026, to v0.5.21-*-20261011: 45-57% faster
+# decode than the 27 Aug tag on every shape, and it survives the 100k prefill
+# that killed v0.5.18-*-20260827 with an aiter FlyDSL OOM. See the README,
+# '12 Oct 2026: the sweep'.
+SGLANG_IMAGE="${SGLANG_IMAGE:-docker://lmsysorg/sglang-rocm:v0.5.21-rocm724-mi35x-20261011}"
 PORT="${PORT:-30000}"
 TP_SIZE="${TP_SIZE:-8}"
 DP_SIZE="${DP_SIZE:-1}"
 CONTEXT_LEN="${CONTEXT_LEN:-}"
 MEM_FRACTION="${MEM_FRACTION:-0.85}"
 ATTENTION_BACKEND="${ATTENTION_BACKEND:-triton}"
+# Split prefill/decode backends, overriding ATTENTION_BACKEND for one phase each.
+# Empty = pass nothing for that phase. Measured 12 Oct 2026 on v0.5.21-20261011:
+# aiter PREFILL (#34438's ASM FP8 kernel with chunked KV) cuts 100k TTFT 44%
+# (11.1 -> 6.2 s) with TPOT and quality unchanged, so it is the default. aiter
+# DECODE is NOT: with context > 8192 sglang silently scales mem_fraction_static
+# by 0.85 for it, the KV pool fell from 852k to 131k tokens, and c=32 TTFT went
+# to 25.8 s — for 3% TPOT at 100k. (SGLANG_AITER_HONOR_EXPLICIT_MEM_FRACTION=1
+# disables that scaling; the DCP8 capacity mode in the README needs it.)
+# PREFILL_ATTENTION_BACKEND= (set, empty) restores the single-backend launch.
+PREFILL_ATTENTION_BACKEND="${PREFILL_ATTENTION_BACKEND-aiter}"
+DECODE_ATTENTION_BACKEND="${DECODE_ATTENTION_BACKEND-}"
 # sglang #34580, merged 18 Aug 2026, mainline images only. K3's MLA decode ran
 # stage-1 with constants tuned on CDNA3: BLOCK_N 16 where gfx950's MFMA tiles want
 # 32, a KV split budget treated as a rounding target so a split could overshoot by
@@ -122,18 +137,22 @@ ATTENTION_BACKEND="${ATTENTION_BACKEND:-triton}"
 # the path the patch touches. It is the first upstream change aimed squarely at the
 # number this deployment is stuck on: decode cost at 100k.
 #
-# OFF BY DEFAULT UPSTREAM, and off here, for one reason worth repeating: it
-# REORDERS THE FP32 ACCUMULATION, so output is not bit-identical to the untuned
-# path. Treat it as an A/B with a benchmark, not as a setting. Restart-level —
-# it is read at launch, not per request.
-MLA_DECODE_TUNE="${MLA_DECODE_TUNE:-}"
+# OFF BY DEFAULT UPSTREAM, because it REORDERS THE FP32 ACCUMULATION, so output
+# is not bit-identical to the untuned path. ON BY DEFAULT HERE since 12 Oct 2026,
+# after the A/B: -5.3% TPOT at 100k, -4.1% at 32k, flat at 1024, and the quality
+# probe and toolcheck both pass. Set 0 to compare. Restart-level — it is read at
+# launch, not per request.
+MLA_DECODE_TUNE="${MLA_DECODE_TUNE:-1}"
 MODEL_DTYPE="${MODEL_DTYPE:-bfloat16}"
 CUDA_GRAPH_MAX_BS_DECODE="${CUDA_GRAPH_MAX_BS_DECODE:-256}"
 DISABLE_RADIX_CACHE="${DISABLE_RADIX_CACHE:-0}"
 KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-}"
 TOOL_PARSER="${TOOL_PARSER:-kimi_k3}"
 REASONING_PARSER="${REASONING_PARSER:-kimi_k3}"
-SPECULATIVE="${SPECULATIVE:-}"
+# DSpark ON by default since 12 Oct 2026: on v0.5.21 it wins at every context
+# measured, 1024 through 100k (README, '12 Oct 2026: the sweep'). No colon in the
+# expansion, so SPECULATIVE= (set but empty) still means off — 'unset' does not.
+SPECULATIVE="${SPECULATIVE-dspark}"
 DSPARK_MODEL="${DSPARK_MODEL:-RadixArk/Kimi-K3-DSpark}"
 # Pinned, not tracking main: the draft repo is rewritten under you — three times
 # in the four days to 1 Aug 2026, twice breaking the launch outright.
@@ -157,6 +176,8 @@ MAMBA_FULL_MEMORY_RATIO="${MAMBA_FULL_MEMORY_RATIO:-}"
 MAMBA_SSM_DTYPE="${MAMBA_SSM_DTYPE:-}"
 MAMBA_RADIX_STRATEGY="${MAMBA_RADIX_STRATEGY:-}"
 MAMBA_SKIP_DECODE_LOCK="${MAMBA_SKIP_DECODE_LOCK:-0}"
+HSA_NO_SCRATCH_RECLAIM="${HSA_NO_SCRATCH_RECLAIM:-}"
+KDA_FUSED_DECODE="${KDA_FUSED_DECODE:-0}"
 ENABLE_AITER="${ENABLE_AITER:-1}"
 FLYDSL_FORCE="${FLYDSL_FORCE:-1}"
 ROCM_MODE="${ROCM_MODE:-auto}"
@@ -1167,6 +1188,24 @@ image_levers() {
                && grep -qs "tools_idx" "$root/srt/parser/reasoning_parser.py"; then
                 echo k3_toolcall_fixes
             fi
+            # #34198 (2 Sep 2026): fused gfx950 KDA decode (f_b + conv + recurrence +
+            # gated RMSNorm), opt-in. The env var was renamed after the merge, so
+            # report the name THIS image reads — passing the other one is inert.
+            k3="$root/srt/models/kimi_k3.py"
+            if grep -qs SGLANG_ROCM_K3_KDA_FUSED_BACKEND "$k3"; then
+                echo kda_fused=SGLANG_ROCM_K3_KDA_FUSED_BACKEND
+            elif grep -qs SGLANG_K3_KDA_FUSED_BACKEND "$k3"; then
+                echo kda_fused=SGLANG_K3_KDA_FUSED_BACKEND
+            fi
+            ab="$root/srt/layers/attention/aiter_backend.py"
+            # #34438 (4 Oct 2026): aiter ASM persistent FP8 prefill for K3 (12->16
+            # head pad) with chunked KV, which lowers peak HBM on long prefill.
+            grep -qs chunked_prefix_ps_metadatas "$ab" && echo aiter_ps_prefill
+            # #34537 (8 Oct 2026): aiter ASM kernel for K3 DSpark target verify.
+            grep -qs _MLA_ASM_CPRR_NATIVE_QLENS "$ab" && echo aiter_asm_verify
+            # Native FP8 prefill on the TRITON backend, default ON where present.
+            # Changes numerics on the path this repo runs by default.
+            grep -qs SGLANG_TRITON_FP8_PREFILL_ATTN "$root/srt/environ.py" && echo triton_fp8_prefill
             # aiter is pinned inside the image, independently of the sglang commit,
             # and it is what the four SGLANG_/AITER_ env vars select. AITER_COMMIT
             # is a real ENV in the published images; the git checkout keeps its
@@ -1181,6 +1220,7 @@ image_levers() {
 }
 lever_has()   { grep -qxF "$1" <<<"$(image_levers)"; }
 lever_aiter() { sed -n 's/^aiter=//p' <<<"$(image_levers)" | head -1; }
+lever_kda_fused_var() { sed -n 's/^kda_fused=//p' <<<"$(image_levers)" | head -1; }
 
 if [[ "$MODE" == "check" ]]; then
     log "Image:   $SIF_PATH"
@@ -1277,6 +1317,24 @@ PY
             warn "  MISS #34881 — tool calls emitted before the reasoning marker are eaten as
        reasoning, and a truncated tool section at stream end vanishes silently."
         fi
+        kda_var="$(lever_kda_fused_var)"
+        if [[ -n "$kda_var" ]]; then
+            log "  OK   #34198 fused KDA decode — opt-in via KDA_FUSED_DECODE=1 (image reads $kda_var)."
+        else
+            warn "  MISS #34198 fused gfx950 KDA decode — KDA_FUSED_DECODE=1 would be inert."
+        fi
+        if lever_has aiter_ps_prefill; then
+            log "  OK   #34438 aiter ASM FP8 prefill + chunked KV (--prefill-attention-backend aiter)."
+        else
+            warn "  MISS #34438 aiter ASM PS prefill for K3."
+        fi
+        if lever_has aiter_asm_verify; then
+            log "  OK   #34537 aiter ASM DSpark target verify."
+        else
+            warn "  MISS #34537 aiter ASM DSpark target verify."
+        fi
+        lever_has triton_fp8_prefill \
+            && log "  NOTE SGLANG_TRITON_FP8_PREFILL_ATTN present (default ON) — triton prefill is FP8 here."
         aiter_sha="$(lever_aiter)"
         if [[ -n "$aiter_sha" ]]; then
             log "  aiter pin: $aiter_sha  (every published image through 20 Aug 2026 is d9e5ef7c,
@@ -1377,7 +1435,7 @@ if [[ "$SPECULATIVE" == "dspark" && "$MODE" == "serve" ]]; then
         die "SPECULATIVE=dspark but the draft model '$DSPARK_MODEL' is not cached in $MODEL_CACHE_DIR.
   The draft loads only after the main model finishes, so starting now would waste that whole load.
   Fetch it first:   ./serve-kimik3.sh download
-  Or serve without speculative decoding:   unset SPECULATIVE"
+  Or serve without speculative decoding:   SPECULATIVE= ./serve-kimik3.sh serve"
     fi
 
     # Resolve the snapshot the SAME WAY the hub does — refs/<branch> -> sha —
@@ -1423,7 +1481,7 @@ if [[ "$SPECULATIVE" == "dspark" && "$MODE" == "serve" ]]; then
     if [[ ! -e "$draft_snapshot/config.json" ]]; then
         die "The draft snapshot $draft_snapshot has no config.json (or it is a dangling symlink).
   The download is incomplete. Re-fetch:   rm -rf $draft_dir && ./serve-kimik3.sh download
-  Or serve without speculative decoding:  unset SPECULATIVE"
+  Or serve without speculative decoding:  SPECULATIVE= ./serve-kimik3.sh serve"
     fi
     # Three fields out of one parse: model_type is the thing SGLang dies without,
     # and the rope type plus the draft's own trained context are what decide
@@ -1451,7 +1509,7 @@ print(rp.get('original_max_position_embeddings') or '')
 
   Re-fetch it:                 rm -rf $draft_dir && ./serve-kimik3.sh download
   Pin the current default:     DSPARK_REVISION=56ce616ad7486f0e96cbb51ef23ed5a1bce1d92d ./serve-kimik3.sh download
-  Or serve without it:         unset SPECULATIVE"
+  Or serve without it:         SPECULATIVE= ./serve-kimik3.sh serve"
     fi
 
     # Hand SGLang the resolved PATH, never the repo id. The repo id makes it
@@ -1797,24 +1855,28 @@ if [[ "$SPECULATIVE" == "dspark" ]]; then
     [[ -n "$DSPARK_BLOCK_SIZE" ]] \
         && spec_flags+=(--speculative-dspark-block-size "$DSPARK_BLOCK_SIZE")
 
-    # NOTE THE FLAG NAME. Upstream's own K3 cookbook prescribes
-    # --enable-linear-replayssm-spec for every DSPARK recipe; that flag DOES NOT
-    # EXIST (no such attribute anywhere in the tree, checked 2 Aug 2026). The
-    # real one is --enable-gdn-replayssm-spec.
+    # NOTE THE FLAG NAME. On 2 Aug 2026 the cookbook's --enable-linear-replayssm-spec
+    # did not exist and the real flag was --enable-gdn-replayssm-spec. Upstream has
+    # since renamed it: v0.5.21 (checked 12 Oct 2026) has only
+    # --enable-linear-replayssm-spec ("Enable the ReplaySSM spec-verify ... GDN or
+    # KDA"). So ask the image which spelling it has, newest first.
     #
-    # Do not "fix" this to the similarly named --enable-linear-replayssm. That is
+    # Do not confuse either with --enable-linear-replayssm (no -spec). That is
     # a different, mutually exclusive flag whose own help says KDA decode is
     # SLOWER than the packed baseline — so the plausible-looking name is a silent
     # regression rather than an error.
     if [[ "$REPLAYSSM_SPEC" == "1" ]]; then
-        if grep -q -- '--enable-gdn-replayssm-spec' <<<"$(image_help)"; then
+        if grep -q -- '--enable-linear-replayssm-spec' <<<"$(image_help)"; then
+            spec_flags+=(--enable-linear-replayssm-spec)
+            log "ReplaySSM spec-verify ENABLED (--enable-linear-replayssm-spec)."
+        elif grep -q -- '--enable-gdn-replayssm-spec' <<<"$(image_help)"; then
             spec_flags+=(--enable-gdn-replayssm-spec)
             log "ReplaySSM spec-verify ENABLED (--enable-gdn-replayssm-spec)."
         elif [[ -z "$(image_help)" ]]; then
             warn "Could not read --help from the image; passing --enable-gdn-replayssm-spec unverified."
             spec_flags+=(--enable-gdn-replayssm-spec)
         else
-            die "This image has no --enable-gdn-replayssm-spec.
+            die "This image has neither --enable-linear-replayssm-spec nor --enable-gdn-replayssm-spec.
   Coexistence with the extra_buffer radix strategy landed upstream on 31 Jul 2026
   (sglang #32692), after the retired rocm720-mi35x-k3-20260727 build. The default
   image carries it, so this means SGLANG_IMAGE points at a pre-Aug build — move
@@ -1850,7 +1912,7 @@ if [[ "$SPECULATIVE" == "dspark" ]]; then
         warn "  The default image (v0.5.17-rocm724-mi35x-*) already carries the fix"
         warn "  (sglang #32621 + #32641), so seeing this means SGLANG_IMAGE has been"
         warn "  pointed BACKWARDS — at rocm720-mi35x-k3-20260727 or another pre-Aug"
-        warn "  build. Move forward, or unset SPECULATIVE, which is zero-risk."
+        warn "  build. Move forward, or set SPECULATIVE= (empty), which is zero-risk."
     fi
 
     # The second landmine, and the one a real client is far likelier to step on:
@@ -1963,6 +2025,26 @@ elif [[ -n "$MLA_DECODE_TUNE" && "$MLA_DECODE_TUNE" != "0" ]]; then
     warn "MLA_DECODE_TUNE=$MLA_DECODE_TUNE is not 1 or 0 — treating it as off."
 fi
 
+# sglang #34198's fused gfx950 KDA decode: f_b + conv1d + recurrent update +
+# gated RMSNorm in one FlyDSL dispatch, on 69 of K3's 93 layers. Opt-in upstream,
+# fail-closed (any shape it does not cover takes the unfused path). The env var
+# was SGLANG_K3_KDA_FUSED_BACKEND at merge and is SGLANG_ROCM_K3_KDA_FUSED_BACKEND
+# on main, so pass the name the image's kimi_k3.py actually reads.
+if [[ "$KDA_FUSED_DECODE" == "1" ]]; then
+    kda_var="$(lever_kda_fused_var)"
+    if [[ -n "$kda_var" ]]; then
+        aiter_env+=(--env "$kda_var=aiter")
+        log "KDA_FUSED_DECODE=1 — $kda_var=aiter (sglang #34198, fused gfx950 KDA decode)."
+    elif lever_has probed; then
+        warn "KDA_FUSED_DECODE=1 but this image has no fused KDA decode (sglang #34198,"
+        warn "  merged 2 Sep 2026). INERT here — use a 20260904-or-later image."
+    else
+        aiter_env+=(--env SGLANG_ROCM_K3_KDA_FUSED_BACKEND=aiter
+                   --env SGLANG_K3_KDA_FUSED_BACKEND=aiter)
+        warn "KDA_FUSED_DECODE=1 and the image could not be probed — passing both names."
+    fi
+fi
+
 # Skips the decode-time mamba lock, freeing one resident KDA state slot per
 # request (extra_buffer 5->4, extra_buffer_lazy 4->3; no_buffer is unaffected).
 # Upstream labels it experimental and ships it off. An env var, not a flag, so it
@@ -1971,6 +2053,16 @@ fi
 if [[ "$MAMBA_SKIP_DECODE_LOCK" == "1" ]]; then
     aiter_env+=(--env SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK=1)
     log "SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK=1 — one fewer KDA state slot per request (experimental)."
+fi
+
+# ROCr's scratch-memory reclaim. On MEC firmware below 177 it races RCCL's memory
+# reclaim; these nodes report 0x2c (44) as of 12 Oct 2026. SemiAnalysis's
+# InferenceX K3/MI355X lane sets it for exactly that reason. Suspect for the
+# 28 Aug long-context crash ("HSA_STATUS_ERROR_OUT_OF_RESOURCES ... Available
+# Free mem : 0 MB" on the first 16k prefill chunk); unset until measured here.
+if [[ -n "$HSA_NO_SCRATCH_RECLAIM" ]]; then
+    aiter_env+=(--env "HSA_NO_SCRATCH_RECLAIM=$HSA_NO_SCRATCH_RECLAIM")
+    log "HSA_NO_SCRATCH_RECLAIM=$HSA_NO_SCRATCH_RECLAIM (MEC firmware: $(cat /sys/class/drm/card*/device/fw_version/mec_fw_version 2>/dev/null | sort -u | tr '\n' ' '))."
 fi
 
 # Forward the SLURM GPU-visibility vars into the container (Apptainer inherits
@@ -2066,6 +2158,8 @@ cmd=("${launcher[@]}"
      --tp "$TP_SIZE"
      ${dp_flag[@]+"${dp_flag[@]}"}
      --attention-backend "$ATTENTION_BACKEND"
+     ${PREFILL_ATTENTION_BACKEND:+--prefill-attention-backend "$PREFILL_ATTENTION_BACKEND"}
+     ${DECODE_ATTENTION_BACKEND:+--decode-attention-backend "$DECODE_ATTENTION_BACKEND"}
      --dtype "$MODEL_DTYPE"
      --mem-fraction-static "$MEM_FRACTION"
      --cuda-graph-max-bs-decode "$CUDA_GRAPH_MAX_BS_DECODE"
@@ -2297,7 +2391,7 @@ while true; do
      Unknown architecture?   ./serve-kimik3.sh check
      Unknown parser name?    ./serve-kimik3.sh parsers
      KV cache OOM?           set CONTEXT_LEN=262144 in kimik3.env and retry
-     DSpark TypeError?       unset SPECULATIVE (sglang issue #32569)
+     DSpark TypeError?       set SPECULATIVE= empty (sglang issue #32569)
      Permission denied on
      /tmp/aiter_configs/*?   another user on this node owns that directory;
                              set AITER_CONFIG_DIR in kimik3.env (see README)"
@@ -2318,7 +2412,7 @@ cat <<EOF
   $SERVED_MODEL_NAME is up and serving on Bunya's MI355X.
 
   Model:       $MODEL_ID
-  Layout:      TP=$TP_SIZE, ctx=${CONTEXT_LEN:-model max (1M)}, spec=${SPECULATIVE:-off}${MLA_DECODE_TUNE:+, mla-decode-tune=$MLA_DECODE_TUNE}
+  Layout:      TP=$TP_SIZE, ctx=${CONTEXT_LEN:-model max (1M)}, spec=${SPECULATIVE:-off}, attn=${PREFILL_ATTENTION_BACKEND:-$ATTENTION_BACKEND}/${DECODE_ATTENTION_BACKEND:-$ATTENTION_BACKEND}${MLA_DECODE_TUNE:+, mla-decode-tune=$MLA_DECODE_TUNE}${HSA_NO_SCRATCH_RECLAIM:+, hsa-no-scratch-reclaim=$HSA_NO_SCRATCH_RECLAIM}, kda-fused=$KDA_FUSED_DECODE
   Node:        $NODE_HOST     (job $JOBID)
   Endpoint:    http://$NODE_HOST:$PORT/v1   (OpenAI-compatible)
   Model name:  $SERVED_MODEL_NAME

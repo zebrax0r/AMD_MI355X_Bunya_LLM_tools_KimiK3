@@ -56,7 +56,14 @@ export SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-kimi-k3}"
 
 # ── Container image ─────────────────────────────────────────────────────────
 
-# THE DEFAULT MOVED ON 20 AUG 2026, from the day-0 branch image
+# THE DEFAULT MOVED AGAIN ON 12 OCT 2026, to v0.5.21-rocm724-mi35x-20261011
+# (aiter e7d2453f, 25 Sep). Same knobs, 45-57% faster decode than the 27 Aug tag
+# at every shape (100k TPOT 29.8 -> 18.6 ms), and it survives the 100k prefill
+# that v0.5.18-*-20260827 died on (an aiter FlyDSL MoE OOM, not firmware). The
+# 27 Aug tag stays the anchor for numbers dated 13 Aug - 11 Oct. See the README,
+# '12 Oct 2026: the sweep'.
+#
+# IT MOVED BEFORE THAT ON 20 AUG 2026, from the day-0 branch image
 # (rocm720-mi35x-k3-20260727) to mainline. That branch — PR #32541 — merged on
 # 4 Aug and was deleted; its image stream ended at rocm720-mi35x-k3-20260803 and
 # has not been rebuilt since. Every number in the README dated before 20 Aug 2026
@@ -101,7 +108,7 @@ export SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-kimi-k3}"
 # node's, but the further apart they drift the more likely GPU passthrough
 # breaks — see ROCM_MODE below and './serve-kimik3.sh gpucheck'. After changing
 # this value the aiter JIT dir re-seeds itself automatically.
-export SGLANG_IMAGE="${SGLANG_IMAGE:-docker://lmsysorg/sglang-rocm:v0.5.17-rocm724-mi35x-20260820}"
+export SGLANG_IMAGE="${SGLANG_IMAGE:-docker://lmsysorg/sglang-rocm:v0.5.21-rocm724-mi35x-20261011}"
 
 # Path to the Apptainer image FILE (built with './serve-kimik3.sh pull').
 # Must be a .sif file, not a directory. Defaults to
@@ -229,6 +236,22 @@ export MEM_FRACTION="${MEM_FRACTION:-0.85}"
 # KDA + MLA attention on gfx950.
 export ATTENTION_BACKEND="${ATTENTION_BACKEND:-triton}"
 
+# Per-phase overrides of ATTENTION_BACKEND (--prefill-attention-backend /
+# --decode-attention-backend). Empty = pass nothing for that phase. Note the
+# expansion has no colon: PREFILL_ATTENTION_BACKEND= (set, empty) turns it off.
+#
+# aiter PREFILL is the default since 12 Oct 2026 — #34438's ASM FP8 prefill with
+# chunked KV. Measured on bun161: 100k TTFT 11.1 -> 6.2 s, 32k 1.3 -> 0.95 s,
+# TPOT unchanged, quality probe and toolcheck pass.
+#
+# aiter DECODE stays off. It is 3% faster at 100k, but with context > 8192 sglang
+# scales mem_fraction_static by 0.85 behind your back (0.85 -> 0.72), and the KV
+# pool fell from 852k tokens to 131k, max running requests from 75 to 11, c=32
+# TTFT to 25.8 s. SGLANG_AITER_HONOR_EXPLICIT_MEM_FRACTION=1 stops the scaling —
+# the DCP8 capacity mode in the README needs aiter decode and that variable.
+export PREFILL_ATTENTION_BACKEND="${PREFILL_ATTENTION_BACKEND-aiter}"
+export DECODE_ATTENTION_BACKEND="${DECODE_ATTENTION_BACKEND-}"
+
 # sglang #34580, merged 18 Aug 2026 — the single biggest lever aimed at this
 # deployment's actual weak spot, which is decode cost at long context.
 #
@@ -241,15 +264,19 @@ export ATTENTION_BACKEND="${ATTENTION_BACKEND:-triton}"
 # It applies here on every count — the kernel wants HIP, MLA, head_dim 576 and
 # gfx95, and K3 on ATTENTION_BACKEND=triton is all four.
 #
-# OFF BY DEFAULT, upstream and here, for one reason: it REORDERS THE FP32
-# ACCUMULATION, so output is not bit-identical to the untuned path. That is why
-# it is an env var and not the default. Treat it as an A/B you run, not a setting
-# you adopt: bench 1024, 32k and 100k with it off, restart, bench them again with
-# it on. It is read at LAUNCH, so changing it needs a restart, not a new request.
+# OFF BY DEFAULT UPSTREAM, for one reason: it REORDERS THE FP32 ACCUMULATION, so
+# output is not bit-identical to the untuned path.
+#
+# ON BY DEFAULT HERE SINCE 12 OCT 2026, after running exactly that A/B on
+# v0.5.21-20261011 (triton both phases, no DSpark): 100k TPOT 18.57 -> 17.58 ms
+# (-5.3%), 32k 17.19 -> 16.49 (-4.1%), 1024 flat; quality probe (arithmetic +
+# a needle at ~30k tokens) and toolcheck pass. Smaller than AMD's 46-73% because
+# the new image's baseline already moved most of the way. Set 0 to compare. It
+# is read at LAUNCH, so changing it needs a restart, not a new request.
 #
 # Needs a mainline image dated 20260820 or later; './serve-kimik3.sh check'
 # reports whether the image has it, and serve warns if you set it where it is inert.
-export MLA_DECODE_TUNE="${MLA_DECODE_TUNE:-}"
+export MLA_DECODE_TUNE="${MLA_DECODE_TUNE:-1}"
 
 # --dtype. The weights are MXFP4; this is the compute/activation dtype.
 export MODEL_DTYPE="${MODEL_DTYPE:-bfloat16}"
@@ -280,9 +307,10 @@ export DISABLE_RADIX_CACHE="${DISABLE_RADIX_CACHE:-0}"
 
 # KV cache dtype. Empty by default — a DELIBERATE divergence, not an oversight.
 # Upstream's own K3 cookbook now sets --kv-cache-dtype fp8_e4m3 for MI355X, but
-# sglang #32938 reports fp8 KV making DSpark SLOWER, and DSpark is the thing this
-# deployment leans on below the crossover. Worth one bench at 100k with
-# SPECULATIVE empty, where the trade is memory for bandwidth and nothing else.
+# sglang #32938 reports fp8 KV making DSpark SLOWER, and DSpark is on by default.
+# Measured 12 Oct 2026 WITHOUT DSpark, paired with DCP8 (README, "DCP8 + fp8 KV
+# — a capacity mode"): 7.8x the KV pool at about the same speed, but it needs
+# aiter decode and SGLANG_AITER_HONOR_EXPLICIT_MEM_FRACTION=1 with MEM_FRACTION=0.80.
 # Set it only if you have measured it on your own shape.
 export KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-}"
 
@@ -297,7 +325,25 @@ export REASONING_PARSER="${REASONING_PARSER:-kimi_k3}"
 
 # ── Speculative decoding (DSpark) ───────────────────────────────────────────
 
-# Empty (default) = off.  "dspark" = enable DSpark speculative decoding.
+# "dspark" (default since 12 Oct 2026) = DSpark speculative decoding on.
+# Empty = off. Set it EMPTY, not unset: the expansion below has no colon, so
+# 'SPECULATIVE= ./serve-kimik3.sh serve' is off and 'unset' falls back to on.
+#
+# 12 OCT 2026: THE CROSSOVER IS GONE. On v0.5.21-20261011 with aiter prefill and
+# MLA_DECODE_TUNE=1, bun161, DSpark on vs off:
+#
+#     1024 c=2   TPOT  4.10 ms vs 16.53   398 vs 115 tok/s   accept 6.61
+#     1024 c=32        8.20 ms vs 32.62  2729 vs 847 tok/s   accept 7.12
+#      32k       TPOT  5.80 ms vs 16.46                      accept 3.29
+#      64k             9.91 ms vs ~17                        accept 2.90
+#     100k            11.86 ms vs 17.58                      accept 2.76
+#
+# A win everywhere, 1.5x at 100k. Two costs: the KDA state cache holds the
+# draft's state too, so max running requests drops 75 -> 27 (MAMBA_SSM_DTYPE
+# below raises it); and accept length at long context is well below the 6.90 the
+# 27 Jul image showed at 100k — the step got cheap enough to win anyway, but it
+# is the next thing to chase. Everything from here down to the next export is
+# the history of how it got here.
 #
 # Upstream's MI355 TP8 numbers make this very attractive for interactive use:
 #   concurrency 2:  median TPOT 20.86 ms -> 8.94 ms, 820 -> 1659 tok/s
@@ -337,8 +383,10 @@ export REASONING_PARSER="${REASONING_PARSER:-kimi_k3}"
 # OR off. The 55-60k crossover therefore has to be RE-MEASURED, not assumed —
 # it can only have moved up. See the README, 'DSpark collapsed at long context'.
 #
-# Still default OFF, for the ordinary reason: get baseline serving working, then
-# add one thing. The sharper reason below is now historical.
+# (Re-measured 12 Oct — see the top of this section. It moved past 100k.)
+#
+# It was default OFF until then, for the ordinary reason: get baseline serving
+# working, then add one thing. The sharper reason below is now historical.
 #
 # THE OLD DAY-0 IMAGE HAD A LIVE SAMPLING BUG (sglang #32569). DSpark's verify step
 # calls top_k_renorm_prob / top_p_renorm_prob; on ROCm those are bound by an
@@ -365,7 +413,7 @@ export REASONING_PARSER="${REASONING_PARSER:-kimi_k3}"
 # the image for the Triton aliases AND for that binding and warns at launch, so
 # you cannot meet either unknowingly; if you see the warning, you have gone
 # backwards on purpose. See the README, 'The sampling landmine'.
-export SPECULATIVE="${SPECULATIVE:-}"
+export SPECULATIVE="${SPECULATIVE-dspark}"
 export DSPARK_MODEL="${DSPARK_MODEL:-RadixArk/Kimi-K3-DSpark}"
 
 # gamma — how many draft tokens DSpark proposes per step. Empty (default) lets
@@ -437,6 +485,18 @@ export MAMBA_RADIX_STRATEGY="${MAMBA_RADIX_STRATEGY:-}"
 # It is an env var, not a flag, so it cannot be capability-probed: an image that
 # does not know it ignores it silently.
 export MAMBA_SKIP_DECODE_LOCK="${MAMBA_SKIP_DECODE_LOCK:-0}"
+
+# HSA_NO_SCRATCH_RECLAIM=1 — turns off ROCr's scratch-memory reclaim. MEC firmware
+# below 177 races RCCL's reclaim under memory pressure; Bunya's MI355X nodes report
+# 0x2c (44). InferenceX's K3/MI355X lane sets it. Unset by default until it is
+# measured here — the 28 Aug long-context OOM is the run that would show it.
+export HSA_NO_SCRATCH_RECLAIM="${HSA_NO_SCRATCH_RECLAIM:-}"
+
+# KDA_FUSED_DECODE=1 — sglang #34198's fused gfx950 KDA decode (f_b + conv1d +
+# recurrence + gated RMSNorm in one dispatch, 69 of 93 layers). Opt-in upstream
+# and fail-closed. Needs a 20260904-or-later image; './serve-kimik3.sh check'
+# reports whether the image has it and which env var name it reads.
+export KDA_FUSED_DECODE="${KDA_FUSED_DECODE:-0}"
 
 # ── ROCm / AMD kernel toggles ───────────────────────────────────────────────
 
