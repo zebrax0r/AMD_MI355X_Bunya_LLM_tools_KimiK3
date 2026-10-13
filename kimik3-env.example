@@ -240,16 +240,22 @@ export ATTENTION_BACKEND="${ATTENTION_BACKEND:-triton}"
 # --decode-attention-backend). Empty = pass nothing for that phase. Note the
 # expansion has no colon: PREFILL_ATTENTION_BACKEND= (set, empty) turns it off.
 #
-# aiter PREFILL is the default since 12 Oct 2026 — #34438's ASM FP8 prefill with
-# chunked KV. Measured on bun161: 100k TTFT 11.1 -> 6.2 s, 32k 1.3 -> 0.95 s,
-# TPOT unchanged, quality probe and toolcheck pass.
+# aiter PREFILL IS UNSAFE — leave PREFILL_ATTENTION_BACKEND empty. #34438's ASM
+# FP8 prefill cut 100k TTFT 11.1 -> 6.2 s on cold prompts and was the default for
+# one day. Then a real kimicode session, 13 Oct 2026, first got [PAD][PAD]... for
+# every reply, and after a restart killed the server with "Memory access fault ...
+# Write access to a read-only page" on four GPUs. Reproduced with
+# ./agentstress.py: the fault is in _mla_fp8_prefill_attn_ps
+# (_forward_extend_prefix_chunk), the path taken only when a LONG PREFIX IS
+# CACHED — ~145k here. Random-prompt benches have no prefix, so they never ran
+# it. Triton prefill ran the same conversation clean to 240k.
 #
 # aiter DECODE stays off. It is 3% faster at 100k, but with context > 8192 sglang
 # scales mem_fraction_static by 0.85 behind your back (0.85 -> 0.72), and the KV
 # pool fell from 852k tokens to 131k, max running requests from 75 to 11, c=32
 # TTFT to 25.8 s. SGLANG_AITER_HONOR_EXPLICIT_MEM_FRACTION=1 stops the scaling —
 # the DCP8 capacity mode in the README needs aiter decode and that variable.
-export PREFILL_ATTENTION_BACKEND="${PREFILL_ATTENTION_BACKEND-aiter}"
+export PREFILL_ATTENTION_BACKEND="${PREFILL_ATTENTION_BACKEND-}"
 export DECODE_ATTENTION_BACKEND="${DECODE_ATTENTION_BACKEND-}"
 
 # sglang #34580, merged 18 Aug 2026 — the single biggest lever aimed at this
@@ -307,7 +313,7 @@ export DISABLE_RADIX_CACHE="${DISABLE_RADIX_CACHE:-0}"
 
 # KV cache dtype. Empty by default — a DELIBERATE divergence, not an oversight.
 # Upstream's own K3 cookbook now sets --kv-cache-dtype fp8_e4m3 for MI355X, but
-# sglang #32938 reports fp8 KV making DSpark SLOWER, and DSpark is on by default.
+# sglang #32938 reports fp8 KV making DSpark SLOWER.
 # Measured 12 Oct 2026 WITHOUT DSpark, paired with DCP8 (README, "DCP8 + fp8 KV
 # — a capacity mode"): 7.8x the KV pool at about the same speed, but it needs
 # aiter decode and SGLANG_AITER_HONOR_EXPLICIT_MEM_FRACTION=1 with MEM_FRACTION=0.80.
@@ -325,25 +331,25 @@ export REASONING_PARSER="${REASONING_PARSER:-kimi_k3}"
 
 # ── Speculative decoding (DSpark) ───────────────────────────────────────────
 
-# "dspark" (default since 12 Oct 2026) = DSpark speculative decoding on.
-# Empty = off. Set it EMPTY, not unset: the expansion below has no colon, so
-# 'SPECULATIVE= ./serve-kimik3.sh serve' is off and 'unset' falls back to on.
+# Empty (default) = off.  "dspark" = DSpark speculative decoding on. The
+# expansion has no colon, so 'SPECULATIVE= ./serve-kimik3.sh serve' is off too.
 #
-# 12 OCT 2026: THE CROSSOVER IS GONE. On v0.5.21-20261011 with aiter prefill and
-# MLA_DECODE_TUNE=1, bun161, DSpark on vs off:
+# 13 OCT 2026, MEASURED ON REAL AGENTIC TEXT (./agentstress.py: one growing
+# conversation, temperature 0.6, v0.5.21, triton prefill), decode tok/s:
 #
-#     1024 c=2   TPOT  4.10 ms vs 16.53   398 vs 115 tok/s   accept 6.61
-#     1024 c=32        8.20 ms vs 32.62  2729 vs 847 tok/s   accept 7.12
-#      32k       TPOT  5.80 ms vs 16.46                      accept 3.29
-#      64k             9.91 ms vs ~17                        accept 2.90
-#     100k            11.86 ms vs 17.58                      accept 2.76
+#     context     DSpark on   DSpark off
+#     0-60k          79          59        <- DSpark wins
+#     60-120k        40          55
+#     120-160k       34          50        <- DSpark loses
 #
-# A win everywhere, 1.5x at 100k. Two costs: the KDA state cache holds the
-# draft's state too, so max running requests drops 75 -> 27 (MAMBA_SSM_DTYPE
-# below raises it); and accept length at long context is well below the 6.90 the
-# 27 Jul image showed at 100k — the step got cheap enough to win anyway, but it
-# is the next thing to chase. Everything from here down to the next export is
-# the history of how it got here.
+# Accept length averaged ~2. So: "dspark" for sessions that stay under ~50k,
+# empty for kimicode/opencode sessions that run long. DSpark also cuts max
+# running requests 75 -> 27 (the KDA state pool holds the draft's state too).
+#
+# The 12 Oct sweep had reported DSpark winning at every context (11.86 vs
+# 17.58 ms at 100k, accept 7 at 1024). Those numbers are real but come from
+# bench-kimik3.sh's RANDOM-TOKEN prompts, which the draft predicts far better
+# than real text. Do not use them to choose this setting.
 #
 # Upstream's MI355 TP8 numbers make this very attractive for interactive use:
 #   concurrency 2:  median TPOT 20.86 ms -> 8.94 ms, 820 -> 1659 tok/s
@@ -383,9 +389,10 @@ export REASONING_PARSER="${REASONING_PARSER:-kimi_k3}"
 # OR off. The 55-60k crossover therefore has to be RE-MEASURED, not assumed —
 # it can only have moved up. See the README, 'DSpark collapsed at long context'.
 #
-# (Re-measured 12 Oct — see the top of this section. It moved past 100k.)
+# (Re-measured 13 Oct on real text — see the top of this section. It still
+# sits around 60k.)
 #
-# It was default OFF until then, for the ordinary reason: get baseline serving
+# It was default OFF from the start, for the ordinary reason: get baseline serving
 # working, then add one thing. The sharper reason below is now historical.
 #
 # THE OLD DAY-0 IMAGE HAD A LIVE SAMPLING BUG (sglang #32569). DSpark's verify step
@@ -413,7 +420,7 @@ export REASONING_PARSER="${REASONING_PARSER:-kimi_k3}"
 # the image for the Triton aliases AND for that binding and warns at launch, so
 # you cannot meet either unknowingly; if you see the warning, you have gone
 # backwards on purpose. See the README, 'The sampling landmine'.
-export SPECULATIVE="${SPECULATIVE-dspark}"
+export SPECULATIVE="${SPECULATIVE-}"
 export DSPARK_MODEL="${DSPARK_MODEL:-RadixArk/Kimi-K3-DSpark}"
 
 # gamma — how many draft tokens DSpark proposes per step. Empty (default) lets

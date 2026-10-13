@@ -14,12 +14,16 @@ from which all the Bunya-specific knowledge here is inherited.
 
 ## What works today — re-measured 12 Oct 2026
 
-> **12 Oct 2026:** new default image `v0.5.21-rocm724-mi35x-20261011`, aiter
-> prefill, `MLA_DECODE_TUNE=1`, and DSpark **on by default**. DSpark now wins at
-> every context length up to 100k (11.86 ms TPOT at 100k, 4.10 ms at 1024 c=2).
-> The nodes moved to the `gpu_rocm` partition. See
-> [12 Oct 2026: the sweep](#12-oct-2026-the-sweep). Older sections below are
-> kept as history, and their numbers are from older images.
+> **13 Oct 2026:** default image `v0.5.21-rocm724-mi35x-20261011` with triton
+> attention, `MLA_DECODE_TUNE=1`, and DSpark **off**. That gives 50–59 tok/s
+> decode from 20k to 160k of real agentic context. Two findings from 12 Oct were
+> reversed a day later by a real kimicode session:
+> - aiter prefill corrupts GPU memory once a long prefix is cached.
+> - DSpark's "wins everywhere" result came from random-token benchmark prompts.
+>
+> See [13 Oct: what the benches missed](#13-oct-what-the-benches-missed). The
+> nodes are now in the `gpu_rocm` partition. Older sections below are kept as
+> history, and their numbers are from older images.
 
 K3 open weights landed on 27 Jul, and **SGLang shipped day-0 AMD support with a
 validated 8× MI355X recipe**. This repo reproduces that recipe.
@@ -28,9 +32,9 @@ validated 8× MI355X recipe**. This repo reproduces that recipe.
 |---|---|
 | Model | **`moonshotai/Kimi-K3`** — arch `KimiK3ForConditionalGeneration`, **1561 GB**, `mxfp4-pack-quantized`. The official release is already **MXFP4-native**, so there is no AMD requant to wait for. |
 | Shape | 93 layers, 896 experts (16 active), 1,048,576 context, `hidden_size` 7168, vision tower. KDA on every layer except every 4th, which is full MLA (`kv_lora_rank` 512). |
-| Engine | SGLang, image **`lmsysorg/sglang-rocm:v0.5.21-rocm724-mi35x-20261011`** since 12 Oct ([why](#12-oct-2026-the-sweep)). Mainline since 20 Aug; the day-0 `rocm720-mi35x-k3-20260727` tag that most measurements below were taken on is kept as the [anchor](#moving-to-a-mainline-image) |
+| Engine | SGLang, image **`lmsysorg/sglang-rocm:v0.5.21-rocm724-mi35x-20261011`** since 12 Oct ([why](#12-oct-2026-the-sweep), and [the 13 Oct correction](#13-oct-what-the-benches-missed)). Mainline since 20 Aug; the day-0 `rocm720-mi35x-k3-20260727` tag that most measurements below were taken on is kept as the [anchor](#moving-to-a-mainline-image) |
 | Parallelism | **TP8** — the whole node |
-| Throughput | **398 / 900 / 2729 output tok/s** at concurrency 2 / 8 / 32 (1024/512, DSpark) as of 12 Oct, and **11.86 ms TPOT at 100k**. The 29 Jul figure was **918 / 2074 / 3793 total tok/s**, measured here at 1024/512 with DSpark. Upstream's `820 / 2356 / 4898` is a different, unpublished workload — [why](#measured-on-bun161-29-jul-2026-dspark-1024512-tp8) |
+| Throughput | **~59 / 55 / 50 tok/s** single-session decode at 0–60k / 60–120k / 120–160k of real agentic context (13 Oct, DSpark off). At 1024/512 without DSpark: **115 / 326 / 847 output tok/s** at concurrency 2 / 8 / 32. The 29 Jul figure was **918 / 2074 / 3793 total tok/s**, measured here at 1024/512 with DSpark. Upstream's `820 / 2356 / 4898` is a different, unpublished workload — [why](#measured-on-bun161-29-jul-2026-dspark-1024512-tp8) |
 | Tool calling / thinking | `--tool-call-parser kimi_k3 --reasoning-parser kimi_k3` |
 | Auth | Bearer API key, auto-generated into `$MODEL_CACHE_DIR/kimik3-api-key` |
 | Clients | **opencode and kimicode both verified end to end** — tool calls, edits, long sessions |
@@ -175,6 +179,7 @@ scontrol show node bun161 | grep -iE 'Gres|Partitions|State'
 | `kimicode-setup.sh` | Writes/merges the kimicode provider config on any machine |
 | `kimicode.kimik3.toml` | The provider template `kimicode-setup.sh` fills in |
 | `bench-kimik3.sh` | Benchmark tok/s / TTFT / ITL at 1024/512, or `longcontext` at 100k |
+| `agentstress.py` | Agent-shaped soak test: one real-text conversation growing to 160k+, streaming, checked for corruption, with decode tok/s by context. Run it after any engine change |
 
 Secrets never live in the repo: `kimik3.env` (your HF token), the generated API
 key and the `.sif` are gitignored / stored under `$MODEL_CACHE_DIR` on scratch.
@@ -690,10 +695,11 @@ an interpolated ~28 ms baseline — a 1.6× win — so the sign flips somewhere 
 **55–60k**, not below 1024. See
 [the crossover](#the-crossover-is-around-5560k--and-that-is-the-operating-policy).
 
-> **Superseded 12 Oct 2026.** On `v0.5.21-*-20261011` DSpark wins at 100k too
-> (11.86 vs 17.58 ms TPOT), so it is now on by default with no context cap. See
-> [12 Oct 2026: the sweep](#12-oct-2026-the-sweep). The policy below applied to
-> the day-0 image.
+> **Still current as of 13 Oct 2026.** On `v0.5.21-*-20261011`, with real agentic
+> text, DSpark wins below ~60k (79 vs 59 tok/s) and loses above it (34 vs
+> 50 tok/s at 120–160k). See
+> [13 Oct: what the benches missed](#13-oct-what-the-benches-missed). Only the
+> sampling warning further down is out of date.
 
 ```bash
 # kimik3.env — sessions that stay under ~50k
@@ -1194,16 +1200,66 @@ and `presharded` (which removes the re-quantisation work entirely) is the lever.
 
 ## 12 Oct 2026: the sweep
 
+### 13 Oct: what the benches missed
+
+**Two of the 12 Oct conclusions below were wrong.** The first real kimicode
+session against the new defaults broke the server twice. First, every reply
+came back as `[PAD][PAD][PAD]…`, even at temperature 0, for any prompt. After a
+restart it died with `Memory access fault by GPU … Write access to a read-only
+page` on four GPUs. Both runs had aiter prefill and DSpark on.
+
+[`agentstress.py`](agentstress.py) reproduces this traffic: one conversation
+growing by 20k tokens a turn, made of real text from this repo, streaming at
+temperature 0.6, and checking every reply for garbage and for a code it must
+recall from that turn's text. With aiter prefill it crashed at turn 8, at ~160k
+context with ~145k cached. The traceback is in `_mla_fp8_prefill_attn_ps` called
+from `_forward_extend_prefix_chunk`: #34438's prefill kernel, on the path taken
+only when part of the prompt is **already in the prefix cache**. With triton
+prefill and nothing else changed, the same conversation ran clean to 240k, and
+the quality probe and `toolcheck` passed afterwards.
+
+The benches could not have caught it. `bench-kimik3.sh` sends random prompts that
+share no prefix, so every prefill showed `#cached-token: 0`. An agent session is
+the opposite: almost every turn is a long cached prefix plus a few thousand new
+tokens.
+
+**The random prompts also flattered DSpark.** The draft predicts random-token
+text far better than real text. Acceptance was 6–7 at 1024 and 2.8–3.3 at
+32–100k in the benches, against **~2.0** in `agentstress.py`. Measured decode
+rate on the same conversation, v0.5.21, triton prefill, `MLA_DECODE_TUNE=1`:
+
+| context | DSpark on | DSpark off |
+|---|---|---|
+| 0–60k | **79 tok/s** | 59 tok/s |
+| 60–120k | 40 tok/s | **55 tok/s** |
+| 120–160k | 34 tok/s | **50 tok/s** |
+
+The crossover is still at about 60k, as it was on the day-0 image. DSpark is off
+by default again. Turn it on (`SPECULATIVE=dspark`) only for sessions that stay
+short.
+
+What still stands from 12 Oct:
+- the v0.5.21 image
+- `MLA_DECODE_TUNE=1`
+- the step-2 crash diagnosis
+- the DCP8 capacity mode, which used aiter prefill and should be re-checked with
+  `agentstress.py` before use
+
+The tables below are left as measured, but read every DSpark and aiter-prefill
+row in them through this section. **Run `agentstress.py` after any engine change,
+not just the benches.**
+
 Six weeks after the last check, one variable at a time, everything on **bun161**
-inside one allocation. The result is the new default config, and it is faster
-than anything earlier in this README at every shape:
+inside one allocation. Read [13 Oct: what the benches missed](#13-oct-what-the-benches-missed)
+first, because two of the conclusions below did not survive real traffic. The
+config this section originally recommended was:
 
 ```bash
-# what serve-kimik3.sh now does with an empty kimik3.env
+# what serve-kimik3.sh does with an empty kimik3.env, as corrected on 13 Oct
 SGLANG_IMAGE=docker://lmsysorg/sglang-rocm:v0.5.21-rocm724-mi35x-20261011
-PREFILL_ATTENTION_BACKEND=aiter     # decode stays on ATTENTION_BACKEND=triton
+ATTENTION_BACKEND=triton            # both phases; aiter prefill reverted
 MLA_DECODE_TUNE=1
-SPECULATIVE=dspark                  # draft still pinned at 56ce616a
+SPECULATIVE=                        # off; see the 13 Oct section above
 ```
 
 ### The headline
@@ -1218,11 +1274,9 @@ SPECULATIVE=dspark                  # draft still pinned at 56ce616a
 | 100k TPOT | 29.83 ms (off) / 52.04 (DSpark) | 17.58 ms | **11.86 ms** (accept 2.76) |
 | 100k TTFT | 15.4 s | 6.24 s | **6.29 s** |
 
-**The DSpark crossover is gone.** On the day-0 image DSpark won below ~55–60k
-and lost 1.7× above it. Now it wins at 100k too, by 1.5×, so the "compact at
-40–50k or turn DSpark off" policy in
-[DSpark collapsed at long context](#dspark-collapsed-at-long-context--because-the-draft-was-a-4k-model)
-is retired. Wherever the new line falls, it is past 100k.
+*(Superseded 13 Oct.)* This table suggested the DSpark crossover was gone. That
+holds only for the bench's random prompts. On real text it is still at about
+60k.
 
 Note what did *not* come back: **acceptance length at long context**. It was 6.90
 at 100k on 12 Aug and is 2.76 now, same draft, same revision. DSpark wins anyway
@@ -1246,10 +1300,10 @@ are c=1, n=4.
 | 3 | **image → v0.5.21-20261011**, triton both phases | 18.57 ms / 11.06 s | 17.19 / 1.32 s | 16.65 / 32.66 | **adopt** |
 | 4a | + fused KDA decode (#34198) | 18.50 / 11.05 s | 17.13 / 1.31 s | 16.62 / 32.68 | no effect, off |
 | 4b | + `MLA_DECODE_TUNE=1` (#34580) | 17.58 / 11.06 s | 16.49 / 1.31 s | 16.54 / 32.62 | **adopt**, −5% |
-| 5 | + aiter **prefill** (#34438) | 17.58 / **6.24 s** | 16.46 / 0.95 s | 16.53 / 32.62 | **adopt**, −44% TTFT |
+| 5 | + aiter **prefill** (#34438) | 17.58 / **6.24 s** | 16.46 / 0.95 s | 16.53 / 32.62 | adopted, then **reverted 13 Oct**: corrupts memory with a cached prefix |
 | 5b | + aiter **decode** too | 17.12 / 6.30 s | 16.30 / 1.39 s | 16.79 / 23.38 | **reject**, see below |
 | 6 | DCP8 + fp8 KV, aiter both | 17.30 / 6.26 s | 16.95 / 0.95 s | 17.70 / — | capacity mode, see below |
-| 7 | step 5 + **DSpark** | **11.86 / 6.29 s** | **5.80 / 0.97 s** | **4.10 / 8.20** | **adopt** |
+| 7 | step 5 + **DSpark** | **11.86 / 6.29 s** | **5.80 / 0.97 s** | **4.10 / 8.20** | adopted, then **reverted 13 Oct**: random-prompt artefact |
 
 **The image alone is most of it.** v0.5.21 carries aiter `e7d2453f` (25 Sep);
 the 27 Aug image carried `c16d44b9` (18 Aug). Against the day-0 baseline, 100k TPOT
@@ -1296,7 +1350,7 @@ EXTRA_ENGINE_ARGS="--prefill-attention-backend aiter --decode-attention-backend 
 | 1024 c=2 TPOT | 16.53 ms | 17.70 ms (+7%) |
 | 1024 c=32 output tok/s | 847 | 834 |
 
-Quality passed. It is not a speed lever. It is for many concurrent long sessions,
+**Re-check before use (13 Oct):** this launch includes aiter prefill, which corrupted memory with long cached prefixes in [the agentic test](#13-oct-what-the-benches-missed). Whether DCP8 runs with triton prefill is untested. Quality passed on the benches. It is not a speed lever. It is for many concurrent long sessions,
 or for contexts past what 852k tokens of KV can hold across them. It has not
 been tried with DSpark.
 
@@ -2125,7 +2179,7 @@ All knobs live in `kimik3.env` (copied from `kimik3-env.example`). Anything you
 | `CONTEXT_LEN` | *(empty)* | Empty = model max (1M), as upstream. Set `262144` if KV won't allocate |
 | `MEM_FRACTION` | `0.85` | `--mem-fraction-static` (upstream's validated value) |
 | `ATTENTION_BACKEND` | `triton` | `--attention-backend`; applies to any phase not overridden below |
-| `PREFILL_ATTENTION_BACKEND` | `aiter` | `--prefill-attention-backend`. Set empty (`PREFILL_ATTENTION_BACKEND=`) to pass nothing. aiter cuts 100k TTFT 44% ([measured](#step-by-step)) |
+| `PREFILL_ATTENTION_BACKEND` | *(empty)* | `--prefill-attention-backend`. **Do not set `aiter`**: it cuts cold 100k TTFT 44%, but it corrupts GPU memory once a long prefix is cached ([13 Oct](#13-oct-what-the-benches-missed)) |
 | `DECODE_ATTENTION_BACKEND` | *(empty)* | `--decode-attention-backend`. `aiter` makes sglang scale `MEM_FRACTION` by 0.85 above 8k context, shrinking the KV pool ~6×, unless `SGLANG_AITER_HONOR_EXPLICIT_MEM_FRACTION=1` |
 | `MLA_DECODE_TUNE` | `1` | Exports `SGLANG_MLA_DECODE_TUNE=1`, the gfx950 MLA decode geometry from [#34580](#the-second-lever--34580-retuned-the-gfx950-mla-decode-geometry). Measured −5% TPOT at 100k on v0.5.21. It reorders the fp32 accumulation, which is why it is off upstream. `0` turns it off |
 | `MODEL_DTYPE` | `bfloat16` | `--dtype` (compute dtype; weights are MXFP4) |
@@ -2134,7 +2188,7 @@ All knobs live in `kimik3.env` (copied from `kimik3-env.example`). Anything you
 | `KV_CACHE_DTYPE` | *(empty)* | Empty on purpose: upstream's cookbook now sets `fp8_e4m3`, but #32938 reports fp8 KV slowing DSpark |
 | `TOOL_PARSER` | `kimi_k3` | Tool-call parser; `none` to omit |
 | `REASONING_PARSER` | `kimi_k3` | Thinking parser; `none` to omit |
-| `SPECULATIVE` | `dspark` | DSpark speculative decoding. Wins at every context up to 100k on v0.5.21 ([measured](#the-headline)). Set **empty**, not unset, to turn it off |
+| `SPECULATIVE` | *(empty)* | `dspark` enables DSpark speculative decoding. On real text it wins below ~60k and loses above it ([13 Oct](#13-oct-what-the-benches-missed)) |
 | `DSPARK_MODEL` | `RadixArk/Kimi-K3-DSpark` | Draft model for DSpark |
 | `DSPARK_BLOCK_SIZE` | *(empty)* | `--speculative-dspark-block-size`. Empty infers gamma from the draft (7 today); setting it anchors against draft drift |
 | `REPLAYSSM_SPEC` | `0` | `--enable-linear-replayssm-spec`, falling back to the older `--enable-gdn-replayssm-spec` on images that predate the rename (v0.5.21 has the linear name). Not to be confused with `--enable-linear-replayssm` (no `-spec`). Reachable since the 20 Aug image; still off because nobody has benched it ([why](#k3s-kda-state-pool--the-knobs-we-did-not-pass)) |

@@ -118,13 +118,18 @@ ATTENTION_BACKEND="${ATTENTION_BACKEND:-triton}"
 # Split prefill/decode backends, overriding ATTENTION_BACKEND for one phase each.
 # Empty = pass nothing for that phase. Measured 12 Oct 2026 on v0.5.21-20261011:
 # aiter PREFILL (#34438's ASM FP8 kernel with chunked KV) cuts 100k TTFT 44%
-# (11.1 -> 6.2 s) with TPOT and quality unchanged, so it is the default. aiter
-# DECODE is NOT: with context > 8192 sglang silently scales mem_fraction_static
+# (11.1 -> 6.2 s) on a COLD prompt — and CORRUPTS GPU MEMORY once a long prefix
+# is cached. Found 13 Oct 2026 in a real kimicode session: _mla_fp8_prefill_attn_ps
+# in _forward_extend_prefix_chunk, reproduced at ~160k context with ~145k cached,
+# "Memory access fault ... Write access to a read-only page" on four GPUs, and
+# before that a server answering every request with [PAD][PAD]... The benches
+# never ran it: random prompts share no prefix. Triton prefill ran the same
+# conversation clean to 240k. DO NOT set aiter here until that kernel is fixed
+# upstream and ./agentstress.py passes. aiter DECODE is not the default either: with context > 8192 sglang silently scales mem_fraction_static
 # by 0.85 for it, the KV pool fell from 852k to 131k tokens, and c=32 TTFT went
 # to 25.8 s — for 3% TPOT at 100k. (SGLANG_AITER_HONOR_EXPLICIT_MEM_FRACTION=1
 # disables that scaling; the DCP8 capacity mode in the README needs it.)
-# PREFILL_ATTENTION_BACKEND= (set, empty) restores the single-backend launch.
-PREFILL_ATTENTION_BACKEND="${PREFILL_ATTENTION_BACKEND-aiter}"
+PREFILL_ATTENTION_BACKEND="${PREFILL_ATTENTION_BACKEND-}"
 DECODE_ATTENTION_BACKEND="${DECODE_ATTENTION_BACKEND-}"
 # sglang #34580, merged 18 Aug 2026, mainline images only. K3's MLA decode ran
 # stage-1 with constants tuned on CDNA3: BLOCK_N 16 where gfx950's MFMA tiles want
@@ -149,10 +154,12 @@ DISABLE_RADIX_CACHE="${DISABLE_RADIX_CACHE:-0}"
 KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-}"
 TOOL_PARSER="${TOOL_PARSER:-kimi_k3}"
 REASONING_PARSER="${REASONING_PARSER:-kimi_k3}"
-# DSpark ON by default since 12 Oct 2026: on v0.5.21 it wins at every context
-# measured, 1024 through 100k (README, '12 Oct 2026: the sweep'). No colon in the
-# expansion, so SPECULATIVE= (set but empty) still means off — 'unset' does not.
-SPECULATIVE="${SPECULATIVE-dspark}"
+# DSpark OFF by default. On 12 Oct it looked like a win at every context, but
+# that was the bench's random-token prompts, which the draft predicts unrealistically
+# well (accept ~7). On real agentic text, 13 Oct, accept is ~2 and decode is
+# 79 vs 59 tok/s under 60k, 40 vs 55 at 60-120k, 34 vs 50 past 120k (on vs off).
+# Set "dspark" for sessions that stay short.
+SPECULATIVE="${SPECULATIVE-}"
 DSPARK_MODEL="${DSPARK_MODEL:-RadixArk/Kimi-K3-DSpark}"
 # Pinned, not tracking main: the draft repo is rewritten under you — three times
 # in the four days to 1 Aug 2026, twice breaking the launch outright.
