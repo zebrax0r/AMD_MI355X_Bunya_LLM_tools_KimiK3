@@ -19,7 +19,7 @@ max_ctx = int(sys.argv[4]) if len(sys.argv) > 4 else 150000
 turn_tok = int(sys.argv[5]) if len(sys.argv) > 5 else 20000
 
 here = os.path.dirname(os.path.abspath(__file__))
-repo = here
+repo = os.path.join(here, "tests", "fixtures", "agentstress-406abdb")
 corpus = []
 for f in ("README.md", "serve-kimik3.sh", "kimik3-env.example", "bench-kimik3.sh"):
     with open(os.path.join(repo, f), errors="replace") as fh:
