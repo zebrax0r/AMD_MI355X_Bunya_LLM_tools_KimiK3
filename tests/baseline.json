@@ -1,0 +1,22 @@
+{
+  "commit": "406abdb123d0015c388bc90a57cf4d460d6de2ee",
+  "tree": "24641917c050eba46f61ef1966f87d700789f756",
+  "preserved": {
+    ".gitignore": ["f4b07fa96b43c472016d95f061b593fdf4707b3e", "100644"],
+    "LICENSE": ["83503e765c556a62a5c78cce3e13b4f04987ba9f", "100644"],
+    "serve-kimik3.sh": ["b8f60157099bf049f7ddf378466da0a4b2b2ff1c", "100755"],
+    "serve-kimik3.sbatch": ["ac48e868d6906914d5aae6b0f9764b560af93051", "100755"],
+    "bench-kimik3.sh": ["1b8749ea47d4368f04dc7c8b2032198401245770", "100755"],
+    "opencode-setup.sh": ["1873daa55a87ff73537185ec614bbefcb4e7e052", "100755"],
+    "kimicode-setup.sh": ["31b8097ab991c3c1cae0624c66d78b5bfbd02bb3", "100755"],
+    "opencode.kimik3.json": ["23812bd9a413078eecb1ecf416682bde42ca01c9", "100644"],
+    "kimicode.kimik3.toml": ["56f09ed0e5335366b4bc8d630e379a760780239c", "100644"]
+  },
+  "fixtures": {
+    "README.md": "3f562866559d173c2a4626cbbc6319428445bcc4",
+    "serve-kimik3.sh": "b8f60157099bf049f7ddf378466da0a4b2b2ff1c",
+    "kimik3-env.example": "3a61294066659ef7712f6db2b0e6f06c0b2526c9",
+    "bench-kimik3.sh": "1b8749ea47d4368f04dc7c8b2032198401245770",
+    "agentstress.py": "b3e1e2ff95d55f20387ab03be6ed3cd55e25fbdc"
+  }
+}

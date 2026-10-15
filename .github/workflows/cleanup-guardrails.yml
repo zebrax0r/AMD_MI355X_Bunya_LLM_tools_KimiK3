@@ -1,0 +1,29 @@
+name: Cleanup guardrails
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cleanup-guardrails-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  cpu-only:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check out the exact public repository revision without credentials
+        env:
+          REPOSITORY: ${{ github.repository }}
+          REVISION: ${{ github.sha }}
+        run: |
+          git init .
+          git remote add origin "https://github.com/${REPOSITORY}.git"
+          git -c protocol.version=2 fetch --no-tags --depth=1 origin "$REVISION"
+          git checkout --detach FETCH_HEAD
+      - name: Run CPU-only preservation checks
+        run: python3 -m unittest discover -s tests -v
